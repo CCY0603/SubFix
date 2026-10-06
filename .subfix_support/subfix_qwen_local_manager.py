@@ -6,9 +6,28 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
 import json
 import os
+import platform
+
+IS_WINDOWS = os.name == "nt" or platform.system() == "Windows"
+
+if IS_WINDOWS:
+    fcntl = None  # Windows 不支持 fcntl 文件锁
+else:
+    import fcntl
+
+
+def _venv_python(env_dir: Path) -> Path:
+    if IS_WINDOWS:
+        return env_dir / "Scripts" / "python.exe"
+    return env_dir / "bin" / "python"
+
+
+def _base_python(root: Path) -> Path:
+    if IS_WINDOWS:
+        return root / "runtime" / "python" / "python.exe"
+    return root / "runtime" / "python" / "bin" / "python3"
 from pathlib import Path
 import re
 import subprocess
@@ -34,6 +53,14 @@ COMMAND_HEARTBEAT_INTERVAL_SECONDS = 1
 INSTALL_IN_PROGRESS_MESSAGE = "本地 Qwen 正在安装或下载模型，请勿重复启动"
 ProgressReporter = Callable[..., None]
 
+# 子进程（pip / venv / 下载器等）默认继承 UTF-8 输出，避免中文错误信息被按本地码页（如 GBK）
+# 解码成乱码。宿主（达芬奇）可能未设置这些变量，此处兜底统一为 UTF-8。
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+# Hugging Face 直连在部分网络环境不可达；下载备用源与运行时兜底统一走公共镜像。
+# 用户显式设置过 HF_ENDPOINT 时尊重其配置。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 
 @dataclass(frozen=True)
 class SubFixQwenPaths:
@@ -42,7 +69,7 @@ class SubFixQwenPaths:
 
     @property
     def base_python(self) -> Path:
-        return self.root / "runtime" / "python" / "bin" / "python3"
+        return _base_python(self.root)
 
     @property
     def env_dir(self) -> Path:
@@ -55,7 +82,7 @@ class SubFixQwenPaths:
 
     @property
     def env_python(self) -> Path:
-        return self.env_dir / "bin" / "python"
+        return _venv_python(self.env_dir)
 
     @property
     def model_dir(self) -> Path:
@@ -91,17 +118,31 @@ class SubFixQwenPaths:
 def exclusive_install_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a+", encoding="utf-8")
+    win_lock_path = lock_path.with_suffix(lock_path.suffix + ".wlock")
     acquired = False
     try:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                try:
+                    fd = os.open(str(win_lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    os.close(fd)
+                except FileExistsError:
+                    raise BlockingIOError()
         except BlockingIOError as exc:
             raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
         acquired = True
         yield
     finally:
         if acquired:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            else:
+                try:
+                    win_lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         lock_file.close()
 
 
@@ -132,7 +173,7 @@ def huggingface_cache_roots() -> list[Path]:
     hf_home = os.getenv("HF_HOME")
     if hf_home:
         roots.append(Path(hf_home).expanduser() / "hub")
-    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    roots.append(Path(os.getenv("LOCALAPPDATA") or (Path.home() / ".cache")) / "huggingface" / "hub")
     return list(dict.fromkeys(roots))
 
 
@@ -164,7 +205,7 @@ def has_model_artifacts(paths: SubFixQwenPaths) -> bool:
 def ready_environment_python(paths: SubFixQwenPaths) -> Path | None:
     if paths.env_python.is_file() and paths.ready_marker.is_file():
         return paths.env_python
-    legacy_python = paths.legacy_env_dir / "bin" / "python"
+    legacy_python = _venv_python(paths.legacy_env_dir)
     # A legacy marker must never certify a newly created, incomplete environment.
     if legacy_python.is_file() and (paths.legacy_plugin_ready_marker.is_file() or paths.legacy_ready_marker.is_file()):
         return legacy_python
@@ -173,7 +214,7 @@ def ready_environment_python(paths: SubFixQwenPaths) -> Path | None:
 
 def inspect_install(paths: SubFixQwenPaths) -> dict[str, object]:
     model_dir = existing_model_dir(paths)
-    environment_exists = paths.env_python.is_file() or (paths.legacy_env_dir / "bin" / "python").is_file()
+    environment_exists = paths.env_python.is_file() or _venv_python(paths.legacy_env_dir).is_file()
     if not environment_exists or not has_model_artifacts(paths):
         return {"state": "missing", "ready": False}
     # The marker is written only after the installer verifies the dependency;
@@ -224,7 +265,13 @@ def append_command_log(log_path: Path | None, command: list[str], output: str) -
 
 
 def command_error_message(error_prefix: str, output: str, log_path: Path | None) -> str:
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    # 去掉 ANSI 转义序列与其它控制字符，避免进度条/颜色码污染最终展示的中文报错。
+    _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-_]")
+    lines = []
+    for raw_line in output.splitlines():
+        line = _ANSI_RE.sub("", raw_line).strip()
+        if line and any(ch.isprintable() for ch in line):
+            lines.append(line)
     errors = [line for line in lines if re.search(r"^ERROR:|[\w.]+(?:Error|Exception):", line)]
     meaningful = [line for line in lines if not line.startswith(("[notice]", "Traceback", "File ", "^"))]
     cause = (errors or meaningful or ["命令未返回可用错误信息"])[-1]
@@ -287,6 +334,7 @@ def run_checked(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
             errors="replace",
         )
     except OSError as exc:
@@ -305,7 +353,7 @@ def run_checked(
 
 
 def create_or_reuse_venv(base_python: Path, env_dir: Path) -> None:
-    if not (env_dir / "bin" / "python").is_file():
+    if not _venv_python(env_dir).is_file():
         run_checked([str(base_python), "-m", "venv", str(env_dir)], error_prefix="创建本地 Qwen 环境失败")
 
 
@@ -395,6 +443,8 @@ def fetch_model_total_bytes(env_python: Path, source: str = "modelscope") -> int
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         total = int(result.stdout.strip().rsplit("\n", 1)[-1])
@@ -430,6 +480,7 @@ def report_model_download_progress(
     total_bytes: int | None,
     report: ProgressReporter,
     stop_event: threading.Event,
+    label: str = "Qwen3-ASR-1.7B",
 ) -> None:
     initial_bytes = directory_size_bytes(model_dir)
     started_at = time.monotonic()
@@ -452,9 +503,9 @@ def report_model_download_progress(
             if eta_seconds is not None:
                 details["eta_seconds"] = eta_seconds
         if details:
-            report("下载模型", "正在下载 Qwen3-ASR-1.7B", **details)
+            report("下载模型", f"正在下载 {label}", **details)
         else:
-            report("连接模型仓库", "正在连接 Qwen3-ASR-1.7B")
+            report("连接模型仓库", f"正在连接 {label}")
         stop_event.wait(1)
 
 
@@ -517,6 +568,87 @@ def download_model(env_python: Path, model_dir: Path, report: ProgressReporter, 
     raise RuntimeError("模型下载源均失败，请检查网络后重试。\n" + "\n".join(errors))
 
 
+QWEN_FORCED_ALIGNER_MODEL_ID = "Qwen/Qwen3-ForcedAligner-0.6B"
+
+
+def _snapshot_download_script(source: str) -> str:
+    if source == "modelscope":
+        return (
+            # Desktop installs should not probe cloud metadata for intranet acceleration.
+            "import os, sys\n"
+            "os.environ['MODELSCOPE_DOWNLOAD_INTRA_CLOUD'] = 'false'\n"
+            "os.environ['INTRA_CLOUD_ACCELERATION'] = 'false'\n"
+            "from modelscope.hub.snapshot_download import snapshot_download\n"
+            "snapshot_download(model_id=sys.argv[1], local_dir=sys.argv[2])\n"
+        )
+    if source == "huggingface":
+        return (
+            "from huggingface_hub import snapshot_download\n"
+            "import sys\n"
+            "snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])\n"
+        )
+    raise ValueError(f"未知模型下载源：{source}")
+
+
+def forced_aligner_dir(paths: SubFixQwenPaths) -> Path:
+    return paths.data_root / "models" / "qwen3-forced-aligner-0.6b"
+
+
+def forced_aligner_is_complete(directory: Path) -> bool:
+    return (directory / "config.json").is_file() and any(directory.glob("*.safetensors"))
+
+
+def ensure_forced_aligner(
+    paths: SubFixQwenPaths, env_python: Path, report: ProgressReporter, log_path: Path
+) -> None:
+    """预下载强制对齐器（时间轴对齐用）。
+
+    识别阶段运行时会因 forced_aligner=... 联网加载该模型；若 huggingface.co 不可达，
+    表现为识别卡住后报 “Qwen3-ASR 模型加载失败”。这里在安装阶段预先下载到本地，
+    运行时即可完全离线加载。任何失败都不阻断安装（运行时仍可经 HF 镜像在线加载）。
+    """
+    directory = forced_aligner_dir(paths)
+    if forced_aligner_is_complete(directory):
+        return
+    errors: list[str] = []
+    for source, label in MODEL_DOWNLOAD_SOURCES:
+        def source_report(stage: str, message: str, source_label: str = label, **details: object) -> None:
+            report(stage, f"{source_label}：{message}", **details)
+
+        source_report("下载对齐模型", "正在准备下载 Qwen3-ForcedAligner-0.6B")
+        try:
+            if source == "modelscope":
+                ensure_modelscope_downloader(env_python, source_report, log_path)
+            stop_event = threading.Event()
+            monitor = threading.Thread(
+                target=report_model_download_progress,
+                args=(directory, None, report, stop_event),
+                kwargs={"label": "Qwen3-ForcedAligner-0.6B"},
+                daemon=True,
+            )
+            monitor.start()
+            try:
+                run_checked(
+                    [str(env_python), "-c", _snapshot_download_script(source),
+                     QWEN_FORCED_ALIGNER_MODEL_ID, str(directory)],
+                    error_prefix="下载 Qwen3-ForcedAligner 模型失败",
+                    log_path=log_path,
+                )
+            finally:
+                stop_event.set()
+                monitor.join(timeout=2)
+            if forced_aligner_is_complete(directory):
+                return
+            errors.append(f"{label}：模型文件不完整")
+        except Exception as exc:  # 非致命：不阻断安装
+            errors.append(f"{label}：{exc}")
+    append_command_log(
+        log_path,
+        ["ensure_forced_aligner"],
+        "对齐器预下载失败（运行时将改用 HF 镜像在线加载）：" + "; ".join(errors),
+    )
+
+
 def write_ready_marker(paths: SubFixQwenPaths, model_dir: Path) -> None:
     paths.ready_marker.write_text(
         json.dumps(
@@ -554,6 +686,11 @@ def install(paths: SubFixQwenPaths, report: ProgressReporter) -> dict[str, objec
         except Exception as exc:
             paths.ready_marker.unlink(missing_ok=True)
             raise RuntimeError(f"下载模型失败：{exc}") from exc
+    # 强制对齐器预下载：非致命，失败仅记录日志（运行时回退 HF 镜像在线加载）。
+    try:
+        ensure_forced_aligner(paths, paths.env_python, report, paths.install_log)
+    except Exception as exc:  # pragma: no cover - defensive
+        append_command_log(paths.install_log, ["ensure_forced_aligner"], f"对齐器预下载异常: {exc}")
     report("校验模型", "正在验证模型文件与运行环境")
     write_ready_marker(paths, model_dir)
     status = inspect_install(paths)
@@ -591,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     paths = SubFixQwenPaths(
         args.root.resolve(),
-        Path.home() / "Library" / "Application Support" / "SubFix",
+        Path(os.getenv("LOCALAPPDATA") or (Path.home() / "Library" / "Application Support")) / "SubFix",
     )
     try:
         if args.action == "install":

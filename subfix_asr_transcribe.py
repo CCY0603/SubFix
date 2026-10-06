@@ -30,6 +30,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+# Hugging Face 直连在部分网络环境不可达（运行时加载 Qwen3-ForcedAligner 会因此失败，
+# 表现为识别进度卡住后报 “Qwen3-ASR 模型加载失败”）。
+# 默认改用公共镜像 hf-mirror.com；用户显式设置过 HF_ENDPOINT 时尊重其配置。
+# 注意：必须在首次导入 transformers/huggingface_hub 之前生效（此处均为懒加载，安全）。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 
 class _LazyGenerateV4:
     _module: Any = None
@@ -230,9 +236,12 @@ QWEN_ROW_REMAP_MAX_START_LOOKBACK = 2
 QWEN_ROW_REMAP_MAX_START_LOOKAHEAD = 12
 DEFAULT_FFMPEG_CANDIDATES = (
     str(Path(__file__).resolve().parent / "bin" / "ffmpeg"),
+    str(Path(__file__).resolve().parent / "bin" / "ffmpeg.exe"),
     str(Path.home() / ".local" / "bin" / "ffmpeg"),
+    str(Path.home() / ".local" / "bin" / "ffmpeg.exe"),
     "/opt/homebrew/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",
+    "ffmpeg",
 )
 _QWEN3_ASR_MODEL_CACHE: dict[tuple[str, str, str, str | None], tuple[Any, str, str]] = {}
 _QWEN3_FORCED_ALIGNER_CACHE: dict[tuple[str, str, str], Any] = {}
@@ -3182,7 +3191,61 @@ def apply_alignment_to_rows(
             if key in segment:
                 aligned_row[key] = segment[key]
         aligned.append(aligned_row)
+    pad_aligned_rows_display(aligned, fps, timeline_start_frame)
     return aligned
+
+
+def pad_aligned_rows_display(
+    aligned_rows: list[dict[str, Any]],
+    fps: float,
+    timeline_start_frame: int,
+    lead_frames: int | None = None,
+    tail_frames: int | None = None,
+) -> list[dict[str, Any]]:
+    """调整字幕“显示”时机，使其更贴合听感而非严格卡在语音边界上：
+
+      * 在对应音频开始前的 lead_frames（默认 5）帧出现；
+      * 在对应音频结束后的 tail_frames（默认 5）帧消失；
+      * 若下一句紧随而来（扩展后会与下一句重叠），则在下一句开始前 1 帧切掉，
+        避免出现两句字幕重叠。
+
+    仅修改最终展示用的 start_frame/end_frame（及其对应的 start/end 秒数），
+    不触碰 alignment 内部使用的 ctc_* 字段。
+    """
+    rate = max(1.0, float(fps or 30.0))
+    if lead_frames is None:
+        lead_frames = int(os.getenv("SUBFIX_DISPLAY_LEAD_FRAMES", "5") or 5)
+    if tail_frames is None:
+        tail_frames = int(os.getenv("SUBFIX_DISPLAY_TAIL_FRAMES", "5") or 5)
+    tl = int(timeline_start_frame or 0)
+    lead_frames = max(0, int(lead_frames))
+    tail_frames = max(0, int(tail_frames))
+
+    for row in aligned_rows:
+        try:
+            sf = int(round(float(row.get("start_frame") or 0)))
+            ef = int(round(float(row.get("end_frame") or sf + 1)))
+        except (TypeError, ValueError):
+            continue
+        new_sf = max(tl, sf - lead_frames)
+        new_ef = ef + tail_frames
+        row["start_frame"] = new_sf
+        row["end_frame"] = new_ef
+        row["start"] = round((new_sf - tl) / rate, 3)
+        row["end"] = round(max(new_sf + 0.001, (new_ef - tl) / rate), 3)
+
+    n = len(aligned_rows)
+    for i in range(n - 1):
+        try:
+            cur_end = int(round(float(aligned_rows[i].get("end_frame") or 0)))
+            nxt_start = int(round(float(aligned_rows[i + 1].get("start_frame") or 0)))
+        except (TypeError, ValueError):
+            continue
+        if cur_end >= nxt_start:
+            cur_end = max(nxt_start - 1, int(round(float(aligned_rows[i].get("start_frame") or 0))))
+            aligned_rows[i]["end_frame"] = cur_end
+            aligned_rows[i]["end"] = round((cur_end - tl) / rate, 3)
+    return aligned_rows
 
 
 def normalize_aligned_segments_for_rows(raw_payload: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3387,6 +3450,80 @@ def preserved_row_segment(
     }
 
 
+def repair_rejected_row_timings(
+    segments: list[dict[str, Any]],
+    fps: float,
+    timeline_start_frame: int,
+) -> None:
+    """把被拒（回退到“名义占位槽”）的行重排到相邻已对齐行之间的空隙里。
+
+    原实现直接沿用输入行的名义帧位（总时长 / 行数），会产生两类问题：
+      * 首行被拒时停在时间轴 0 附近，与第 2 行之间留下大段空白（开头对不上）；
+      * 被拒行按行号插到已对齐行中间，造成时间倒挂（起止时间小于前一行）。
+    这里改为：按“连续被拒行段”处理，用整体语速估算时长，把该段紧贴
+    下一已对齐行的起点放入空隙，从而消除大段空白与倒挂。
+    """
+    n = len(segments)
+    if n == 0:
+        return
+    accepted = [s.get("row_remap_decision") == "accepted_local_match" for s in segments]
+    if all(accepted) or not any(accepted):
+        return
+
+    def fnum(index: int, key: str) -> float:
+        try:
+            return float(segments[index].get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ok_index = [i for i in range(n) if accepted[i]]
+    total_chars = sum(max(1, int(segments[i].get("ctc_char_count") or 1)) for i in ok_index)
+    total_speech = sum(max(0.0, fnum(i, "end") - fnum(i, "start")) for i in ok_index)
+    rate = (total_chars / total_speech) if (total_speech > 1e-6 and total_chars > 0) else 4.0
+    if not (1.0 <= rate <= 20.0):
+        rate = 4.0
+
+    gap = 0.08
+    min_dur = 0.6
+    i = 0
+    while i < n:
+        if accepted[i]:
+            i += 1
+            continue
+        run_start = i
+        while i < n and not accepted[i]:
+            i += 1
+        run_end = i - 1
+        run = list(range(run_start, run_end + 1))
+        chars = [max(1, int(segments[k].get("ctc_char_count") or 1)) for k in run]
+        chars_sum = float(sum(chars))
+
+        left = fnum(run_start - 1, "end") if run_start > 0 else 0.0
+        right = fnum(run_end + 1, "start") if run_end + 1 < n else left + chars_sum / rate + gap
+
+        est = chars_sum / rate
+        window = right - left - gap
+        if window <= 0.0:
+            total = max(min_dur * len(run), est)
+        elif est > window:
+            total = window
+        else:
+            total = max(est, min(min_dur * len(run), window))
+
+        cursor = max(0.0, right - gap - total)
+        for k, c in zip(run, chars):
+            duration = total * (c / chars_sum)
+            seg_start = cursor
+            seg_end = max(cursor + 0.05, cursor + duration)
+            segment = segments[k]
+            segment["start"] = round(seg_start, 3)
+            segment["end"] = round(seg_end, 3)
+            start_frame = int(round(timeline_start_frame + seg_start * fps))
+            segment["ctc_start_frame"] = start_frame
+            segment["ctc_end_frame"] = max(int(round(timeline_start_frame + seg_end * fps)), start_frame + 1)
+            cursor = seg_end
+
+
 def qwen3_remap_timestamp_items_to_rows(
     rows: list[dict[str, Any]],
     timestamp_items: list[dict[str, Any]],
@@ -3453,6 +3590,7 @@ def qwen3_remap_timestamp_items_to_rows(
             }
         )
         cursor = end_index
+    repair_rejected_row_timings(segments, fps, timeline_start_frame)
     return segments
 
 
@@ -3809,7 +3947,9 @@ def cut_audio(
     if audio_channel_index is not None and audio_channel_index > 0:
         cmd.extend(["-filter:a", f"pan=mono|c0=c{audio_channel_index - 1}"])
     cmd.extend(["-ac", "1", "-ar", "16000", "-vn", str(output)])
-    subprocess.run(cmd, check=True, text=True, capture_output=True)
+    # 必须显式按 UTF-8 解码：默认 locale 码页（GBK）遇到非 GBK 字节会让 subprocess 的
+    # 读取线程直接崩溃（UnicodeDecodeError），父进程随之永久等待 → 进度卡死。
+    subprocess.run(cmd, check=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
 
 
 def transcribe_mlx_whisper(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
@@ -3864,6 +4004,20 @@ def transcribe_openai_whisper(audio_path: Path, model: str, language: str | None
         raise RuntimeError(f"OpenAI Whisper 转写失败: {exc}") from exc
 
 
+def _local_forced_aligner_model() -> str | None:
+    """安装阶段已预下载的强制对齐器本地目录；存在则完全离线加载，不再访问 Hugging Face。"""
+    data_root = os.getenv("LOCALAPPDATA") or os.path.join(
+        str(Path.home()), "Library", "Application Support"
+    )
+    candidate = Path(data_root) / "SubFix" / "models" / "qwen3-forced-aligner-0.6b"
+    try:
+        if (candidate / "config.json").is_file():
+            return str(candidate)
+    except OSError:
+        return None
+    return None
+
+
 def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
     try:
         import torch  # type: ignore
@@ -3872,7 +4026,7 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
         raise RuntimeError("Qwen3-ASR 环境未安装，请安装 qwen-asr 或继续使用 Whisper fallback") from exc
 
     model_name = os.getenv("SUBFIX_QWEN3_ASR_MODEL") or QWEN3_ASR_MODEL
-    aligner_name = os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or QWEN3_FORCED_ALIGNER_MODEL
+    aligner_name = os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or _local_forced_aligner_model() or QWEN3_FORCED_ALIGNER_MODEL
     device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP") or "auto"
     dtype = qwen3_torch_dtype(torch)
 
@@ -3907,7 +4061,7 @@ def load_qwen3_forced_aligner() -> Any:
     except Exception as exc:  # pragma: no cover - optional local runtime
         raise RuntimeError("Qwen3-ForcedAligner 环境未安装，请运行 setup_asr_env.sh") from exc
 
-    model_name = os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or QWEN3_FORCED_ALIGNER_MODEL
+    model_name = os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or _local_forced_aligner_model() or QWEN3_FORCED_ALIGNER_MODEL
     device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP") or "auto"
     dtype = qwen3_torch_dtype(torch)
     cache_key = (model_name, device_map, str(dtype))
@@ -3938,7 +4092,10 @@ def qwen3_force_align_items(audio_path: Path, text: str, language: str) -> list[
         unit_text = str(qwen3_timestamp_value(item, "text", "word") or "")
         start = qwen3_timestamp_value(item, "start_time", "start")
         end = qwen3_timestamp_value(item, "end_time", "end")
-        if unit_text and start is not None and end is not None and float(end) > float(start):
+        # 对齐器可能对个别字符给出 start == end 的零长度时间戳：旧逻辑用 “>” 会把
+        # 整条丢掉，造成候选文本缺字（如目标“聚焦大模型”只匹配到“聚大模型”），
+        # 行相似度被压低后误判为 rejected_low_score。这里放行零长度时间戳。
+        if unit_text and start is not None and end is not None and float(end) >= float(start):
             normalized.append({"text": unit_text, "start": float(start), "end": float(end)})
     return normalized
 
@@ -4505,7 +4662,7 @@ def transcribe_external_backend(audio_path: Path, model: str, language: str | No
             model=shlex.quote(str(model)),
             language=shlex.quote(str(language or "auto")),
         )
-        result = subprocess.run(command, shell=True, text=True, capture_output=True)
+        result = subprocess.run(command, shell=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
         if result.returncode != 0:
             error_text = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(f"{backend} 执行失败: {error_text}")
@@ -6572,7 +6729,7 @@ def qwen3_cpp_forced_align_text_rows(
         "-o",
         str(output_path),
     ]
-    result = subprocess.run(cmd, text=True, capture_output=True)
+    result = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", capture_output=True)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"Qwen3 forced align 执行失败: {detail or result.returncode}")
@@ -6632,6 +6789,70 @@ def qwen3_cpp_forced_align_text_rows(
             "qwen_output_path": str(output_path),
             "qwen_cli": str(bin_path),
             "qwen_model": str(model_path),
+        },
+    }
+
+
+def qwen3_py_forced_align_text_rows(
+    audio_path: Path,
+    rows: list[dict[str, Any]],
+    language: str | None,
+    fps: float,
+    timeline_start_frame: int,
+) -> dict[str, Any]:
+    """用 transformers 版 Qwen3ForcedAligner 把文稿行强制对齐到音频。
+
+    与 qwen3_cpp_forced_align_text_rows 的 remap 逻辑完全一致，只是底层对齐引擎换成
+    安装器已预下载的 Qwen3-ForcedAligner-0.6B（HF 模型），无需单独构建 cpp 二进制。
+    对齐结果直接给出每条文稿行的绝对时间轴（基于 timeline_start_frame）。
+    """
+    alignment_text = build_alignment_text(rows)
+    if not alignment_text:
+        raise RuntimeError("Qwen3 forced align 文本为空")
+    items = qwen3_force_align_items(Path(audio_path), alignment_text, qwen3_language_name(language) or "Chinese")
+    if not items:
+        raise RuntimeError("Qwen3 forced align 没有返回时间戳")
+    row_segments = qwen3_remap_timestamp_items_to_rows(
+        rows, items, fps=fps, timeline_start_frame=timeline_start_frame
+    )
+    aligned_rows: list[dict[str, Any]] = []
+    for row, segment in zip(rows, row_segments, strict=True):
+        segment_start = float(segment.get("start") or 0.0)
+        segment_end = float(segment.get("end") or segment_start)
+        start_frame = int(round(timeline_start_frame + segment_start * fps))
+        end_frame = max(start_frame + 1, int(round(timeline_start_frame + segment_end * fps)))
+        aligned_row = {
+            "index": int(row.get("index") or (len(aligned_rows) + 1)),
+            "text": str(row.get("text") or ""),
+            "start": round(segment_start, 3),
+            "end": round(segment_end, 3),
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+        }
+        for key in (
+            "ctc_start_frame",
+            "ctc_end_frame",
+            "ctc_confidence",
+            "ctc_char_count",
+            "alignment_mode",
+            "row_remap_score",
+            "row_remap_decision",
+            "remap_text_candidate",
+            "row_remap_target",
+        ):
+            if key in segment:
+                aligned_row[key] = segment[key]
+        aligned_rows.append(aligned_row)
+    pad_aligned_rows_display(aligned_rows, fps, timeline_start_frame)
+    return {
+        "backend": "qwen3_forced_aligner_py",
+        "model": os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or _local_forced_aligner_model() or QWEN3_FORCED_ALIGNER_MODEL,
+        "aligned_rows": aligned_rows,
+        "text": alignment_text,
+        "diagnostic": {
+            "align_engine": "qwen3_py",
+            "row_count": len(rows),
+            "aligned_count": len(aligned_rows),
         },
     }
 
@@ -6989,6 +7210,152 @@ def run_qwen_forced_align_batch_plan(
     return payload
 
 
+SCRIPT_MATCH_MAX_SECONDS = 1800.0
+
+
+def load_script_match_plan(plan_json: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float, int, str]:
+    """解析文稿匹配批量计划：音频源列表 + 文稿行 + fps + 时间线起点 + 语言。"""
+    if not plan_json:
+        raise RuntimeError("缺少文稿匹配批量计划")
+    # 文稿文本可能夹带损坏/混编字节（Fusion 文本框在中文 Windows 下偶发）：
+    # 先按 UTF-8 严格解码；失败再按系统默认编码（中文 Windows 为 cp936/GBK）尝试；
+    # 仍失败则按 UTF-8 容错解码，最大限度保留有效字符（损坏字节以 U+FFFD 占位）。
+    raw = Path(plan_json).read_bytes()
+    try:
+        plan_text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        import locale
+        enc = locale.getpreferredencoding(False) or "gbk"
+        try:
+            plan_text = raw.decode(enc)
+        except UnicodeDecodeError:
+            plan_text = raw.decode("utf-8", errors="replace")
+    payload = json.loads(plan_text)
+    fps = float(payload.get("fps") or 30.0)
+    timeline_start_frame = int(float(payload.get("timeline_start_frame") or 0))
+    language = payload.get("language") or "auto"
+    audio_sources: list[dict[str, Any]] = []
+    for src in payload.get("audio_sources") or []:
+        if not src:
+            continue
+        audio_sources.append({
+            "audio": str(src.get("audio") or ""),
+            "source_start": float(src.get("source_start") or 0.0),
+            "source_end": float(src["source_end"]) if src.get("source_end") is not None else None,
+            "timeline_start_frame": int(float(src.get("timeline_start_frame") or 0)),
+            "fps": float(src.get("fps") or fps),
+            "audio_channel_index": int(src["audio_channel_index"]) if int(src.get("audio_channel_index") or 0) > 0 else None,
+        })
+    rows = normalize_rows_payload(payload.get("rows") or [])
+    # 去除容错解码产生的替换符，避免脏字符进入对齐模型。
+    for row in rows:
+        txt = row.get("text")
+        if isinstance(txt, str) and ("\ufffd" in txt):
+            row["text"] = txt.replace("\ufffd", "")
+    return audio_sources, rows, fps, timeline_start_frame, language
+
+
+def run_script_match_align(
+    audio_sources: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    fps: float,
+    timeline_start_frame: int,
+    language: str,
+    progress_path: Path | None,
+) -> dict[str, Any]:
+    """文稿匹配核心：拼接选区音频 → Qwen3 强制对齐 → 输出 subtitle_rows。
+
+    多源音频按时间线顺序用 ffmpeg amix+adelay 叠加（源间静音间隙保留为静音，因此
+    绝对时间轴与选区一致）；单源则直接裁剪。随后用 transformers 版 Qwen3ForcedAligner
+    把整段文稿对齐到拼接后的音频，字幕文字严格等于文稿。
+    """
+    if not audio_sources:
+        raise RuntimeError("文稿匹配缺少音频源")
+    if not rows:
+        raise RuntimeError("文稿匹配缺少文稿内容")
+    ffmpeg_path = resolve_ffmpeg(None)
+    if not ffmpeg_path:
+        raise RuntimeError("未找到 ffmpeg，无法拼接音频")
+
+    ordered = sorted(audio_sources, key=lambda s: float(s.get("timeline_start_frame") or 0))
+    with tempfile.TemporaryDirectory(prefix="subfix_script_match_") as tmp_root:
+        tmp_root_path = Path(tmp_root)
+        cut_paths: list[tuple[Path, float]] = []
+        for index, src in enumerate(ordered, start=1):
+            audio_path = Path(str(src.get("audio") or ""))
+            if not audio_path.exists():
+                raise RuntimeError(f"音频文件不存在: {audio_path}")
+            cut_path = tmp_root_path / f"src_{index}.wav"
+            cut_audio(
+                ffmpeg_path,
+                audio_path,
+                cut_path,
+                float(src.get("source_start") or 0.0),
+                src.get("source_end"),
+                int(src["audio_channel_index"]) if src.get("audio_channel_index") else None,
+            )
+            cut_paths.append((cut_path, float(src.get("timeline_start_frame") or 0)))
+
+        if len(cut_paths) == 1:
+            combined_path: Path = cut_paths[0][0]
+        else:
+            filter_parts: list[str] = []
+            input_args: list[str] = []
+            for i, (cut_path, offset_frame) in enumerate(cut_paths, start=1):
+                input_args.extend(["-i", str(cut_path)])
+                delay_ms = max(0, int(round((offset_frame - timeline_start_frame) / max(fps, 1.0) * 1000)))
+                filter_parts.append(f"[{i - 1}:a]adelay=delays={delay_ms}|{delay_ms}[a{i}]")
+            amix_inputs = "".join(f"[a{i}]" for i in range(1, len(cut_paths) + 1))
+            filter_parts.append(f"{amix_inputs}amix=inputs={len(cut_paths)}:normalize=0[aout]")
+            combined_path = tmp_root_path / "combined.wav"
+            cmd = [
+                ffmpeg_path, "-y", "-hide_banner", "-nostdin",
+                *input_args,
+                "-filter_complex", ";".join(filter_parts),
+                "-map", "[aout]",
+                "-ac", "1", "-ar", "16000", str(combined_path),
+            ]
+            subprocess.run(cmd, check=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
+
+        try:
+            duration = audio_duration_seconds(combined_path)
+        except Exception:
+            duration = 0.0
+        if duration > SCRIPT_MATCH_MAX_SECONDS:
+            raise RuntimeError(
+                f"文稿匹配选区过长（约 {duration:.0f}s，上限 {SCRIPT_MATCH_MAX_SECONDS:.0f}s），请缩小 In/Out 选区后重试"
+            )
+
+        # 为尚无时长的文稿行设定名义时长占位，低置信度回退行不至于全部塌缩到 0 帧。
+        nominal_slot = max(1.0, duration / max(1, len(rows)))
+        for i, row in enumerate(rows, start=1):
+            row["index"] = i
+            ns_start = timeline_start_frame + int(round((i - 1) * nominal_slot * fps))
+            row["start_frame"] = ns_start
+            row["end_frame"] = ns_start + max(1, int(round(nominal_slot * fps)))
+
+        if progress_path:
+            write_progress(progress_path, "qwen_forced_align", "正在执行 Qwen3 文稿强制对齐", align_engine="qwen3_py")
+        result = qwen3_py_forced_align_text_rows(combined_path, rows, language, fps, timeline_start_frame)
+
+        aligned_rows = result.get("aligned_rows") or []
+        subtitle_rows: list[dict[str, Any]] = []
+        for i, row in enumerate(aligned_rows, start=1):
+            row["index"] = i
+            subtitle_rows.append(row)
+        if not subtitle_rows:
+            raise RuntimeError("Qwen3 文稿对齐未产出字幕，请检查文稿与音频是否匹配")
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "subtitle_rows": subtitle_rows,
+        "diagnostic": dict(result.get("diagnostic") or {}),
+    }
+    payload["diagnostic"]["mode"] = "script_match_align"
+    payload["diagnostic"]["source_count"] = len(audio_sources)
+    return payload
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio")
@@ -7032,6 +7399,7 @@ def main(argv: list[str] | None = None) -> int:
         "--mode",
         choices=(
             "qwen_forced_align_text_batches",
+            "script_match_align",
             "transcribe",
             "generate_subtitles",
             "generate_subtitles_batch",
@@ -7136,6 +7504,12 @@ def main(argv: list[str] | None = None) -> int:
                 progress_index=completion_index,
                 progress_total=completion_total,
             )
+            return 0 if payload.get("ok") else 1
+        if args.mode == "script_match_align":
+            audio_sources, rows, fps, timeline_start_frame, language = load_script_match_plan(args.batch_plan_json)
+            payload = run_script_match_align(audio_sources, rows, fps, timeline_start_frame, language, progress_path)
+            write_payload(output_path, build_generate_writeback_payload(payload))
+            write_progress(progress_path, "done", "文稿匹配对齐已完成", progress_index=1, progress_total=1)
             return 0 if payload.get("ok") else 1
         if args.fixture_json:
             write_progress(progress_path, "write_output", "正在写入 fixture 对齐结果")

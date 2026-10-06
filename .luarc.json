@@ -1,0 +1,30 @@
+{
+  "runtime": {
+    "version": "LuaJIT"
+  },
+  "diagnostics": {
+    "globals": [
+      "fusion",
+      "bmd",
+      "resolve",
+      "fu",
+      "res",
+      "app",
+      "comp",
+      "composition",
+      "subtitle_data",
+      "align_engine",
+      "batch_payload",
+      "utf8"
+    ],
+    "disable": [
+      "undefined-field",
+      "need-check-nil",
+      "inject-field",
+      "duplicate-set-field",
+      "cast-local-type",
+      "param-type-mismatch",
+      "redundant-parameter"
+    ]
+  }
+}

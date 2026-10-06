@@ -1,6 +1,111 @@
 #!/usr/bin/env lua
 -- SubFix shared module: generate subtitles for the current DaVinci Resolve In/Out selection.
 
+-- 跨平台辅助：macOS / Windows 下路径与系统调用差异集中处理。
+-- 若 SubFix.lua 已定义则复用，否则在此定义，保证本模块作为独立入口（生成选区字幕.lua）也能运行。
+if not _G.SUBFIX_IS_WINDOWS then
+    _G.SUBFIX_PATH_SEP = package.config:sub(1, 1)
+    _G.SUBFIX_IS_WINDOWS = (_G.SUBFIX_PATH_SEP == "\\")
+
+    _G.subfix_pjoin = function(dir_path, leaf_name)
+        local dir_value = tostring(dir_path or "")
+        local name_value = tostring(leaf_name or "")
+        if dir_value == "" then return name_value end
+        if name_value == "" then return dir_value end
+        local tail = dir_value:sub(-1)
+        if tail == "/" or tail == "\\" then return dir_value .. name_value end
+        return dir_value .. _G.SUBFIX_PATH_SEP .. name_value
+    end
+
+    _G.subfix_home_dir = function()
+        return os.getenv("USERPROFILE") or os.getenv("HOME") or ""
+    end
+
+    _G.subfix_dr_utility_root = function()
+        if _G.SUBFIX_IS_WINDOWS then
+            local appdata = os.getenv("APPDATA") or ""
+            local programdata = os.getenv("ProgramData") or ""
+            local rel = "Blackmagic Design\\DaVinci Resolve\\Fusion\\Scripts\\Utility"
+            return {
+                user = appdata ~= "" and _G.subfix_pjoin(appdata, rel) or nil,
+                system = programdata ~= "" and _G.subfix_pjoin(programdata, rel) or nil
+            }
+        else
+            local home = _G.subfix_home_dir()
+            local rel = "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+            return {
+                user = home ~= "" and _G.subfix_pjoin(home, rel) or nil,
+                system = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+            }
+        end
+    end
+
+    _G.subfix_support_dir = function(utility_root)
+        return _G.subfix_pjoin(tostring(utility_root or (_G.subfix_dr_utility_root().user or "")), ".subfix_support")
+    end
+
+    _G.subfix_venv_python = function(helper_dir)
+        if _G.SUBFIX_IS_WINDOWS then
+            return _G.subfix_pjoin(helper_dir, ".subfix_asr_env\\Scripts\\python.exe")
+        end
+        return _G.subfix_pjoin(helper_dir, ".subfix_asr_env/bin/python")
+    end
+
+    _G.subfix_runtime_python = function(helper_dir)
+        if _G.SUBFIX_IS_WINDOWS then
+            return _G.subfix_pjoin(helper_dir, "runtime\\python\\python.exe")
+        end
+        return _G.subfix_pjoin(helper_dir, "runtime/python/bin/python3")
+    end
+
+    _G.subfix_dq = function(value)
+        local s = tostring(value or ""):gsub('"', '\\"')
+        return '"' .. s .. '"'
+    end
+
+    _G.subfix_open_url = function(url)
+        local u = tostring(url or "")
+        if u == "" then return false end
+        if _G.SUBFIX_IS_WINDOWS then
+            os.execute("cmd /c start \"\" " .. _G.subfix_dq(u))
+            return true
+        end
+        os.execute("/usr/bin/open " .. (shell_quote and shell_quote(u) or _G.subfix_dq(u)))
+        return true
+    end
+
+    if not _G.shell_quote then
+        _G.shell_quote = function(value)
+            if _G.SUBFIX_IS_WINDOWS then
+                return _G.subfix_dq(value)
+            end
+            local s = tostring(value or "")
+            return "'" .. s:gsub("'", "'\\''") .. "'"
+        end
+    end
+end
+
+-- 统一临时目录：Windows 用 TEMP/TMP，其余用 TMPDIR//tmp；返回值不带结尾分隔符。
+local function temp_dir()
+    local base
+    if SUBFIX_IS_WINDOWS then
+        base = os.getenv("TEMP") or os.getenv("TMP") or os.getenv("TMPDIR")
+    else
+        base = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP")
+    end
+    if not base or base == "" then
+        base = SUBFIX_IS_WINDOWS and "." or "/tmp"
+    end
+    base = tostring(base):gsub("[/\\]+$", "")
+    local root = base .. "/SubFix_GenerateSelectionSubtitles"
+    if SUBFIX_IS_WINDOWS then
+        os.execute('cmd /c if not exist "' .. root .. '" mkdir "' .. root .. '"')
+    else
+        os.execute("mkdir -p " .. shell_quote(root) .. " 2>/dev/null")
+    end
+    return root
+end
+
 local SubFixGenerateSelectionCore = {}
 local runtime_options = {}
 local TARGET_SUBTITLE_TRACK = 1
@@ -8,8 +113,6 @@ local DEFAULT_ASR_MODEL = "large-v3-turbo"
 local DEFAULT_ASR_LANGUAGE = tostring(os.getenv("SUBFIX_ASR_LANGUAGE") or "zh")
 local DEFAULT_ASR_BACKEND = "auto"
 local WORK_SCOPE_MODE_SELECTION = "selection"
-local TRACK_CHECKED_MARK = "☑"
-local TRACK_UNCHECKED_MARK = "☐"
 local FALLBACK_ITEM_SCOPE_EXPAND_MAX_GAP_FRAMES = 2
 local GENERATE_PROGRESS_BAR_WIDTH = 36
 local GENERATE_PROGRESS_STALL_WARNING_SECONDS = 300
@@ -22,6 +125,48 @@ local ui = fusion_app and fusion_app.UIManager or nil
 local dispatcher = (ui and bmd and bmd.UIDispatcher) and bmd.UIDispatcher(ui) or nil
 local ui_timer_handlers = {}
 
+-- 统一视觉常量：14px 字体 + 深色专业主题（背景 #1A212B / #0F141A、文字 #D6DDE7、强调橙 #FF6A00、选中橙 #FF6A00）。
+local DIALOG_FONT = nil
+if ui then
+    DIALOG_FONT = ui:Font{PixelSize = 14}
+end
+-- Fusion UIManager 的逐项颜色（TextColor[]/BackgroundColor[]）取值为 0–1 浮点；
+-- 传 0–255 会被钳位成 1.0（纯黄/纯白），故统一经本函数换算，避免再踩坑。
+local function ui_color(r, g, b, a)
+    return {R = r / 255, G = g / 255, B = b / 255, A = (a or 255) / 255}
+end
+local SUBFIX_TEXT_COLOR = ui_color(214, 221, 231)      -- #D6DDE7
+local SUBFIX_ACCENT_COLOR = ui_color(255, 106, 0)      -- #FF6A00
+local SUBFIX_CHECKED_COLOR = ui_color(255, 106, 0)     -- #FF6A00
+-- 音频轨道树样式改用窗口级 QSS 承载：未选中=白灰字(#C2C7D0)，选中=橙底(#FF6A00)+白字，
+-- 通过 selection-background-color / ::item:selected 覆盖原生高亮（原生高亮本机可见，仅颜色需改）。
+-- 根容器样式：作用于窗口内所有控件（统一字体、深色背景、蓝色强调、对齐留白）。
+local SUBFIX_ROOT_STYLESHEET = [[
+QWidget { font-size: 14px; color: #D6DDE7; background-color: #1A212B; }
+QLabel { font-size: 14px; color: #D6DDE7; background-color: transparent; }
+QPushButton { font-size: 14px; background-color: #243240; color: #D6DDE7; border: 1px solid #34506b; border-radius: 5px; padding: 6px 12px; }
+QPushButton:hover { background-color: #2c3e52; border: 1px solid #FF6A00; }
+QLineEdit, QTextEdit, QComboBox { background-color: #0F141A; color: #D6DDE7; border: 1px solid #34506b; border-radius: 5px; padding: 6px; font-size: 14px; }
+QTreeWidget { background-color: #0F141A; color: #C2C7D0; border: 1px solid #34506b; border-radius: 5px; font-size: 14px; selection-background-color: #FF6A00; selection-color: #FFFFFF; }
+QTreeWidget::item:selected { background-color: #FF6A00; color: #FFFFFF; }
+QTreeWidget::item:!selected:hover { background-color: #243240; }
+QTreeWidget::item { padding: 6px; }
+QComboBox QAbstractItemView { background-color: #0F141A; color: #D6DDE7; selection-background-color: #FF6A00; }
+]]
+-- 主操作/选中态按钮的蓝色强调样式；未选中按钮的基础样式。
+local SUBFIX_BTN_ACCENT = "QPushButton{font-size:14px;background-color:#FF6A00;color:#FFFFFF;font-weight:bold;border:1px solid #FF6A00;border-radius:5px;padding:6px 12px;} QPushButton:hover{background-color:#CC5600;}"
+local SUBFIX_BTN_BASE = "QPushButton{font-size:14px;background-color:#243240;color:#D6DDE7;border:1px solid #34506b;border-radius:5px;padding:6px 12px;}"
+-- 选中态：描边高亮（不填充），与"橙色边框"一致的观感
+local SUBFIX_BTN_SELECTED = "QPushButton{font-size:14px;background-color:#1A212B;color:#FF6A00;font-weight:bold;border:1px solid #FF6A00;border-radius:5px;padding:6px 12px;} QPushButton:hover{background-color:#243240;border:1px solid #FF8C33;}"
+-- 切换按钮统一样式：未选中=深灰底+灰边框+灰白字；选中(:checked)=深底+橙边框+橙字。
+-- 用 Qt 的 :checked 伪状态驱动选中态，避免依赖运行时改写 StyleSheet（本机 Fusion 运行时改 StyleSheet 不生效）。
+local SUBFIX_BTN_TOGGLE = [[
+QPushButton{font-size:14px;background-color:#243240;color:#D6DDE7;border:1px solid #34506b;border-radius:5px;padding:6px 12px;}
+QPushButton:hover{background-color:#2c3e52;border:1px solid #FF8C33;}
+QPushButton:checked{background-color:#1A212B;color:#FF6A00;font-weight:bold;border:1px solid #FF6A00;}
+QPushButton:checked:hover{background-color:#243240;border:1px solid #FF8C33;}
+]]
+
 if dispatcher and dispatcher.On then
     function dispatcher.On.Timeout(ev)
         local timer_id = tostring(ev and ev.who or "")
@@ -31,6 +176,15 @@ if dispatcher and dispatcher.On then
 end
 
 local function shell_quote(value)
+    -- Windows 的 cmd.exe 不认 POSIX 单引号：'C:\...\python.exe' 会被当成含非法字符的
+    -- 文件名，报 “The filename, directory name, or volume label syntax is incorrect.”。
+    -- 必须复用全局的 Windows 感知实现（双引号）；POSIX 分支保持单引号转义不变。
+    -- 注意：此局部函数会遮蔽全局 shell_quote，因此这里必须自己处理平台差异。
+    if _G.SUBFIX_IS_WINDOWS then
+        if _G.subfix_dq then return _G.subfix_dq(value) end
+        local fallback = tostring(value or ""):gsub('"', "")
+        return '"' .. fallback .. '"'
+    end
     local text = tostring(value or "")
     return "'" .. text:gsub("'", "'\\''") .. "'"
 end
@@ -83,6 +237,7 @@ function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     const visible = screenRect(selected.visibleFrame);
     return [visible.x, visible.y, visible.width, visible.height].join(",");
 })();]]
+    if SUBFIX_IS_WINDOWS then return nil end
     local escaped = jxa:gsub("'", "'\\\"'\\\"'")
     local pipe = io.popen("/usr/bin/osascript -l JavaScript -e '" .. escaped .. "' 2>/dev/null", "r")
     if not pipe then return nil end
@@ -164,6 +319,8 @@ local function set_tree_item_text(item, column, text)
     pcall(function() item.Text[column] = tostring(text or "") end)
 end
 
+
+
 local function get_tree_event_value(ev, keys)
     for _, key in ipairs(keys or {}) do
         if ev and ev[key] ~= nil then return ev[key] end
@@ -198,6 +355,25 @@ local function trim_text(value)
     return tostring(value or ""):match("^%s*(.-)%s*$") or ""
 end
 
+-- 从 .srt 文本中抽取字幕正文：跳过序号行与 "-->" 时间轴行，保留其余文本行。
+local function extract_srt_text(content)
+    if not content then return "" end
+    local out = {}
+    for line in (content .. "\n"):gmatch("(.-)\n") do
+        local s = trim_text(line)
+        if s ~= "" then
+            if string.match(s, "^%d+$") then
+                -- 序号行，跳过
+            elseif string.match(s, "%d+:%d+:%d+[%.,]%d+%s*%-%->%s*%d+:%d+:%d+[%.,]%d+") then
+                -- 时间轴行，跳过
+            else
+                out[#out + 1] = s
+            end
+        end
+    end
+    return table.concat(out, "\n")
+end
+
 local function decode_json_text(json_text)
     if type(json_text) ~= "string" or json_text == "" then return nil, "JSON 为空" end
     local pos = 1
@@ -230,8 +406,38 @@ local function decode_json_text(json_text)
                     parts[#parts + 1] = mapped
                     pos = pos + 2
                 elseif esc == "u" then
-                    parts[#parts + 1] = "?"
+                    -- 正确解码 \uXXXX（含代理对），编码回 UTF-8 字节，避免中文变成乱码/问号。
+                    local code = tonumber(json_text:sub(pos + 2, pos + 5), 16)
+                    if not code then fail("bad unicode escape") end
                     pos = pos + 6
+                    if code >= 0xD800 and code <= 0xDBFF and json_text:sub(pos, pos + 1) == "\\u" then
+                        local low = tonumber(json_text:sub(pos + 2, pos + 5), 16)
+                        if low and low >= 0xDC00 and low <= 0xDFFF then
+                            code = 0x10000 + (code - 0xD800) * 0x400 + (low - 0xDC00)
+                            pos = pos + 6
+                        end
+                    end
+                    if code < 0x80 then
+                        parts[#parts + 1] = string.char(code)
+                    elseif code < 0x800 then
+                        parts[#parts + 1] = string.char(
+                            0xC0 + math.floor(code / 0x40),
+                            0x80 + (code % 0x40)
+                        )
+                    elseif code < 0x10000 then
+                        parts[#parts + 1] = string.char(
+                            0xE0 + math.floor(code / 0x1000),
+                            0x80 + (math.floor(code / 0x40) % 0x40),
+                            0x80 + (code % 0x40)
+                        )
+                    else
+                        parts[#parts + 1] = string.char(
+                            0xF0 + math.floor(code / 0x40000),
+                            0x80 + (math.floor(code / 0x1000) % 0x40),
+                            0x80 + (math.floor(code / 0x40) % 0x40),
+                            0x80 + (code % 0x40)
+                        )
+                    end
                 else
                     fail("bad escape")
                 end
@@ -319,11 +525,135 @@ local function decode_json_text(json_text)
     return nil, tostring(result)
 end
 
+-- Windows 下 Resolve 自带 Lua（LuaJIT）用 ANSI 的 io.open，打不开中文/Unicode 路径。
+-- 这里尝试用宽字符 API GetFileAttributesW 作为回退，并用 ffi 调用。
+local _subfix_ffi = nil
+local _subfix_get_file_attributes_w = nil
+do
+    local ok_ffi, f = pcall(require, "ffi")
+    if ok_ffi and f then
+        _subfix_ffi = f
+        pcall(function()
+            _subfix_ffi.cdef[[ int __stdcall GetFileAttributesW(const wchar_t* lpFileName); ]]
+            _subfix_get_file_attributes_w = _subfix_ffi.C.GetFileAttributesW
+        end)
+    end
+end
+
+-- Fusion 文本框（中文 Windows）返回的是系统 ANSI/GBK 字节，而本模块与下游 Python 均按 UTF-8 处理。
+-- 这里用 FFI 把 ANSI/GBK 文本转成 UTF-8；若已是合法 UTF-8 或无法转换，则原样返回（交由 Python 端按系统编码兜底）。
+local _subfix_mbwc, _subfix_wcmb = nil, nil
+if _subfix_ffi then
+    pcall(function()
+        _subfix_ffi.cdef[[
+            int __stdcall MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char* lpMultiByteStr, int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
+            int __stdcall WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags, const wchar_t* lpWideCharStr, int cchWideChar, char* lpMultiByteStr, int cbMultiByte, const char* lpDefaultChar, int* lpUsedDefaultChar);
+        ]]
+        _subfix_mbwc = _subfix_ffi.C.MultiByteToWideChar
+        _subfix_wcmb = _subfix_ffi.C.WideCharToMultiByte
+    end)
+end
+
+local function subfix_is_utf8(s)
+    if type(s) ~= "string" then return true end
+    local i, n = 1, #s
+    while i <= n do
+        local b = string.byte(s, i)
+        local len
+        if b < 0x80 then len = 1
+        elseif b >= 0xC2 and b <= 0xDF then len = 2
+        elseif b >= 0xE0 and b <= 0xEF then len = 3
+        elseif b >= 0xF0 and b <= 0xF4 then len = 4
+        else return false end
+        if i + len - 1 > n then return false end
+        for k = 1, len - 1 do
+            local b2 = string.byte(s, i + k)
+            if b2 < 0x80 or b2 > 0xBF then return false end
+        end
+        i = i + len
+    end
+    return true
+end
+
+local function subfix_ansi_to_utf8(s)
+    if type(s) ~= "string" or s == "" then return s end
+    if subfix_is_utf8(s) then
+        return s
+    end
+    if not _subfix_ffi or not _subfix_mbwc or not _subfix_wcmb then
+        return s
+    end
+    local CP_ACP, CP_UTF8 = 0, 65001
+    local wlen = _subfix_mbwc(CP_ACP, 0, s, -1, nil, 0)
+    if not wlen or wlen <= 0 then return s end
+    local wbuf = _subfix_ffi.new("wchar_t[?]", wlen)
+    _subfix_mbwc(CP_ACP, 0, s, -1, wbuf, wlen)
+    local blen = _subfix_wcmb(CP_UTF8, 0, wbuf, -1, nil, 0, nil, nil)
+    if not blen or blen <= 0 then return s end
+    local bbuf = _subfix_ffi.new("char[?]", blen)
+    _subfix_wcmb(CP_UTF8, 0, wbuf, -1, bbuf, blen, nil, nil)
+    local out = _subfix_ffi.string(bbuf, blen - 1)
+    -- 仅当转换结果是合法 UTF-8 才采用；否则原样返回，交由 Python 端容错解码，
+    -- 避免把“以 UTF-8 为主、夹带少量损坏字节”的文本当成纯 GBK 转坏。
+    if subfix_is_utf8(out) then
+        return out
+    end
+    return s
+end
+
+-- 将 UTF-8 字符串转为 UTF-16LE 字节串。
+local function subfix_utf8_to_utf16le(s)
+    if type(s) ~= "string" then return nil end
+    local out = {}
+    local i, n = 1, #s
+    while i <= n do
+        local b = string.byte(s, i)
+        local cp
+        if b < 0x80 then
+            cp, i = b, i + 1
+        elseif b < 0xC0 then
+            cp, i = b, i + 1
+        elseif b < 0xE0 then
+            cp = ((b - 0xC0) * 0x40) + (string.byte(s, i + 1) - 0x80)
+            i = i + 2
+        elseif b < 0xF0 then
+            cp = ((b - 0xE0) * 0x1000) + ((string.byte(s, i + 1) - 0x80) * 0x40) + (string.byte(s, i + 2) - 0x80)
+            i = i + 3
+        else
+            cp = ((b - 0xF0) * 0x40000) + ((string.byte(s, i + 1) - 0x80) * 0x1000) + ((string.byte(s, i + 2) - 0x80) * 0x40) + (string.byte(s, i + 3) - 0x80)
+            i = i + 4
+        end
+        if cp < 0x10000 then
+            out[#out + 1] = string.char(cp % 256)
+            out[#out + 1] = string.char(math.floor(cp / 256))
+        else
+            cp = cp - 0x10000
+            local hi = 0xD800 + math.floor(cp / 0x400)
+            local lo = 0xDC00 + (cp % 0x400)
+            out[#out + 1] = string.char(hi % 256); out[#out + 1] = string.char(math.floor(hi / 256))
+            out[#out + 1] = string.char(lo % 256); out[#out + 1] = string.char(math.floor(lo / 256))
+        end
+    end
+    return table.concat(out)
+end
+
 local function file_exists(path)
-    local file = io.open(tostring(path or ""), "rb")
+    path = tostring(path or "")
+    if path == "" then return false end
+    local file = io.open(path, "rb")
     if file then
         file:close()
         return true
+    end
+    -- ANSI io.open 打不开中文路径：用 GetFileAttributesW 宽字符判定。
+    if _subfix_get_file_attributes_w and _subfix_ffi then
+        local ok, w = pcall(subfix_utf8_to_utf16le, path)
+        if ok and w then
+            local buf = _subfix_ffi.new("char[?]", #w + 2)
+            _subfix_ffi.copy(buf, w .. "\0\0")
+            local attr = _subfix_get_file_attributes_w(_subfix_ffi.cast("wchar_t*", buf))
+            if attr ~= -1 then return true end
+        end
     end
     return false
 end
@@ -362,37 +692,38 @@ end
 
 local function resolve_asr_paths()
     local root = configured_script_root()
-    local helper_dir = root .. "/.subfix_support"
-    local home_dir = os.getenv("HOME") or ""
-    local user_support_dir = home_dir ~= "" and (home_dir .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support") or helper_dir
-    local user_python = user_support_dir .. "/.subfix_asr_env/bin/python"
-    local user_runtime_python = user_support_dir .. "/runtime/python/bin/python3"
+    local helper_dir = subfix_pjoin(root, ".subfix_support")
+    local setup_ext = SUBFIX_IS_WINDOWS and ".ps1" or ".sh"
+    local utility = subfix_dr_utility_root()
+    local user_support_dir = utility.user and subfix_support_dir(utility.user) or helper_dir
+    local user_python = utility.user and subfix_venv_python(user_support_dir) or ""
+    local user_runtime_python = utility.user and subfix_runtime_python(user_support_dir) or ""
     local paths = {
-        helper = helper_dir .. "/subfix_asr_transcribe.py",
-        qwen_manager = helper_dir .. "/subfix_qwen_local_manager.py",
-        process_group = helper_dir .. "/subfix_process_group.py",
-        setup = helper_dir .. "/setup_asr_env.sh",
-        python = helper_dir .. "/.subfix_asr_env/bin/python",
-        runtime_python = helper_dir .. "/runtime/python/bin/python3",
-        diagnostic = user_support_dir .. "/last_generate_diagnostic.json",
-        hotwords = user_support_dir .. "/hotwords.json"
+        helper = subfix_pjoin(helper_dir, "subfix_asr_transcribe.py"),
+        qwen_manager = subfix_pjoin(helper_dir, "subfix_qwen_local_manager.py"),
+        process_group = subfix_pjoin(helper_dir, "subfix_process_group.py"),
+        setup = subfix_pjoin(helper_dir, "setup_asr_env" .. setup_ext),
+        python = subfix_venv_python(helper_dir),
+        runtime_python = subfix_runtime_python(helper_dir),
+        diagnostic = subfix_pjoin(user_support_dir, "last_generate_diagnostic.json"),
+        hotwords = subfix_pjoin(user_support_dir, "hotwords.json")
     }
-    if not file_exists(paths.helper) and file_exists(root .. "/subfix_asr_transcribe.py") then
-        paths.helper = root .. "/subfix_asr_transcribe.py"
-        paths.qwen_manager = root .. "/subfix_qwen_local_manager.py"
-        paths.process_group = root .. "/subfix_process_group.py"
-        paths.setup = root .. "/setup_asr_env.sh"
-        paths.python = root .. "/.subfix_asr_env/bin/python"
-        paths.runtime_python = root .. "/runtime/python/bin/python3"
+    if not file_exists(paths.helper) and file_exists(subfix_pjoin(root, "subfix_asr_transcribe.py")) then
+        paths.helper = subfix_pjoin(root, "subfix_asr_transcribe.py")
+        paths.qwen_manager = subfix_pjoin(root, "subfix_qwen_local_manager.py")
+        paths.process_group = subfix_pjoin(root, "subfix_process_group.py")
+        paths.setup = subfix_pjoin(root, "setup_asr_env" .. setup_ext)
+        paths.python = subfix_venv_python(root)
+        paths.runtime_python = subfix_runtime_python(root)
     end
     local module_dir = script_dir()
-    if not file_exists(paths.helper) and file_exists(module_dir .. "/subfix_asr_transcribe.py") then
-        paths.helper = module_dir .. "/subfix_asr_transcribe.py"
-        paths.qwen_manager = module_dir .. "/subfix_qwen_local_manager.py"
-        paths.process_group = module_dir .. "/subfix_process_group.py"
-        paths.setup = module_dir .. "/setup_asr_env.sh"
-        paths.python = module_dir .. "/.subfix_asr_env/bin/python"
-        paths.runtime_python = module_dir .. "/runtime/python/bin/python3"
+    if not file_exists(paths.helper) and file_exists(subfix_pjoin(module_dir, "subfix_asr_transcribe.py")) then
+        paths.helper = subfix_pjoin(module_dir, "subfix_asr_transcribe.py")
+        paths.qwen_manager = subfix_pjoin(module_dir, "subfix_qwen_local_manager.py")
+        paths.process_group = subfix_pjoin(module_dir, "subfix_process_group.py")
+        paths.setup = subfix_pjoin(module_dir, "setup_asr_env" .. setup_ext)
+        paths.python = subfix_venv_python(module_dir)
+        paths.runtime_python = subfix_runtime_python(module_dir)
     end
     if not file_exists(paths.python) and file_exists(user_python) then
         paths.python = user_python
@@ -408,19 +739,27 @@ local function build_qwen_status_command(paths, output_path)
         return nil, "未找到本地 Qwen 安装管理器"
     end
     return table.concat({
-        "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
+        shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
         "--action", "status", "--output", shell_quote(output_path),
     }, " "), nil
 end
 
 local function inspect_local_qwen(paths)
-    local temporary_root = os.getenv("TMPDIR") or "/tmp"
+    local temporary_root = temp_dir()
     local output_path = temporary_root .. "/subfix_qwen_status_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
     local cmd = build_qwen_status_command(paths, output_path)
     if not cmd then return {state = "missing", ready = false} end
-    os.execute(cmd .. " >/dev/null 2>&1")
+    if SUBFIX_IS_WINDOWS then
+        -- 关键：Lua 的 os.execute 走 C system()（cmd /c <命令>，不会额外包一层引号）。
+        -- 命令行以引号开头且含多组引号时，cmd 会剥掉首尾引号，把带空格的 Python 路径劈断，
+        -- 导致 status 检测永远失败（表现为“本地 Qwen 安装后校验未通过”）。
+        -- 加 call 前缀可让 cmd 正确解析带引号的程序路径（已用 msvcrt.system 实测 rc=0 并产出 JSON）。
+        os.execute("call " .. cmd .. " >nul 2>nul")
+    else
+        os.execute(cmd .. " >/dev/null 2>&1")
+    end
     local payload = decode_json_text(read_text_file(output_path) or "")
-    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    pcall(function() os.remove(output_path) end)
     if type(payload) ~= "table" then return {state = "missing", ready = false} end
     payload.ready = payload.ready == true
     return payload
@@ -430,7 +769,7 @@ local function build_qwen_install_command(paths, output_path, progress_path)
     if not file_exists(paths.runtime_python) then return nil, "未找到 SubFix 内置 Python" end
     if not file_exists(paths.qwen_manager) then return nil, "缺少本地 Qwen 安装管理器" end
     return table.concat({
-        "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
+        shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
         "--action", "install", "--output", shell_quote(output_path),
         "--progress-json", shell_quote(progress_path),
     }, " "), nil
@@ -628,12 +967,6 @@ local function save_generate_hotword_entries(entries)
     return write_text_file(path, '{"version":1,"entries":[' .. table.concat(parts, ",") .. "]}\n")
 end
 
-local function temp_dir()
-    local root = (os.getenv("TMPDIR") or "/tmp") .. "/SubFix_GenerateSelectionSubtitles"
-    os.execute("mkdir -p " .. shell_quote(root) .. " 2>/dev/null")
-    return root
-end
-
 local function parse_fps(value)
     local text = tostring(value or "")
     if text == "29.97" then return 30000 / 1001 end
@@ -677,6 +1010,17 @@ local function timecode_to_frame(value, fps)
     local rate = math.max(1, tonumber(fps) or 30)
     local total_seconds = (tonumber(hh) or 0) * 3600 + (tonumber(mm) or 0) * 60 + (tonumber(ss) or 0)
     return math.floor(total_seconds * rate + (tonumber(ff) or 0) + 0.5)
+end
+
+-- Resolve 的 TimelineItem:GetStart()/GetEnd() 在不同版本/平台可能返回帧数或时间码字符串。
+-- 统一转成帧：数值直接用，时间码用 timecode_to_frame。这样与 read_generation_scope
+-- 通过 normalize_mark_frame 算出的选区帧处于同一坐标系（时间线起点为 0 时二者一致）。
+local function subfix_item_frame_bounds(item, fps)
+    local ok_s, s = pcall(function() return item:GetStart() end)
+    local ok_e, e = pcall(function() return item:GetEnd() end)
+    s = ok_s and (tonumber(s) or timecode_to_frame(s, fps)) or nil
+    e = ok_e and (tonumber(e) or timecode_to_frame(e, fps)) or nil
+    return s, e
 end
 
 local function srt_time_to_frame(value, fps, base_frame)
@@ -804,10 +1148,7 @@ local function expand_scope_from_seed_item(timeline, track_type, track_index, se
     local records = {}
     local seed_record_index = nil
     for item_index, item in ipairs(items or {}) do
-        local ok_start, item_start = pcall(function() return item:GetStart() end)
-        local ok_end, item_end = pcall(function() return item:GetEnd() end)
-        item_start = ok_start and tonumber(item_start) or nil
-        item_end = ok_end and tonumber(item_end) or nil
+        local item_start, item_end = subfix_item_frame_bounds(item, nil)
         if item_start and item_end and item_end > item_start then
             local record = {
                 item = item,
@@ -931,10 +1272,7 @@ local function read_selected_timeline_item_scope(timeline)
             items = ok_items and items or {}
             for _, item in ipairs(items or {}) do
                 if timeline_item_is_selected and timeline_item_is_selected(item) then
-                    local ok_start, item_start = pcall(function() return item:GetStart() end)
-                    local ok_end, item_end = pcall(function() return item:GetEnd() end)
-                    item_start = ok_start and tonumber(item_start) or nil
-                    item_end = ok_end and tonumber(item_end) or nil
+                    local item_start, item_end = subfix_item_frame_bounds(item, nil)
                     if item_start and item_end and item_end > item_start then
                         local expanded_start, expanded_end, expanded_count = expand_scope_from_seed_item(
                             timeline,
@@ -999,10 +1337,7 @@ local function find_playhead_item_scope_in_track_type(timeline, fps, track_type,
         local ok_items, items = pcall(function() return timeline:GetItemListInTrack(track_type, track_index) end)
         items = ok_items and items or {}
         for item_index, item in ipairs(items or {}) do
-            local ok_start, item_start = pcall(function() return item:GetStart() end)
-            local ok_end, item_end = pcall(function() return item:GetEnd() end)
-            item_start = ok_start and tonumber(item_start) or nil
-            item_end = ok_end and tonumber(item_end) or nil
+            local item_start, item_end = subfix_item_frame_bounds(item, fps)
             if item_start and item_end and item_start <= playhead_frame and playhead_frame < item_end then
                 local duration = item_end - item_start
                 if duration > 0 and (
@@ -1088,11 +1423,17 @@ end
 
 local function get_audio_item_file_path(item)
     local ok_media, media_item = pcall(function() return item:GetMediaPoolItem() end)
-    if not ok_media or not media_item then return nil end
+    if not ok_media or not media_item then
+        print("[SubFix Generate] 音频片段 GetMediaPoolItem 失败，无法定位媒体文件")
+        return nil
+    end
     local ok_path, raw_path = pcall(function() return media_item:GetClipProperty("File Path") end)
     if ok_path and raw_path and tostring(raw_path) ~= "" then
         local file_path = tostring(raw_path)
         if file_exists(file_path) then return file_path end
+        print("[SubFix Generate] 文件存在性检查失败，原始路径=[" .. file_path .. "]")
+    else
+        print("[SubFix Generate] 无法读取音频片段的 File Path 属性")
     end
     return nil
 end
@@ -1270,15 +1611,14 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
 
     local audio_sources = {}
     local effective_fps = math.max(1, tonumber(fps) or 30)
+    local seen_items, items_with_path = 0, 0
     for track_index = 1, track_count do
         local track_display_name = get_audio_track_display_name(timeline, track_index)
         local ok_items, items = pcall(function() return timeline:GetItemListInTrack("audio", track_index) end)
         items = ok_items and items or {}
         for item_index, item in ipairs(items or {}) do
-            local ok_start, item_start = pcall(function() return item:GetStart() end)
-            local ok_end, item_end = pcall(function() return item:GetEnd() end)
-            item_start = ok_start and tonumber(item_start) or nil
-            item_end = ok_end and tonumber(item_end) or nil
+            local item_start, item_end = subfix_item_frame_bounds(item, fps)
+            seen_items = seen_items + 1
             if item_start and item_end and item_end > item_start then
                 local overlap_start = math.max(scope_start, item_start)
                 local overlap_end = math.min(scope_end, item_end)
@@ -1286,6 +1626,7 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
                 if overlap_frames > 0 then
                     local file_path = get_audio_item_file_path(item)
                     if file_path then
+                        items_with_path = items_with_path + 1
                         local source_offset_frames = get_audio_item_source_offset_frames(item)
                         local ok_media, media_item = pcall(function() return item:GetMediaPoolItem() end)
                         media_item = ok_media and media_item or nil
@@ -1330,7 +1671,9 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
     end)
 
     if #audio_sources == 0 then
-        return nil, "未找到与选区重叠的本地音频片段"
+        return nil, string.format(
+            "未找到与选区重叠的本地音频片段（已扫描 %d 条音频片段，%d 条能定位到文件；音频轨 %d 条，fps %s）",
+            seen_items, items_with_path, track_count, tostring(fps))
     end
     return audio_sources
 end
@@ -1673,7 +2016,7 @@ local function clone_audio_source(source)
 end
 
 local function rounded_number_key(value, precision)
-    local multiplier = math.pow(10, tonumber(precision) or 3)
+    local multiplier = 10 ^ (tonumber(precision) or 3)
     return tostring(math.floor((tonumber(value) or 0) * multiplier + 0.5) / multiplier)
 end
 
@@ -1939,27 +2282,23 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local subtitle_mode = "live"
     -- 字幕长度：标准（≤25字）/ 短视频（≤10字），默认标准。仅控制断句粒度
     -- （每条字幕最大字数），不涉及回声消除或断句算法本体。
-    -- UI 用两个互斥的小勾选项代替下拉框/大按钮：与上方音频轨道列表同款的
-    -- ☑/☐ 勾选样式，紧凑、一眼看出当前选中项。
+    -- UI 用两个互斥的切换按钮表示选中项：选中态用橙色描边高亮（SUBFIX_BTN_SELECTED），
+    -- 未选中用深灰（SUBFIX_BTN_BASE），紧凑且一眼看出当前选中项。
     local SUBTITLE_LENGTH_OPTIONS = {
         {label = "标准（≤25字）", max_chars = 25},
         {label = "短视频（≤10字）", max_chars = 10},
     }
-    local SUBTITLE_LENGTH_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
-    local SUBTITLE_LENGTH_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_length_index = 1
     local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[1].max_chars
     -- 识别模型：主面板只保留 Qwen（本地）与豆包（云端）两个入口；豆包具体版本
     -- 在配置窗口内选择，并通过 selected_doubao_backend 映射到实际 helper backend。
     -- 仅决定把哪个 --backend 传给 ASR helper，不改断句/回声/对齐算法本体。默认
     -- Qwen(auto) 时与现状完全一致（build 传 DEFAULT_ASR_BACKEND == "auto"）。UI 复用
-    -- 与字幕长度同款的 ☑/☐ 互斥小勾选样式。
+    -- 与字幕长度同款的互斥切换按钮（橙色描边=选中）。
     local SUBTITLE_ENGINE_OPTIONS = {
         {label = "Qwen（本地）", backend = "auto"},
         {label = "豆包（云端）", backend = "doubao"},
     }
-    local SUBTITLE_ENGINE_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
-    local SUBTITLE_ENGINE_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_engine_index = 1
     local selected_doubao_backend = read_doubao_backend_preference()
     -- 记住上次选择的识别模型：命中偏好则默认选它（找不到/无偏好则保持默认 Qwen）。
@@ -1981,44 +2320,61 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local dialog_cancelled = false
     local qwen_install_requested = false
     local track_rows = {}
+    local script_match_enabled = false
+    local script_match_text = ""
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
         WindowTitle = "SubFix · 生成选区字幕",
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 420, 316}),
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 440, 560}),
     },
     ui:VGroup{
-        Spacing = 8,
-        ContentsMargins = {12, 12, 12, 18},
+        Font = DIALOG_FONT,
+        StyleSheet = SUBFIX_ROOT_STYLESHEET,
+        Spacing = 11,
+        ContentsMargins = {16, 16, 16, 16},
         ui:Label{ID = "GenerateSelectionInfoLabel", Text = "选择用于识别的音频轨道", Weight = 0},
         ui:Tree{
             ID = "GenerateAudioTrackTree",
             Weight = 1,
-            MinimumSize = {0, 90},
+            MinimumSize = {0, 120},
             Events = {ItemClicked = true}
         },
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
-            ui:Label{Text = "字幕长度：", Weight = 0},
-            ui:Button{ID = "GenerateSubtitleLengthStandardBtn", Text = "标准（≤25字）", Weight = 0, MinimumSize = {0, 20}},
-            ui:Button{ID = "GenerateSubtitleLengthShortBtn", Text = "短视频（≤10字）", Weight = 0, MinimumSize = {0, 20}},
+            ui:Label{Text = "字幕长度：", Weight = 0, MinimumSize = {76, 0}, Alignment = {AlignRight = true, AlignVCenter = true}},
+            ui:Button{ID = "GenerateSubtitleLengthStandardBtn", Text = "标准（≤25字）", Weight = 0, MinimumSize = {0, 20}, Checkable = true, Checked = true, StyleSheet = SUBFIX_BTN_TOGGLE},
+            ui:Button{ID = "GenerateSubtitleLengthShortBtn", Text = "短视频（≤10字）", Weight = 0, MinimumSize = {0, 20}, Checkable = true, Checked = false, StyleSheet = SUBFIX_BTN_TOGGLE},
             ui:HGap(0, 1)
         },
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
-            ui:Label{Text = "识别模型：", Weight = 0},
-            ui:Button{ID = "GenerateSubtitleEngineQwenBtn", Text = "Qwen（本地）", Weight = 0, MinimumSize = {0, 20}},
-            ui:Button{ID = "GenerateSubtitleEngineDoubaoBtn", Text = "豆包（云端）", Weight = 0, MinimumSize = {0, 20}},
+            ui:Label{Text = "识别模型：", Weight = 0, MinimumSize = {76, 0}, Alignment = {AlignRight = true, AlignVCenter = true}},
+            ui:Button{ID = "GenerateSubtitleEngineQwenBtn", Text = "Qwen（本地）", Weight = 0, MinimumSize = {0, 20}, Checkable = true, Checked = true, StyleSheet = SUBFIX_BTN_TOGGLE},
+            ui:Button{ID = "GenerateSubtitleEngineDoubaoBtn", Text = "豆包（云端）", Weight = 0, MinimumSize = {0, 20}, Checkable = true, Checked = false, StyleSheet = SUBFIX_BTN_TOGGLE},
             ui:HGap(0, 1)
         },
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
-            ui:Label{Text = "热词库：", Weight = 0},
-            ui:Button{ID = "GenerateHotwordToggleBtn", Text = "", Weight = 0, MinimumSize = {0, 20}},
+            ui:Label{Text = "热词库：", Weight = 0, MinimumSize = {76, 0}, Alignment = {AlignRight = true, AlignVCenter = true}},
+            ui:Button{ID = "GenerateHotwordToggleBtn", Text = "", Weight = 0, MinimumSize = {0, 20}, Checkable = true, Checked = false, StyleSheet = SUBFIX_BTN_TOGGLE},
             ui:Button{ID = "GenerateHotwordManageBtn", Text = "管理…", Weight = 0, MinimumSize = {0, 20}},
             ui:HGap(0, 1)
+        },
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:Label{Text = "文稿匹配：", Weight = 0, MinimumSize = {76, 0}, Alignment = {AlignRight = true, AlignVCenter = true}},
+            ui:Button{ID = "GenerateScriptMatchToggleBtn", Text = "", Weight = 0, MinimumSize = {0, 20}, Checkable = true, Checked = false, StyleSheet = SUBFIX_BTN_TOGGLE},
+            ui:Button{ID = "GenerateScriptMatchEditBtn", Text = "文稿…", Weight = 0, MinimumSize = {0, 20}},
+            ui:HGap(0, 1)
+        },
+        ui:Label{
+            ID = "GenerateScriptMatchStatusLabel",
+            Text = "关闭：使用识别模型生成字幕",
+            Weight = 0
         },
         ui:Label{
             ID = "GenerateSelectionRangeLabel",
@@ -2035,7 +2391,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             Weight = 0,
             Spacing = 8,
             MinimumSize = {0, 36},
-            ui:Button{ID = "GenerateSelectionConfirmBtn", Text = "生成", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateSelectionConfirmBtn", Text = "生成", Weight = 1, MinimumSize = {0, 30}, StyleSheet = SUBFIX_BTN_ACCENT},
             ui:Button{ID = "GenerateSelectionCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
         },
         ui:VGap(8, 0)
@@ -2044,24 +2400,32 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local items = selection_window:GetItems()
     local track_tree = items and items.GenerateAudioTrackTree or nil
     if not track_tree then return nil, nil, nil, nil, "无法初始化音频轨道列表" end
-    pcall(function() track_tree.ColumnCount = 2 end)
+    pcall(function() track_tree.ColumnCount = 1 end)
     pcall(function() track_tree.HeaderHidden = true end)
     pcall(function() track_tree.RootIsDecorated = false end)
     pcall(function() track_tree.ItemsExpandable = false end)
-    pcall(function() track_tree.ColumnWidth[0] = 28 end)
-    pcall(function() track_tree.ColumnWidth[1] = 340 end)
+    pcall(function() track_tree.ColumnWidth[0] = 360 end)
+    -- 选择语义：ExtendedSelection = 普通点击单选互斥、Ctrl/Shift 点击多选（原生绘制，无需手写修饰键）。
+    pcall(function() track_tree.SelectionMode = "ExtendedSelection" end)
+    pcall(function() track_tree.SelectionBehavior = "SelectRows" end)
 
     local length_standard_btn = items and items.GenerateSubtitleLengthStandardBtn or nil
     local length_short_btn = items and items.GenerateSubtitleLengthShortBtn or nil
 
     local function refresh_subtitle_length_buttons()
         if length_standard_btn then
-            local prefix = selected_length_index == 1 and SUBTITLE_LENGTH_SELECTED_PREFIX or SUBTITLE_LENGTH_UNSELECTED_PREFIX
-            pcall(function() length_standard_btn.Text = prefix .. SUBTITLE_LENGTH_OPTIONS[1].label end)
+            local selected = selected_length_index == 1
+            pcall(function() length_standard_btn.Text = SUBTITLE_LENGTH_OPTIONS[1].label end)
+            pcall(function() length_standard_btn.Checked = selected end)
+            pcall(function() length_standard_btn:SetAttrs({Checked = selected}) end)
+            pcall(function() length_standard_btn:SetAttrs({StyleSheet = SUBFIX_BTN_TOGGLE}) end)
         end
         if length_short_btn then
-            local prefix = selected_length_index == 2 and SUBTITLE_LENGTH_SELECTED_PREFIX or SUBTITLE_LENGTH_UNSELECTED_PREFIX
-            pcall(function() length_short_btn.Text = prefix .. SUBTITLE_LENGTH_OPTIONS[2].label end)
+            local selected = selected_length_index == 2
+            pcall(function() length_short_btn.Text = SUBTITLE_LENGTH_OPTIONS[2].label end)
+            pcall(function() length_short_btn.Checked = selected end)
+            pcall(function() length_short_btn:SetAttrs({Checked = selected}) end)
+            pcall(function() length_short_btn:SetAttrs({StyleSheet = SUBFIX_BTN_TOGGLE}) end)
         end
     end
 
@@ -2080,15 +2444,23 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local engine_qwen_btn = items and items.GenerateSubtitleEngineQwenBtn or nil
     local engine_doubao_btn = items and items.GenerateSubtitleEngineDoubaoBtn or nil
     local hotword_toggle_btn = items and items.GenerateHotwordToggleBtn or nil
+    local script_match_toggle_btn = items and items.GenerateScriptMatchToggleBtn or nil
+    local script_match_status_label = items and items.GenerateScriptMatchStatusLabel or nil
 
     local function refresh_subtitle_engine_buttons()
         if engine_qwen_btn then
-            local prefix = selected_engine_index == 1 and SUBTITLE_ENGINE_SELECTED_PREFIX or SUBTITLE_ENGINE_UNSELECTED_PREFIX
-            pcall(function() engine_qwen_btn.Text = prefix .. SUBTITLE_ENGINE_OPTIONS[1].label end)
+            local selected = selected_engine_index == 1
+            pcall(function() engine_qwen_btn.Text = SUBTITLE_ENGINE_OPTIONS[1].label end)
+            pcall(function() engine_qwen_btn.Checked = selected end)
+            pcall(function() engine_qwen_btn:SetAttrs({Checked = selected}) end)
+            pcall(function() engine_qwen_btn:SetAttrs({StyleSheet = SUBFIX_BTN_TOGGLE}) end)
         end
         if engine_doubao_btn then
-            local prefix = selected_engine_index == 2 and SUBTITLE_ENGINE_SELECTED_PREFIX or SUBTITLE_ENGINE_UNSELECTED_PREFIX
-            pcall(function() engine_doubao_btn.Text = prefix .. SUBTITLE_ENGINE_OPTIONS[2].label end)
+            local selected = selected_engine_index == 2
+            pcall(function() engine_doubao_btn.Text = SUBTITLE_ENGINE_OPTIONS[2].label end)
+            pcall(function() engine_doubao_btn.Checked = selected end)
+            pcall(function() engine_doubao_btn:SetAttrs({Checked = selected}) end)
+            pcall(function() engine_doubao_btn:SetAttrs({StyleSheet = SUBFIX_BTN_TOGGLE}) end)
         end
     end
 
@@ -2111,10 +2483,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local hotword_library_closing = false
     local function refresh_hotword_toggle()
         if not hotword_toggle_btn then return end
-        local prefix = hotwords_enabled and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK
         local count_text = tostring(#hotword_entries) .. " 条"
         if #hotword_entries > 200 then count_text = count_text .. "（本次前200条）" end
-        pcall(function() hotword_toggle_btn.Text = prefix .. " " .. count_text end)
+        pcall(function() hotword_toggle_btn.Text = count_text end)
+        pcall(function() hotword_toggle_btn.Checked = hotwords_enabled end)
+        pcall(function() hotword_toggle_btn:SetAttrs({Checked = hotwords_enabled}) end)
+        pcall(function() hotword_toggle_btn:SetAttrs({StyleSheet = SUBFIX_BTN_TOGGLE}) end)
     end
 
     local function show_hotword_library_dialog()
@@ -2129,6 +2503,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({620, 330, 520, 290}),
         },
         ui:VGroup{
+            Font = DIALOG_FONT,
+            StyleSheet = SUBFIX_ROOT_STYLESHEET,
             Spacing = 6,
             ContentsMargins = 10,
             ui:Tree{ID = "GenerateHotwordTree", Weight = 1, MinimumSize = {0, 90}, Events = {ItemClicked = true}},
@@ -2241,6 +2617,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
                     Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({720, 390, 360, 80}),
                 },
                 ui:VGroup{
+                    Font = DIALOG_FONT,
+                    StyleSheet = SUBFIX_ROOT_STYLESHEET,
                     Spacing = 10,
                     ContentsMargins = 14,
                     ui:Label{Text = "确定清空全部热词吗？此操作无法撤销。", WordWrap = true, Weight = 0},
@@ -2305,7 +2683,133 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     function selection_window.On.GenerateHotwordManageBtn.Clicked(ev)
         show_hotword_library_dialog()
     end
+
+    -- 文稿匹配：粘贴/导入文稿，用本地 Qwen3 强制对齐器把文稿对到选区音频时间轴。
+    local function refresh_script_match_toggle()
+        if script_match_toggle_btn then
+            local detail = ""
+            if script_match_enabled then
+                local n = 0
+                for _ in (script_match_text .. "\n"):gmatch("(.-)\n") do
+                    if trim_text(_) ~= "" then n = n + 1 end
+                end
+                detail = string.format("（已启用 %d 行）", n)
+            end
+            pcall(function() script_match_toggle_btn.Text = "启用文稿匹配" .. detail end)
+            pcall(function() script_match_toggle_btn.Checked = script_match_enabled end)
+            pcall(function() script_match_toggle_btn:SetAttrs({Checked = script_match_enabled}) end)
+            pcall(function() script_match_toggle_btn:SetAttrs({StyleSheet = SUBFIX_BTN_TOGGLE}) end)
+        end
+        if script_match_status_label then
+            if script_match_enabled then
+                pcall(function() script_match_status_label.Text = "已启用：用 Qwen3 强制对齐文稿（忽略识别模型），字幕文字将严格等于文稿" end)
+            else
+                pcall(function() script_match_status_label.Text = "关闭：使用识别模型生成字幕" end)
+            end
+        end
+        if engine_qwen_btn then pcall(function() engine_qwen_btn.Enabled = not script_match_enabled end) end
+        if engine_doubao_btn then pcall(function() engine_doubao_btn.Enabled = not script_match_enabled end) end
+    end
+
+    local script_match_window = nil
+    local function show_script_match_dialog()
+        if script_match_window then
+            pcall(function() script_match_window:Show() end)
+            return
+        end
+        script_match_window = dispatcher:AddWindow({
+            ID = "GenerateScriptMatchWindow",
+            WindowTitle = "SubFix · 文稿匹配",
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({620, 340, 560, 420}),
+        },
+        ui:VGroup{
+            Font = DIALOG_FONT,
+            StyleSheet = SUBFIX_ROOT_STYLESHEET,
+            Spacing = 8,
+            ContentsMargins = 12,
+            ui:Label{Text = "粘贴文稿，或从 .txt/.srt 导入。字幕文字将严格等于文稿，并按选区音频时间轴对齐。", WordWrap = true, Weight = 0, MinimumSize = {0, 46}},
+            ui:TextEdit{ID = "ScriptMatchInput", PlainText = script_match_text or "", Weight = 1, MinimumSize = {0, 150}},
+            ui:HGroup{
+                Weight = 0, Spacing = 8,
+                ui:Label{Text = "或输入文件路径：", Weight = 0},
+                ui:LineEdit{ID = "ScriptMatchPathInput", PlaceholderText = "例如 C:\\script.txt", Weight = 1}
+            },
+            ui:HGroup{
+                Weight = 0, Spacing = 8, MinimumSize = {0, 34},
+                ui:Button{ID = "ScriptMatchImportBtn", Text = "浏览…", Weight = 0, MinimumSize = {0, 28}},
+                ui:Button{ID = "ScriptMatchReadBtn", Text = "读取文件", Weight = 0, MinimumSize = {0, 28}},
+                ui:Button{ID = "ScriptMatchClearBtn", Text = "清空", Weight = 0, MinimumSize = {0, 28}}
+            },
+            ui:Label{ID = "ScriptMatchStatusLabel", Text = "", Weight = 0},
+            ui:HGroup{
+                Weight = 0, Spacing = 8, MinimumSize = {0, 34},
+                ui:Button{ID = "ScriptMatchConfirmBtn", Text = "确定", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_ACCENT},
+                ui:Button{ID = "ScriptMatchCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
+            },
+            ui:VGap(8, 0)
+        })
+        local sm_items = script_match_window:GetItems()
+        local sm_input = sm_items and sm_items.ScriptMatchInput or nil
+        local sm_path = sm_items and sm_items.ScriptMatchPathInput or nil
+        local sm_status = sm_items and sm_items.ScriptMatchStatusLabel or nil
+        local function set_status(msg) if sm_status then pcall(function() sm_status.Text = msg or "" end) end end
+        local function import_file(path)
+            if not path or path == "" then return end
+            local content = read_text_file(path)
+            if not content then set_status("无法读取文件：" .. tostring(path)) return end
+            if string.match(string.lower(path), "%.srt$") then
+                content = extract_srt_text(content)
+            end
+            if sm_input then pcall(function() sm_input.PlainText = content end) end
+            if sm_path then pcall(function() sm_path.Text = path end) end
+            set_status("已导入：" .. tostring(path))
+        end
+        function script_match_window.On.ScriptMatchReadBtn.Clicked(ev)
+            import_file(trim_text(sm_path and sm_path.Text or ""))
+        end
+        function script_match_window.On.ScriptMatchImportBtn.Clicked(ev)
+            local ok, path = pcall(function() return fusion:RequestFile("Open", "", "Text (*.txt *.srt)") end)
+            if ok and path and path ~= "" then
+                import_file(path)
+            elseif not ok then
+                set_status("无法打开文件选择对话框，请手动粘贴或输入路径后点“读取文件”")
+            end
+        end
+        function script_match_window.On.ScriptMatchClearBtn.Clicked(ev)
+            if sm_input then pcall(function() sm_input.PlainText = "" end) end
+            if sm_path then pcall(function() sm_path.Text = "" end) end
+            set_status("已清空")
+        end
+        function script_match_window.On.ScriptMatchConfirmBtn.Clicked(ev)
+            local text = sm_input and sm_input.PlainText or ""
+            script_match_text = text
+            if trim_text(text) ~= "" then
+                script_match_enabled = true
+            end
+            refresh_script_match_toggle()
+            pcall(function() script_match_window:Hide() end)
+        end
+        function script_match_window.On.ScriptMatchCancelBtn.Clicked(ev)
+            pcall(function() script_match_window:Hide() end)
+        end
+        function script_match_window.On.GenerateScriptMatchWindow.Close(ev)
+            pcall(function() script_match_window:Hide() end)
+        end
+        pcall(function() script_match_window:Show() end)
+    end
+
+    function selection_window.On.GenerateScriptMatchToggleBtn.Clicked(ev)
+        script_match_enabled = not script_match_enabled
+        if script_match_enabled and trim_text(script_match_text) == "" then
+            show_script_match_dialog()
+        end
+        refresh_script_match_toggle()
+    end
+    function selection_window.On.GenerateScriptMatchEditBtn.Clicked(ev)
+        show_script_match_dialog()
+    end
     refresh_hotword_toggle()
+    refresh_script_match_toggle()
 
     -- 豆包密钥配置子窗口：点"豆包（云端）"且未配置密钥时按需弹出。复用父对话框
     -- 已在跑的 dispatcher:RunLoop() 作非模态覆盖，子窗口自身不 RunLoop/ExitLoop，
@@ -2318,6 +2822,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         MinimumSize = {420, 228},
     },
     ui:VGroup{
+        Font = DIALOG_FONT,
+        StyleSheet = SUBFIX_ROOT_STYLESHEET,
         Spacing = 8,
         ContentsMargins = 12,
         ui:Label{Text = "填写火山引擎（豆包）语音识别 API Key", Weight = 0},
@@ -2356,7 +2862,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             Weight = 0,
             MinimumSize = {0, 36},
             Spacing = 8,
-            ui:Button{ID = "GenerateDoubaoKeySaveBtn", Text = "保存", Weight = 1, MinimumSize = {0, 36}},
+            ui:Button{ID = "GenerateDoubaoKeySaveBtn", Text = "保存", Weight = 1, MinimumSize = {0, 36}, StyleSheet = SUBFIX_BTN_ACCENT},
             ui:Button{ID = "GenerateDoubaoKeyCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 36}}
         }
     })
@@ -2378,11 +2884,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     local function open_doubao_api_key_guide()
-        local ok, result = pcall(
-            os.execute,
-            "/usr/bin/open " .. shell_quote(DOUBAO_API_KEY_GUIDE_URL) .. " >/dev/null 2>&1"
-        )
-        if not ok or (result ~= true and result ~= 0) then
+        local ok = pcall(subfix_open_url, DOUBAO_API_KEY_GUIDE_URL)
+        if not ok then
             set_doubao_key_status("无法打开浏览器，请手动访问火山引擎豆包语音控制台")
         end
     end
@@ -2471,6 +2974,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({520, 320, 380, 150}),
     },
     ui:VGroup{
+        Font = DIALOG_FONT,
+        StyleSheet = SUBFIX_ROOT_STYLESHEET,
         Spacing = 8,
         ContentsMargins = 12,
         ui:Label{Text = "已选择「豆包（云端）」，但尚未配置密钥。", Weight = 0},
@@ -2497,6 +3002,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 330, 420, 100}),
     },
     ui:VGroup{
+        Font = DIALOG_FONT,
+        StyleSheet = SUBFIX_ROOT_STYLESHEET,
         Spacing = 8,
         ContentsMargins = 14,
         ui:Label{ID = "GenerateQwenDownloadStatusLabel", Text = "本地 Qwen 识别需要下载运行环境与 Qwen3-ASR-1.7B 模型。", Weight = 0},
@@ -2505,7 +3012,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             Weight = 0,
             Spacing = 8,
             MinimumSize = {0, 34},
-            ui:Button{ID = "GenerateQwenDownloadConfirmBtn", Text = "下载并使用", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateQwenDownloadConfirmBtn", Text = "下载并使用", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_ACCENT},
             ui:Button{ID = "GenerateQwenDownloadCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
         }
     })
@@ -2576,42 +3083,45 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     for index, source in ipairs(audio_sources) do
         local ok_item, item = pcall(function() return track_tree:NewItem() end)
         if ok_item and item then
-            local checked = index == 1
-            track_rows[index] = {source = source, checked = checked, item = item}
-            set_tree_item_text(item, 0, checked and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK)
-            set_tree_item_text(item, 1, format_audio_source_label(source, fps))
+            track_rows[index] = {source = source, item = item}
+            set_tree_item_text(item, 0, format_audio_source_label(source, fps))
             pcall(function() track_tree:AddTopLevelItem(item) end)
             item_map[item] = index
         end
     end
+
+    -- 默认选中第 1 条轨道；选中态交由 Qt 原生选择绘制（ExtendedSelection：普通点击单选互斥、
+    -- Ctrl/Shift 点击多选），视觉由窗口级 QSS 的 selection-background-color / ::item:selected 渲染橙底白字。
+    pcall(function()
+        if track_rows[1] and track_rows[1].item then
+            track_rows[1].item.Selected = true
+            pcall(function() track_tree:SetSelection(track_rows[1].item) end)
+        end
+    end)
     safe_refresh_tree_widget(track_tree)
 
     local function collect_checked_audio_sources()
         local checked_sources = {}
-        for _, row in ipairs(track_rows) do
-            if row.checked then
-                checked_sources[#checked_sources + 1] = row.source
+        local selected = {}
+        pcall(function() selected = track_tree:SelectedItems() or {} end)
+        if not selected or #selected == 0 then
+            for _, row in ipairs(track_rows) do
+                if row.item and row.item.Selected then
+                    selected[#selected + 1] = row.item
+                end
+            end
+        end
+        for _, item in ipairs(selected) do
+            local idx = item_map[item]
+            if idx and track_rows[idx] then
+                checked_sources[#checked_sources + 1] = track_rows[idx].source
             end
         end
         return checked_sources
     end
 
-    local function set_track_checked(row, checked)
-        row.checked = checked == true
-        set_tree_item_text(row.item, 0, row.checked and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK)
-    end
-
-    -- 现场模式支持多麦：点击即切换该轨勾选状态（单轨场景自然退化为单选）
-    function selection_window.On.GenerateAudioTrackTree.ItemClicked(ev)
-        local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem"})
-        if not item then item = get_selected_tree_node(track_tree) end
-        if not item then return end
-        local row_index = item_map[item]
-        if row_index and track_rows[row_index] then
-            set_track_checked(track_rows[row_index], not track_rows[row_index].checked)
-            safe_refresh_tree_widget(track_tree)
-        end
-    end
+    -- 点击选择完全交由 Qt 原生选择（ExtendedSelection）处理：普通点击单选互斥、Ctrl/Shift 点击多选；
+    -- 确认时由 collect_checked_audio_sources() 直接读取 SelectedItems() 收集已选轨道，无需手动维护勾选态。
 
     -- 字幕长度：两个互斥按钮，点击即切换选中项并高亮当前选择
     function selection_window.On.GenerateSubtitleLengthStandardBtn.Clicked(ev)
@@ -2663,7 +3173,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         selected_max_chars = read_selected_max_chars()
         selected_backend = read_selected_backend()
         selected_hotwords_json = hotwords_enabled and resolve_asr_paths().hotwords or nil
-        if selected_backend == "auto" then
+        if script_match_enabled or selected_backend == "auto" then
             local qwen_status = inspect_local_qwen(resolve_asr_paths())
             if not qwen_status.ready then
                 open_qwen_download_dialog()
@@ -2698,6 +3208,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     pcall(function() qwen_download_window:Hide() end)
     pcall(function() if hotword_library_window then hotword_library_window:Hide() end end)
     pcall(function() if hotword_clear_confirm_window then hotword_clear_confirm_window:Hide() end end)
+    pcall(function() if script_match_window then script_match_window:Hide() end end)
 
     if qwen_install_requested then
         return nil, nil, nil, nil, nil, "__subfix_install_qwen__"
@@ -2719,7 +3230,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     if #selected_audio_sources == 0 then
         return nil, nil, nil, nil, nil, "请至少选择一个音频轨道"
     end
-    return selected_audio_sources, subtitle_mode, selected_max_chars, selected_backend, selected_hotwords_json, nil
+    return selected_audio_sources, subtitle_mode, selected_max_chars, selected_backend, selected_hotwords_json, script_match_enabled, script_match_text, nil
 end
 
 local function progress_elapsed_text(started_at)
@@ -2813,6 +3324,8 @@ local function show_generate_progress_window()
         Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({520, 380, 430, 200}),
     },
     ui:VGroup{
+        Font = DIALOG_FONT,
+        StyleSheet = SUBFIX_ROOT_STYLESHEET,
         Spacing = 8,
         ContentsMargins = 20,
         ui:Label{ID = "GenerateProgressStatusLabel", Text = "准备中", Weight = 0, MinimumSize = {0, 22}},
@@ -2999,6 +3512,8 @@ local function show_doubao_asr_failure_action_dialog(reason)
         Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({520, 320, 520, 300}),
     },
     ui:VGroup{
+        Font = DIALOG_FONT,
+        StyleSheet = SUBFIX_ROOT_STYLESHEET,
         Spacing = 8,
         ContentsMargins = 12,
         ui:Label{Text = "豆包（云端）未完成识别：", Weight = 0},
@@ -3125,12 +3640,14 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     end
     local generate_engine = resolve_generate_engine()
     local cmd_parts = {}
-    if asr_backend == "auto" then
-        cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model)
-    end
     local command_args = {}
     if qwen_status and qwen_status.ready and file_exists(qwen_status.python or "") then
-        command_args = {"env", "-u", "PYTHONHOME", "-u", "PYTHONPATH"}
+        if SUBFIX_IS_WINDOWS then
+            -- Windows 的 cmd 没有 env：用 set 清空，避免继承父进程的 PYTHONHOME/PYTHONPATH。
+            command_args = {'set "PYTHONHOME=" &', 'set "PYTHONPATH=" &'}
+        else
+            command_args = {"env", "-u", "PYTHONHOME", "-u", "PYTHONPATH"}
+        end
     end
     local helper_args = {
         shell_quote(python),
@@ -3164,16 +3681,83 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         cmd_parts[#cmd_parts + 1] = "--hotwords-json"
         cmd_parts[#cmd_parts + 1] = shell_quote(hotwords_json)
     end
-    return table.concat(cmd_parts, " "), nil
+    local command_text = table.concat(cmd_parts, " ")
+    if asr_backend == "auto" then
+        if SUBFIX_IS_WINDOWS then
+            -- cmd 里用 set 设置模型路径（整段加引号以容纳空格），再用 & 接上真正的命令。
+            command_text = 'set "SUBFIX_QWEN3_ASR_MODEL=' .. tostring(qwen_status.model):gsub('"', "") .. '" & ' .. command_text
+        else
+            command_text = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model) .. " " .. command_text
+        end
+    end
+    return command_text, nil
 end
 
 local function kill_background_process(pid_file)
     local pid_text = trim_text(read_text_file(pid_file) or "")
     local pid = tonumber(pid_text)
     if pid and pid > 0 then
-        os.execute("kill -TERM -- -" .. tostring(pid) .. " 2>/dev/null || kill -TERM " .. tostring(pid) .. " 2>/dev/null || true")
-        os.execute("sleep 0.2; kill -KILL -- -" .. tostring(pid) .. " 2>/dev/null || true")
+        if SUBFIX_IS_WINDOWS then
+            -- taskkill /T 连同子进程（python 等）一起结束。
+            os.execute("taskkill /F /T /PID " .. tostring(pid) .. " >nul 2>nul")
+        else
+            os.execute("kill -TERM -- -" .. tostring(pid) .. " 2>/dev/null || kill -TERM " .. tostring(pid) .. " 2>/dev/null || true")
+            os.execute("sleep 0.2; kill -KILL -- -" .. tostring(pid) .. " 2>/dev/null || true")
+        end
     end
+end
+
+-- 跨平台删除临时文件（失败静默忽略）。
+local function remove_temp_files(...)
+    for _, path in ipairs({ ... }) do
+        local target = tostring(path or "")
+        if target ~= "" then
+            pcall(function() os.remove(target) end)
+        end
+    end
+end
+
+-- Windows 专用后台启动：先落盘一个 .cmd（真正干活的批处理），再落盘一个 .ps1 文件，
+-- 用 start "" /b 以无窗口方式异步启动 PowerShell 执行该 .ps1，由 .ps1 记录子进程 PID。
+-- 关键：必须改用独立 .ps1 文件 + -File，绝不能把 PowerShell 命令内联进 -Command。
+-- 原因：os.execute 最终走 cmd /c，而 cmd 对“以引号开头且含多个引号组”的命令行会剥离首尾引号，
+-- 导致内联 -Command "...嵌套引号..." 被劈坏（报 “‘...powershell.exe” ...’ 不是内部或外部命令”，
+-- 进而进度窗永不出现、报错信息乱码）。-File 形式只有两组引号（程序路径、脚本路径），无嵌套，稳。
+local function launch_background_windows(inner_cmd, stdout_file, pid_file, done_file, exit_file)
+    local runner_path = stdout_file .. ".cmd"
+    local ps1_path = stdout_file .. ".ps1"
+    local handle = io.open(runner_path, "wb")
+    if not handle then
+        return false
+    end
+    handle:write("@echo off\r\n")
+    handle:write("chcp 65001 >nul\r\n")
+    -- 清掉宿主（Resolve/Fusion）可能注入的 Python 环境；统一按 UTF-8 输出，便于读取报错。
+    handle:write('set "PYTHONHOME="\r\n')
+    handle:write('set "PYTHONPATH="\r\n')
+    handle:write('set "PYTHONIOENCODING=utf-8"\r\n')
+    handle:write(tostring(inner_cmd) .. " > " .. subfix_dq(stdout_file) .. " 2>&1\r\n")
+    handle:write("echo %ERRORLEVEL% > " .. subfix_dq(exit_file) .. "\r\n")
+    handle:write("echo done > " .. subfix_dq(done_file) .. "\r\n")
+    handle:close()
+
+    -- 独立的 .ps1：启动 cmd /c runner 并以隐藏窗口运行，把子进程（cmd.exe）PID 写到 pid_file。
+    -- 注意路径用单引号包裹；pid 取 Start-Process -PassThru 返回的 .Id（纯数字，便于 taskkill /T 取消）。
+    local ps = io.open(ps1_path, "wb")
+    if not ps then
+        return false
+    end
+    ps:write("$p = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c','" .. runner_path
+        .. "') -PassThru -WindowStyle Hidden\r\n")
+    ps:write("$p.Id | Out-File -FilePath '" .. pid_file .. "' -Encoding ascii\r\n")
+    ps:close()
+
+    local powershell = tostring(os.getenv("SystemRoot") or "C:\\Windows")
+        .. "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    -- start "" /b：无窗口、异步（立即返回），第一个 "" 是 start 的标题占位（程序路径带引号时必须保留）。
+    os.execute('start "" /b ' .. subfix_dq(powershell)
+        .. ' -NoProfile -ExecutionPolicy Bypass -File ' .. subfix_dq(ps1_path))
+    return true
 end
 
 local function progress_payload_signature(payload)
@@ -3200,41 +3784,48 @@ local function run_background_command_with_progress(cmd, progress_path, progress
     if not file_exists(paths.runtime_python) then
         return false, "未找到 SubFix 内置 Python", nil
     end
-    local grouped_cmd
-    if file_exists(paths.process_group) then
-        grouped_cmd = table.concat({
-            shell_quote(paths.runtime_python),
-            shell_quote(paths.process_group),
-            shell_quote(cmd),
-        }, " ")
+    if SUBFIX_IS_WINDOWS then
+        -- Windows：直接运行原命令（不需要进程组包装），由批处理写入退出码与完成标记。
+        launch_background_windows(cmd, stdout_file, pid_file, done_file, exit_file)
     else
-        -- v3.2.0 cannot add new paths, so incremental upgrades need an inline equivalent.
-        local inline_group_code = 'import os,sys; os.setsid(); os.execl("/bin/sh", "sh", "-c", sys.argv[1])'
-        grouped_cmd = table.concat({
-            shell_quote(paths.runtime_python),
-            "-c",
-            shell_quote(inline_group_code),
-            shell_quote(cmd),
-        }, " ")
-    end
+        local grouped_cmd
+        if file_exists(paths.process_group) then
+            grouped_cmd = table.concat({
+                shell_quote(paths.runtime_python),
+                shell_quote(paths.process_group),
+                shell_quote(cmd),
+            }, " ")
+        else
+            -- v3.2.0 cannot add new paths, so incremental upgrades need an inline equivalent.
+            local inline_group_code = 'import os,sys; os.setsid(); os.execl("/bin/sh", "sh", "-c", sys.argv[1])'
+            grouped_cmd = table.concat({
+                shell_quote(paths.runtime_python),
+                "-c",
+                shell_quote(inline_group_code),
+                shell_quote(cmd),
+            }, " ")
+        end
 
-    -- Detach the waiting shell too: inherited host pipes can keep launch blocked
-    -- until the worker exits, preventing the progress event loop from starting.
-    local bg_cmd = string.format(
-        "(%s > %s 2>&1 & worker_pid=$!; echo $worker_pid > %s; wait $worker_pid; echo $? > %s; touch %s) </dev/null >/dev/null 2>&1 &",
-        grouped_cmd,
-        shell_quote(stdout_file),
-        shell_quote(pid_file),
-        shell_quote(exit_file),
-        shell_quote(done_file)
-    )
-    os.execute(bg_cmd)
+        -- Detach the waiting shell too: inherited host pipes can keep launch blocked
+        -- until the worker exits, preventing the progress event loop from starting.
+        local bg_cmd = string.format(
+            "(%s > %s 2>&1 & worker_pid=$!; echo $worker_pid > %s; wait $worker_pid; echo $? > %s; touch %s) </dev/null >/dev/null 2>&1 &",
+            grouped_cmd,
+            shell_quote(stdout_file),
+            shell_quote(pid_file),
+            shell_quote(exit_file),
+            shell_quote(done_file)
+        )
+        os.execute(bg_cmd)
+    end
 
     local timer_id = "GenerateProgressPollTimer_" .. uid
     local poll_timer = ui:Timer({ID = timer_id, Interval = 200, SingleShot = false})
     local last_signature = nil
     local last_progress_changed_at = os.time()
     local stall_warning_logged = false
+    local launch_failed = false
+    local launch_ticks = 0
 
     local timer_registered = register_ui_timer(poll_timer, function()
         local payload = parse_progress_payload(read_text_file(progress_path) or "")
@@ -3272,6 +3863,18 @@ local function run_background_command_with_progress(cmd, progress_path, progress
             return
         end
 
+        -- 兜底：30 秒内既没有 PID、也没有输出/进度文件，判定启动器失败，避免永久卡在进度窗。
+        launch_ticks = launch_ticks + 1
+        if launch_ticks == 150 and not launch_failed
+            and not file_exists(pid_file) and not file_exists(done_file)
+            and not file_exists(stdout_file) and not file_exists(progress_path) then
+            launch_failed = true
+            pcall(function() poll_timer:Stop() end)
+            ui_timer_handlers[timer_id] = nil
+            pcall(function() dispatcher:ExitLoop() end)
+            return
+        end
+
         if file_exists(done_file) then
             pcall(function() poll_timer:Stop() end)
             ui_timer_handlers[timer_id] = nil
@@ -3296,7 +3899,27 @@ local function run_background_command_with_progress(cmd, progress_path, progress
 
     output = read_text_file(stdout_file) or ""
     local exit_code = tonumber(trim_text(read_text_file(exit_file) or "")) or 1
-    os.execute(string.format("rm -f %s %s %s %s 2>/dev/null", shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file), shell_quote(exit_file)))
+
+    if launch_failed then
+        remove_temp_files(stdout_file, pid_file, done_file, exit_file, stdout_file .. ".cmd", stdout_file .. ".ps1")
+        return false, "后台任务未能启动（启动器失败）。\n命令: " .. tostring(cmd), nil
+    end
+    if exit_code ~= 0 then
+        -- 保留一份原始输出便于排查（批处理已 chcp 65001，正常情况下可直接阅读）。
+        local keep_path = root .. "/last_failure_stdout.log"
+        local source = io.open(stdout_file, "rb")
+        if source then
+            local data = source:read("*a")
+            source:close()
+            local keep = io.open(keep_path, "wb")
+            if keep then keep:write(data) keep:close() end
+        end
+        print(string.format(
+            "[SubFix Generate] 后台命令失败（退出码 %d）；原始输出已保留到 %s：\n%s",
+            exit_code, keep_path, tostring(output)
+        ))
+    end
+    remove_temp_files(stdout_file, pid_file, done_file, exit_file, stdout_file .. ".cmd")
 
     if cancelled then
         return false, "已取消", "cancelled"
@@ -3316,7 +3939,7 @@ local function run_asr_helper_with_progress(audio_source, srt_path, json_path, t
         )
     end
     local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
-    os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
+    remove_temp_files(progress_path)
     if not ok then
         return false, tostring(output or "ASR helper 执行失败"), status
     end
@@ -3369,13 +3992,328 @@ local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, jso
         string.format("批量识别 %d 段音频 · 有效音频 %s", tonumber(source_count) or 0, duration_text)
     )
     local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
-    os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
+    remove_temp_files(progress_path)
     if not ok then
         return false, tostring(output or "ASR helper 执行失败"), status
     end
     if not file_exists(json_path) then
         return false, "ASR helper 未生成 JSON"
     end
+    return true
+end
+
+local function write_script_match_batch_plan(path, audio_sources, rows, fps, timeline_start_frame, language)
+    local lines = {"{", '  "fps": ' .. tostring(fps) .. ','}
+    lines[#lines + 1] = '  "timeline_start_frame": ' .. tostring(timeline_start_frame) .. ','
+    lines[#lines + 1] = '  "language": "' .. json_escape(language or "zh") .. '",'
+    lines[#lines + 1] = '  "audio_sources": ['
+    for i, src in ipairs(audio_sources) do
+        local ch = tonumber(src.audio_channel_index)
+        lines[#lines + 1] = "    {"
+        lines[#lines + 1] = string.format('      "audio": "%s",', json_escape(tostring(src.file_path or "")))
+        lines[#lines + 1] = string.format('      "source_start": %.6f,', tonumber(src.source_start_seconds) or 0)
+        lines[#lines + 1] = string.format('      "source_end": %.6f,', tonumber(src.source_end_seconds) or 0)
+        lines[#lines + 1] = string.format('      "timeline_start_frame": %d,', tonumber(src.start_frame) or 0)
+        lines[#lines + 1] = string.format('      "fps": %.6f,', tonumber(src.fps) or fps)
+        lines[#lines + 1] = string.format('      "audio_channel_index": %s', (ch and ch > 0) and tostring(math.floor(ch)) or "null")
+        lines[#lines + 1] = i < #audio_sources and "    }," or "    }"
+    end
+    lines[#lines + 1] = "  ],"
+    lines[#lines + 1] = '  "rows": ['
+    for i, row in ipairs(rows) do
+        lines[#lines + 1] = '    {"text": "' .. json_escape(tostring(row.text or "")) .. '"}' .. (i < #rows and "," or "")
+    end
+    lines[#lines + 1] = "  ]"
+    lines[#lines + 1] = "}"
+    return write_text_file(path, table.concat(lines, "\n") .. "\n")
+end
+
+-- ============ 文稿匹配：语义/标点优先断句 ============
+-- 通用：断句发生在语义边界（从句/短语结束），绝不在单词或词组中间断开；
+-- 中文：顿号转空格、保留《》·、逗号分行、句末 。！？ 删除/中段视为分行；
+-- 英文：标点之后或连词/介词之前断行，… 表示停顿未完、-- 表示被打断。
+
+local function utf8_next(s, i)
+    i = i or 1
+    if i > #s then return nil end
+    local b = s:byte(i)
+    local len = 1
+    if b >= 0xF0 then len = 4
+    elseif b >= 0xE0 then len = 3
+    elseif b >= 0xC0 then len = 2 end
+    local e = i + len - 1
+    return i, e, s:sub(i, e)
+end
+
+local function utf8_len(s)
+    local n, i = 0, 1
+    while i <= #s do
+        local _, e = utf8_next(s, i)
+        i = e + 1
+        n = n + 1
+    end
+    return n
+end
+
+local function char_to_byte_pos(s, char_count)
+    local n, i = 0, 1
+    while i <= #s and n < char_count do
+        local _, e = utf8_next(s, i)
+        i = e + 1
+        n = n + 1
+    end
+    return i - 1
+end
+
+local function detect_segment_language(block)
+    block = tostring(block or "")
+    local latin, cjk = 0, 0
+    local i = 1
+    while i <= #block do
+        local _, eb, c = utf8_next(block, i)
+        if c:match("[A-Za-z]") then
+            latin = latin + 1
+        else
+            local b = c:byte(1)
+            if b and b >= 0xE3 then cjk = cjk + 1 end
+        end
+        i = eb + 1
+    end
+    if cjk == 0 then return "en" end
+    if latin == 0 then return "zh" end
+    return (cjk >= latin) and "zh" or "en"
+end
+
+-- 注意：Lua 的字符类 [] 是“按字节集合”匹配，把多字节中文标点写进 [] 会误伤字节集相同的汉字
+-- （如“冀”=e5 86 80 含 0x80、“聚”=e8 81 9a 含 0x9a、“国”=e5 9b bd 含 0x9b），导致汉字被当标点切掉。
+-- 因此这里统一改为“整字符精确比对”。
+local ZH_SPLIT_CHARS = {
+    ["，"] = true, ["。"] = true, ["！"] = true, ["？"] = true, ["；"] = true, ["："] = true,
+    [","] = true, [";"] = true, [":"] = true, ["!"] = true, ["?"] = true, ["."] = true,
+}
+local EN_SPLIT_CHARS = {
+    ["，"] = true, ["。"] = true, ["！"] = true, ["？"] = true, ["；"] = true, ["："] = true,
+    [","] = true, [";"] = true, [":"] = true, ["!"] = true, ["?"] = true,
+}
+local function is_space_char(c)
+    return c ~= nil and #c == 1 and c:match("^%s$") ~= nil
+end
+-- 逐字符折叠连续破折号（ASCII/全角/中文破折号）为 "--"，避免字节类 gsub 误伤含相同字节的汉字。
+local function collapse_dash_runs(text)
+    local out, i, n = {}, 1, #text
+    while i <= n do
+        local _, eb, c = utf8_next(text, i)
+        if c == "-" or c == "–" or c == "—" then
+            local j, count = eb + 1, 1
+            while j <= n do
+                local _, eb2, c2 = utf8_next(text, j)
+                if c2 == "-" or c2 == "–" or c2 == "—" then
+                    count = count + 1
+                    j = eb2 + 1
+                else
+                    break
+                end
+            end
+            out[#out + 1] = (count >= 2) and "--" or c
+            i = j
+        else
+            out[#out + 1] = c
+            i = eb + 1
+        end
+    end
+    return table.concat(out)
+end
+
+local function normalize_script_segment(text, lang)
+    text = tostring(text or "")
+    text = text:gsub("%.%.%.", "…")
+    text = collapse_dash_runs(text)
+    if lang ~= "en" then
+        text = text:gsub("、", " ")
+    end
+    return text
+end
+
+local function segment_chinese(block)
+    local text = normalize_script_segment(block, "zh")
+    local parts, start_byte = {}, 1
+    local i = 1
+    while i <= #text do
+        local sb, eb, c = utf8_next(text, i)
+        if ZH_SPLIT_CHARS[c] then
+            local piece = trim_text(text:sub(start_byte, sb - 1))
+            if piece ~= "" then parts[#parts + 1] = piece end
+            i = eb + 1
+            while i <= #text do
+                local _, eb2, c2 = utf8_next(text, i)
+                if c2:match("[%p%s]") then i = eb2 + 1 else break end
+            end
+            start_byte = i
+        else
+            i = eb + 1
+        end
+    end
+    local last = trim_text(text:sub(start_byte))
+    if last ~= "" then parts[#parts + 1] = last end
+    return parts
+end
+
+local function segment_english(block)
+    local text = normalize_script_segment(block, "en")
+    local parts, start_byte = {}, 1
+    local i = 1
+    while i <= #text do
+        local sb, eb, c = utf8_next(text, i)
+        if EN_SPLIT_CHARS[c] then
+            local piece = trim_text(text:sub(start_byte, sb - 1))
+            if piece ~= "" then parts[#parts + 1] = piece end
+            i = eb + 1
+            while i <= #text do
+                local _, eb2, c2 = utf8_next(text, i)
+                if c2:match("[%p%s]") then i = eb2 + 1 else break end
+            end
+            start_byte = i
+        elseif c == "." then
+            local _, _, nxt = utf8_next(text, eb + 1)
+            if (not nxt) or nxt:match("%s") then
+                local piece = trim_text(text:sub(start_byte, sb - 1))
+                if piece ~= "" then parts[#parts + 1] = piece end
+                i = eb + 1
+                while i <= #text do
+                    local _, eb3, c3 = utf8_next(text, i)
+                    if c3:match("[%s]") then i = eb3 + 1 else break end
+                end
+                start_byte = i
+            else
+                i = eb + 1
+            end
+        else
+            i = eb + 1
+        end
+    end
+    local last = trim_text(text:sub(start_byte))
+    if last ~= "" then parts[#parts + 1] = last end
+    return parts
+end
+
+local function find_best_break_point(s, lang, max_chars)
+    local max_pos = char_to_byte_pos(s, max_chars)
+    local last_candidate = 0
+    local i = 1
+    while i <= max_pos and i <= #s do
+        local sb, eb, c = utf8_next(s, i)
+        local is_break
+        if lang == "en" then
+            is_break = (EN_SPLIT_CHARS[c] == true) or is_space_char(c)
+        else
+            is_break = (ZH_SPLIT_CHARS[c] == true) or is_space_char(c)
+        end
+        if is_break then last_candidate = eb end
+        i = eb + 1
+    end
+    return last_candidate
+end
+
+local function force_break_point(s, lang, max_chars)
+    local max_pos = char_to_byte_pos(s, max_chars)
+    if lang == "en" then
+        local i = max_pos + 1
+        while i <= #s do
+            local _, eb, c = utf8_next(s, i)
+            if c:match("%s") then return eb end
+            i = eb + 1
+        end
+    end
+    return max_pos
+end
+
+local function soft_break_by_length(seg, lang, max_chars)
+    max_chars = tonumber(max_chars) or 0
+    if max_chars <= 0 then return {seg} end
+    if utf8_len(seg) <= max_chars then return {seg} end
+    local pieces = {}
+    local rest = seg
+    while utf8_len(rest) > max_chars do
+        local prev_len = utf8_len(rest)
+        local cut = find_best_break_point(rest, lang, max_chars)
+        if cut <= 0 then cut = force_break_point(rest, lang, max_chars) end
+        if cut <= 0 then cut = char_to_byte_pos(rest, max_chars) end
+        local a = trim_text(rest:sub(1, cut))
+        rest = trim_text(rest:sub(cut + 1))
+        if a ~= "" then pieces[#pieces + 1] = a end
+        if utf8_len(rest) >= prev_len then break end
+    end
+    local final_rest = trim_text(rest)
+    if final_rest ~= "" then
+        if #pieces > 0 and utf8_len(final_rest) <= 2 then
+            pieces[#pieces] = pieces[#pieces] .. final_rest
+        else
+            pieces[#pieces + 1] = final_rest
+        end
+    end
+    return pieces
+end
+
+local function split_script_into_subtitle_rows(script_text, max_chars)
+    max_chars = tonumber(max_chars) or 28
+    local rows = {}
+    for raw in (tostring(script_text or "") .. "\n"):gmatch("(.-)\n") do
+        local block = trim_text(raw)
+        if block ~= "" then
+            local lang = detect_segment_language(block)
+            local segs = (lang == "en") and segment_english(block) or segment_chinese(block)
+            for _, seg in ipairs(segs) do
+                for _, piece in ipairs(soft_break_by_length(seg, lang, max_chars)) do
+                    local t = trim_text(piece)
+                    if t ~= "" then rows[#rows + 1] = {text = t} end
+                end
+            end
+        end
+    end
+    return rows
+end
+
+-- 文稿匹配：用本地 Qwen 环境里的 transformers 版 Qwen3ForcedAligner 对齐（复用 Qwen python）。
+local function build_script_match_helper_command(batch_plan_path, json_path, progress_path, timeline_start_frame, fps, language)
+    local paths = resolve_asr_paths()
+    if not file_exists(paths.helper) then return nil, "缺少 ASR helper: " .. tostring(paths.helper) end
+    local qwen_status = inspect_local_qwen(paths)
+    if not (qwen_status and qwen_status.ready and file_exists(qwen_status.python or "")) then
+        return nil, "本地 Qwen 尚未安装，请先双击“Qwen（本地）”完成下载安装"
+    end
+    local python = qwen_status.python
+    local command_args = {}
+    if SUBFIX_IS_WINDOWS then
+        command_args = {'set "PYTHONHOME=" &', 'set "PYTHONPATH=" &'}
+    else
+        command_args = {"env", "-u", "PYTHONHOME", "-u", "PYTHONPATH"}
+    end
+    local helper_args = {
+        shell_quote(python),
+        shell_quote(paths.helper),
+        "--mode", "script_match_align",
+        "--batch-plan-json", shell_quote(batch_plan_path),
+        "--output", shell_quote(json_path),
+        "--timeline-start-frame", shell_quote(tostring(timeline_start_frame)),
+        "--fps", shell_quote(tostring(fps)),
+        "--language", shell_quote(language or DEFAULT_ASR_LANGUAGE),
+        "--progress-json", shell_quote(progress_path)
+    }
+    local cmd_parts = {}
+    for _, value in ipairs(command_args) do cmd_parts[#cmd_parts + 1] = value end
+    for _, value in ipairs(helper_args) do cmd_parts[#cmd_parts + 1] = value end
+    return table.concat(cmd_parts, " "), nil
+end
+
+local function run_script_match_helper_with_progress(batch_plan_path, json_path, timeline_start_frame, fps, language, progress_state)
+    local progress_path = json_path .. ".progress.json"
+    local cmd, cmd_err = build_script_match_helper_command(batch_plan_path, json_path, progress_path, timeline_start_frame, fps, language)
+    if not cmd then return false, cmd_err end
+    update_generate_progress_window(progress_state, {stage = "启动文稿对齐", message = "正在用 Qwen3 强制对齐文稿与音频"}, "正在用 Qwen3 强制对齐文稿与音频")
+    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
+    remove_temp_files(progress_path)
+    if not ok then return false, tostring(output or "文稿对齐 helper 执行失败"), status end
+    if not file_exists(json_path) then return false, "文稿对齐 helper 未生成 JSON" end
     return true
 end
 
@@ -3387,6 +4325,8 @@ local function show_qwen_install_complete_dialog()
         Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 420, 110}),
     },
     ui:VGroup{
+        Font = DIALOG_FONT,
+        StyleSheet = SUBFIX_ROOT_STYLESHEET,
         Spacing = 8,
         ContentsMargins = 14,
         ui:Label{Text = "本地 Qwen 已安装完成。", Weight = 0},
@@ -3394,7 +4334,7 @@ local function show_qwen_install_complete_dialog()
         ui:HGroup{
             Weight = 0,
             MinimumSize = {0, 34},
-            ui:Button{ID = "GenerateQwenInstallCompleteBtn", Text = "继续", Weight = 1, MinimumSize = {0, 28}}
+            ui:Button{ID = "GenerateQwenInstallCompleteBtn", Text = "继续", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_ACCENT}
         }
     })
     local function close_complete_window()
@@ -3422,9 +4362,9 @@ local function install_local_qwen_with_progress()
     if not progress_state then return false, progress_err end
     update_generate_progress_window(progress_state, {stage = "准备下载", message = "正在准备本地 Qwen 安装", indeterminate = true})
     local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
-    os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
+    remove_temp_files(progress_path)
     local payload = decode_json_text(read_text_file(output_path) or "")
-    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    remove_temp_files(output_path)
     if not ok then
         local message = type(payload) == "table" and tostring(payload.error or "") or ""
         if message == "" then message = tostring(output or "本地 Qwen 安装失败") end
@@ -3454,6 +4394,8 @@ local function show_qwen_install_failed_dialog(message)
         Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 560, 240}),
     },
     ui:VGroup{
+        Font = DIALOG_FONT,
+        StyleSheet = SUBFIX_ROOT_STYLESHEET,
         Spacing = 8,
         ContentsMargins = 14,
         ui:Label{Text = "本地 Qwen 尚未安装完成：", Weight = 0},
@@ -3693,7 +4635,11 @@ local function import_rebuild_srt_with_retry(media_pool, rebuild_srt_path)
         last_error = ok_import and "Resolve 返回空媒体项" or tostring(items)
         if attempt < 2 then
             print("[SubFix Generate] 首次导入重建字幕 SRT 失败，准备重试: " .. tostring(last_error))
-            os.execute("sleep 0.25")
+            if SUBFIX_IS_WINDOWS then
+                os.execute("ping -n 2 127.0.0.1 >nul")
+            else
+                os.execute("sleep 0.25")
+            end
         end
     end
     return nil, "导入重建字幕 SRT 失败（已重试）: " .. tostring(last_error)
@@ -3782,7 +4728,8 @@ local function generate_selection_subtitles()
     -- 始终弹出对话框（含只有 1 个音频候选的情形）：即便只有一条音频轨，用户也需要能
     -- 选择识别模型（Qwen/豆包）与字幕长度，故不再对单候选自动跳过弹窗、直接生成。
     while true do
-        selected_audio_sources, subtitle_mode, max_chars, backend, hotwords_json, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
+        ---@diagnostic disable-next-line: lowercase-global
+        selected_audio_sources, subtitle_mode, max_chars, backend, hotwords_json, script_match_enabled, script_match_text, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
         if selection_err ~= "__subfix_install_qwen__" then break end
         local install_ok, install_err = false, nil
         repeat
@@ -3843,40 +4790,30 @@ local function generate_selection_subtitles()
     if write_selected_audio_source_diagnostic(audio_diag_path, selected_audio_sources, scope, source_optimization) then
         print("[SubFix Generate] 已写入音频源诊断: " .. audio_diag_path)
     end
-    local helper_ok, helper_err, helper_status = run_asr_helper_batch_with_progress(
-        batch_plan_path,
-        srt_path,
-        json_path,
-        scope.timeline_start_frame,
-        fps,
-        progress_state,
-        #selected_track_sources,
-        subtitle_mode,
-        max_chars,
-        backend,
-        hotwords_json,
-        effective_audio_seconds
-    )
-    while not helper_ok and helper_status ~= "cancelled" and (backend == "doubao_asr" or backend == "doubao_asr_v2") and is_doubao_asr_failure(helper_err) do
-        -- 进度窗口中的错误文本通常包含 Python 完整日志；隐藏它，改由明确操作的短弹窗呈现。
-        pcall(function() progress_state.window:Hide() end)
-        local action = show_doubao_asr_failure_action_dialog(helper_err)
-        if action == "close" then break end
-
-        if action == "local_qwen" then
-            backend = DEFAULT_ASR_BACKEND
-            print("[SubFix Generate] 用户选择云端失败后改用本地 Qwen")
-        else
-            print("[SubFix Generate] 用户选择重试豆包（云端）")
+    local helper_ok, helper_err, helper_status = nil, nil, nil
+    if script_match_enabled and type(script_match_text) == "string" and trim_text(script_match_text) ~= "" then
+        -- 文稿匹配分支：用本地 Qwen3 强制对齐器把文稿对到选区音频时间轴。
+        -- 先按用户粘贴的显式换行硬断（尊重手动分段），再按语义/标点软断，最后按“每行最大字数”做软长度约束。
+        local script_rows = split_script_into_subtitle_rows(subfix_ansi_to_utf8(script_match_text), max_chars)
+        print("[SubFix Generate] 文稿断句: " .. #script_rows .. " 行（软长度上限 " .. tostring(max_chars) .. "）")
+        if #script_rows == 0 then
+            finish_generate_progress_window(progress_state, "失败", "文稿内容为空，无法匹配")
+            error("文稿内容为空")
         end
-
-        local replacement_progress, replacement_err = show_generate_progress_window()
-        if not replacement_progress then
-            helper_ok = false
-            helper_err = replacement_err or "无法重新打开生成进度窗口"
-            break
+        local sm_plan_path = root .. "/GeneratedSelection_" .. uid .. ".script_match_plan.json"
+        if not write_script_match_batch_plan(sm_plan_path, selected_track_sources, script_rows, fps, scope.timeline_start_frame, DEFAULT_ASR_LANGUAGE) then
+            finish_generate_progress_window(progress_state, "失败", "无法写入文稿匹配计划")
+            error("无法写入文稿匹配计划")
         end
-        progress_state = replacement_progress
+        helper_ok, helper_err, helper_status = run_script_match_helper_with_progress(
+            sm_plan_path,
+            json_path,
+            scope.timeline_start_frame,
+            fps,
+            DEFAULT_ASR_LANGUAGE,
+            progress_state
+        )
+    else
         helper_ok, helper_err, helper_status = run_asr_helper_batch_with_progress(
             batch_plan_path,
             srt_path,
@@ -3891,6 +4828,41 @@ local function generate_selection_subtitles()
             hotwords_json,
             effective_audio_seconds
         )
+        while not helper_ok and helper_status ~= "cancelled" and (backend == "doubao_asr" or backend == "doubao_asr_v2") and is_doubao_asr_failure(helper_err) do
+            -- 进度窗口中的错误文本通常包含 Python 完整日志；隐藏它，改由明确操作的短弹窗呈现。
+            pcall(function() progress_state.window:Hide() end)
+            local action = show_doubao_asr_failure_action_dialog(helper_err)
+            if action == "close" then break end
+
+            if action == "local_qwen" then
+                backend = DEFAULT_ASR_BACKEND
+                print("[SubFix Generate] 用户选择云端失败后改用本地 Qwen")
+            else
+                print("[SubFix Generate] 用户选择重试豆包（云端）")
+            end
+
+            local replacement_progress, replacement_err = show_generate_progress_window()
+            if not replacement_progress then
+                helper_ok = false
+                helper_err = replacement_err or "无法重新打开生成进度窗口"
+                break
+            end
+            progress_state = replacement_progress
+            helper_ok, helper_err, helper_status = run_asr_helper_batch_with_progress(
+                batch_plan_path,
+                srt_path,
+                json_path,
+                scope.timeline_start_frame,
+                fps,
+                progress_state,
+                #selected_track_sources,
+                subtitle_mode,
+                max_chars,
+                backend,
+                hotwords_json,
+                effective_audio_seconds
+            )
+        end
     end
     if not helper_ok then
         finish_generate_progress_window(progress_state, helper_status == "cancelled" and "已取消" or "失败", helper_err)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe GitHub Release updater for the macOS SubFix Resolve scripts."""
+"""Safe GitHub Release updater for the SubFix Resolve scripts (macOS / Windows)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+import platform
+from pathlib import Path, PurePath
 import shutil
 import tempfile
 from typing import Any, Callable
@@ -18,8 +19,20 @@ import zipfile
 
 REPOSITORY = "HooperH/SubFix"
 RELEASE_API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
-USER_UTILITY_ROOT = Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
-SYSTEM_UTILITY_ROOT = Path("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility")
+def _resolve_utility_roots() -> "tuple[Path, Path]":
+    if platform.system() == "Windows":
+        appdata = Path(os.environ.get("APPDATA", ""))
+        programdata = Path(os.environ.get("ProgramData", ""))
+        rel = "Blackmagic Design\\DaVinci Resolve\\Fusion\\Scripts\\Utility"
+        user = appdata / rel if str(appdata) else Path.home() / rel
+        system = programdata / rel if str(programdata) else Path(programdata) / rel
+        return user, system
+    home = Path.home()
+    rel = "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+    return home / rel, Path("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility")
+
+
+USER_UTILITY_ROOT, SYSTEM_UTILITY_ROOT = _resolve_utility_roots()
 MANIFEST_NAME = "subfix-update-manifest.json"
 UPDATE_FILE_PATHS = frozenset(
     {
@@ -36,6 +49,7 @@ UPDATE_FILE_PATHS = frozenset(
         ".subfix_support/bin/ffmpeg",
         ".subfix_support/licenses/FFmpeg-LGPL-2.1.txt",
         ".subfix_support/setup_asr_env.sh",
+        ".subfix_support/setup_asr_env.ps1",
         ".subfix_support/segmentation_profile.json",
         ".subfix_support/segmentation_profile_v3.json",
         ".subfix_support/segmentation_profile_v4.json",
@@ -162,9 +176,9 @@ def _safe_update_files(archive: zipfile.ZipFile, version: str) -> list[str]:
     files = manifest.get("files")
     if not isinstance(files, list) or not files or any(not isinstance(item, str) for item in files):
         raise UpdateError("更新包 manifest 文件列表错误")
-    normalized_files = [str(PurePosixPath(item)) for item in files]
+    normalized_files = [str(PurePath(item)) for item in files]
     if len(normalized_files) != len(set(normalized_files)) or any(
-        item.startswith("/") or ".." in PurePosixPath(item).parts or item not in UPDATE_FILE_PATHS
+        item.startswith("/") or ".." in PurePath(item).parts or item not in UPDATE_FILE_PATHS
         for item in normalized_files
     ):
         raise UpdateError("更新包包含未授权文件")
@@ -180,12 +194,12 @@ def _safe_destination(target_root: Path, relative_path: str) -> Path:
     if parent.is_symlink():
         raise UpdateError("拒绝写入符号链接目录")
     # 仅允许在用户 Resolve 脚本目录的真实子目录中替换白名单文件。
-    for part in PurePosixPath(relative_path).parts[:-1]:
+    for part in PurePath(relative_path).parts[:-1]:
         parent = parent / part
         if parent.is_symlink():
             raise UpdateError(f"拒绝写入符号链接目录: {relative_path}")
         parent.mkdir(exist_ok=True)
-    return parent / PurePosixPath(relative_path).name
+    return parent / PurePath(relative_path).name
 
 
 def cleanup_legacy_system_menu(target_root: Path) -> None:
@@ -239,7 +253,7 @@ def install_archive(archive_path: Path, expected_sha256: str, version: str, targ
                     replacement = destination.with_name(destination.name + ".subfix-new")
                     shutil.copy2(stage_root / relative_path, replacement)
                     os.replace(replacement, destination)
-                    if relative_path == ".subfix_support/bin/ffmpeg":
+                    if os.name != "nt" and relative_path == ".subfix_support/bin/ffmpeg":
                         destination.chmod(0o755)
                     replaced.append(destination)
                 cleanup_legacy_system_menu(target_root)
