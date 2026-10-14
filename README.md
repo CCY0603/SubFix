@@ -3,6 +3,12 @@
 DaVinci Resolve 字幕插件。口播、现场、单段和批量字幕生成统一使用 v5。
 
 ## 版本更新
+<img width="1242" height="792" alt="01" src="https://github.com/user-attachments/assets/5434b825-f8f3-4d5b-ba2f-dc12a804b224" />
+<img width="1242" height="792" alt="02" src="https://github.com/user-attachments/assets/2915995b-e75c-49f9-9981-0efc4c8467ad" />
+<img width="1238" height="790" alt="03" src="https://github.com/user-attachments/assets/8cf14c31-8542-4650-a302-f7c01970d962" />
+
+
+
 
 ### v3.3.1（2026-10-14）
 
