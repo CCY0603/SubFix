@@ -83,7 +83,7 @@ def partition_adaptive_regions(
     risky_regions: list[dict[str, Any]] = []
     active_units: list[dict[str, Any]] = []
     recent_units: list[dict[str, Any]] = []
-    echo_lookback_frames = max(1, int(round(3.0 * float(fps))))
+    echo_lookback_frames = max(1, _round_half_up(3.0 * float(fps)))
     for unit in valid_units:
         start = int(unit["start_frame"])
         end = int(unit["end_frame"])
@@ -135,7 +135,7 @@ def partition_adaptive_regions(
                 )
         recent_units.append(unit)
 
-    padding_frames = max(0, int(round(float(padding_seconds) * float(fps))))
+    padding_frames = max(0, _round_half_up(float(padding_seconds) * float(fps)))
     expanded_risky = _merge_adaptive_regions(
         [
             {
@@ -206,8 +206,8 @@ def detect_ambiguous_regions(
         zip(windows or [], payloads or []),
         key=lambda pair: (int(pair[0].get("track_index") or 0), int(pair[0].get("start_frame") or 0)),
     )
-    padding = max(1, int(round(2.5 * fps)))
-    maximum_frames = max(1, int(round(16.0 * fps)))
+    padding = max(1, _round_half_up(2.5 * fps))
+    maximum_frames = max(1, _round_half_up(16.0 * fps))
     regions: list[dict[str, Any]] = []
     disagreement_count = 0
     for (left_window, left_payload), (right_window, right_payload) in zip(pairs, pairs[1:]):
@@ -475,6 +475,17 @@ def _read_pcm16(path: str | Path) -> tuple[int, array]:
     return sample_rate, samples
 
 
+def _round_half_up(value: float) -> int:
+    """Frame-count rounding shared by every time->frame estimate in v5.
+
+    Python's built-in ``round`` is banker's rounding (round-half-even), so
+    29.97 fps conversions like 0.5-frame boundaries silently disagree
+    between sites. Frame boundaries and tail estimates must use the
+    conventional round-half-up so every caller rounds the same way.
+    """
+    return int(math.floor(float(value) + 0.5))
+
+
 def _window_rms(samples: array, size: int) -> list[float]:
     levels: list[float] = []
     for index in range(0, len(samples), size):
@@ -490,7 +501,9 @@ def _speech_regions(levels: list[float], sample_rate: int, hop_samples: int, fps
         return []
     sorted_levels = sorted(levels)
     noise = sorted_levels[min(len(sorted_levels) - 1, int(len(sorted_levels) * 0.20))]
-    peak = max(sorted_levels)
+    # 用 95 分位而非绝对最大值做能量峰值：单个爆音/咔哒声会把 max 拉到异常高，
+    # 导致阈值被尖峰绑架、其余正常语音全部落在阈值之下。
+    peak = sorted_levels[min(len(sorted_levels) - 1, int(len(sorted_levels) * 0.95))]
     on_threshold = max(noise * 2.0, peak * 0.15, 1.0)
     off_threshold = max(noise * 1.35, peak * 0.08, 0.5)
     hangover_windows = max(1, int(math.ceil(0.08 * sample_rate / hop_samples)))
@@ -508,16 +521,16 @@ def _speech_regions(levels: list[float], sample_rate: int, hop_samples: int, fps
                 below_count += 1
                 if below_count >= hangover_windows:
                     end_index = max(start_index + 1, index - below_count + 1)
-                    start_frame = track_start_frame + int(round(start_index * hop_samples / sample_rate * fps))
-                    end_frame = track_start_frame + int(round(end_index * hop_samples / sample_rate * fps))
+                    start_frame = track_start_frame + _round_half_up(start_index * hop_samples / sample_rate * fps)
+                    end_frame = track_start_frame + _round_half_up(end_index * hop_samples / sample_rate * fps)
                     regions.append((start_frame, max(start_frame + 1, end_frame)))
                     voiced = False
                     below_count = 0
             else:
                 below_count = 0
     if voiced:
-        start_frame = track_start_frame + int(round(start_index * hop_samples / sample_rate * fps))
-        end_frame = track_start_frame + int(round(len(levels) * hop_samples / sample_rate * fps))
+        start_frame = track_start_frame + _round_half_up(start_index * hop_samples / sample_rate * fps)
+        end_frame = track_start_frame + _round_half_up(len(levels) * hop_samples / sample_rate * fps)
         regions.append((start_frame, max(start_frame + 1, end_frame)))
     return regions
 
@@ -560,10 +573,12 @@ def refine_subtitle_boundaries(
     fps: float,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     sample_rate, samples = _read_pcm16(audio_path)
-    hop_samples = max(1, int(round(sample_rate * 0.01)))
+    hop_samples = max(1, _round_half_up(sample_rate * 0.01))
     levels = _window_rms(samples, hop_samples)
     regions = _speech_regions(levels, sample_rate, hop_samples, fps, track_start_frame)
-    search_frames = max(1, int(round(12)))
+    # 搜索窗按帧率缩放：设计基准是 30fps 下 12 帧（0.4s）。硬编码 12 会让
+    # 60fps 工程只搜到 0.2s、24fps 工程搜到 0.5s，行为随工程帧率漂移。
+    search_frames = max(1, _round_half_up(0.4 * float(fps)))
     output: list[dict[str, Any]] = []
     for raw_row in sorted(rows or [], key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0))):
         row = dict(raw_row)
@@ -584,7 +599,7 @@ def refine_subtitle_boundaries(
 
     valley_count = 0
     preserved_gaps = 0
-    maximum_continuous_gap = max(1, int(round(0.20 * fps)))
+    maximum_continuous_gap = max(1, _round_half_up(0.20 * fps))
     for left, right in zip(output, output[1:]):
         # Decide from pre-refinement bounds, not gaps created by amplitude guesses.
         left_end = int(left["original_end_frame"])
@@ -673,7 +688,13 @@ def shadow_refine_subtitle_boundaries(
         fps,
     )
     output: list[dict[str, Any]] = []
-    for original, candidate in zip(original_rows, suggested_rows, strict=True):
+    # zip(..., strict=True) 仅 Python 3.10+ 支持；显式等长校验保持同等语义并兼容 3.8/3.9。
+    if len(original_rows) != len(suggested_rows):
+        raise ValueError(
+            "refine_subtitle_boundaries 返回行数不一致: original=%d suggested=%d"
+            % (len(original_rows), len(suggested_rows))
+        )
+    for original, candidate in zip(original_rows, suggested_rows):
         row = dict(original)
         row["suggested_start_frame"] = int(candidate.get("start_frame") or row.get("start_frame") or 0)
         row["suggested_end_frame"] = int(candidate.get("end_frame") or row.get("end_frame") or 0)

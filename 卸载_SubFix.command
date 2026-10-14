@@ -60,5 +60,16 @@ if (( ${#system_targets[@]} )); then
 fi
 if (( ${#user_targets[@]} )); then /bin/rm -rf -- "${user_targets[@]}"; fi
 if (( ${#system_targets[@]} )); then sudo /bin/rm -rf -- "${system_targets[@]}"; fi
+
+# 删除后复核：有残留则明确失败并返回非零，不能谎报成功。
+failed=()
+for path in "${user_targets[@]}" "${system_targets[@]}"; do
+  [[ -e "$path" || -L "$path" ]] && failed+=("$path")
+done
+if (( ${#failed[@]} )); then
+  echo "以下项目未能删除，请检查权限或关闭达芬奇后重试：" >&2
+  printf '  %s\n' "${failed[@]}" >&2
+  exit 1
+fi
 echo "SubFix 卸载完成，请重新打开达芬奇以刷新脚本菜单。"
 finish

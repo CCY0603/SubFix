@@ -41,13 +41,15 @@ if (-not (Test-Path $SourceSupport)) {
 #   全用户：%ProgramData%\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility
 $RelUser = 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
 $RelSystem = 'Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility'
+$AppDataBase = [Environment]::GetEnvironmentVariable('APPDATA')
+if (-not $AppDataBase) { $AppDataBase = Join-Path $env:USERPROFILE 'AppData\Roaming' }
+$ProgramDataBase = [Environment]::GetEnvironmentVariable('ProgramData')
+if (-not $ProgramDataBase) { $ProgramDataBase = 'C:\ProgramData' }
 if ($AllUsers) {
-    $Base = [Environment]::GetEnvironmentVariable('ProgramData')
-    if (-not $Base) { $Base = 'C:\ProgramData' }
+    $Base = $ProgramDataBase
     $Rel = $RelSystem
 } else {
-    $Base = [Environment]::GetEnvironmentVariable('APPDATA')
-    if (-not $Base) { $Base = Join-Path $env:USERPROFILE 'AppData\Roaming' }
+    $Base = $AppDataBase
     $Rel = $RelUser
 }
 $Target = Join-Path $Base $Rel
@@ -72,11 +74,10 @@ New-Item -ItemType Directory -Force -Path $DestSupport | Out-Null
 
 # -Force 合并复制，保留用户此前可能留下的私有 Qwen 模型、环境与配置。
 if ($SourceSubFix -eq $Source) {
-    # 仓库扁平布局：只复制两个 lua 入口，避免把仓库其它文件（README、脚本、隐藏目录等）带进去。
-    foreach ($F in @('SubFix.lua', '生成选区字幕.lua')) {
-        $Src = Join-Path $Source $F
-        if (Test-Path $Src) { Copy-Item -Path $Src -Destination $DestSubFix -Force }
-    }
+    # 仓库扁平布局：只复制唯一的用户菜单入口，避免把仓库其它文件（README、脚本、隐藏目录等）带进去。
+    # 独立的「生成选区字幕.lua」仅保留在仓库中作为手动调试入口，不再面向用户部署。
+    $Src = Join-Path $Source 'SubFix.lua'
+    if (Test-Path $Src) { Copy-Item -Path $Src -Destination $DestSubFix -Force }
     # 扁平布局下辅助脚本位于源根目录，按运行时期望的 .subfix_support 布局复制过去。
     foreach ($Py in (Get-ChildItem -Path $Source -Filter 'subfix_*.py' -File)) {
         Copy-Item -Path $Py.FullName -Destination $DestSupport -Force
@@ -85,6 +86,36 @@ if ($SourceSubFix -eq $Source) {
     Copy-Item -Path (Join-Path $SourceSubFix '*') -Destination $DestSubFix -Recurse -Force
 }
 Copy-Item -Path (Join-Path $SourceSupport '*') -Destination $DestSupport -Recurse -Force
+
+# 旧版本曾把独立的「生成选区字幕」菜单复制进 SubFix 目录或 Utility 根目录；
+# 合并为单一菜单后这些副本必须清掉。绝不动现役的 SubFix\SubFix.lua。
+function Remove-LegacySubFixMenu {
+    param([string]$Root)
+    if (-not $Root -or -not (Test-Path -LiteralPath $Root)) { return }
+    foreach ($Legacy in @(
+        (Join-Path $Root 'SubFix\生成选区字幕.lua'),
+        (Join-Path $Root 'SubFix\SubFix_GenerateSelectionSubtitles.lua'),
+        (Join-Path $Root 'SubFix_GenerateSelectionSubtitles.lua'),
+        (Join-Path $Root 'SubFix.lua')
+    )) {
+        try {
+            if (Test-Path -LiteralPath $Legacy) {
+                Remove-Item -LiteralPath $Legacy -Force -ErrorAction Stop
+                Write-Host "已清理旧版菜单副本：$Legacy"
+            }
+        } catch {
+            Write-Warning "未能删除旧版菜单副本：$Legacy（$($_.Exception.Message)）"
+        }
+    }
+}
+
+Remove-LegacySubFixMenu -Root $Target
+# 部署到一个根时，顺带尽力清理另一个根里的旧副本（系统级可能需要管理员，失败仅警告）。
+if ($AllUsers) {
+    Remove-LegacySubFixMenu -Root (Join-Path $AppDataBase $RelUser)
+} else {
+    Remove-LegacySubFixMenu -Root (Join-Path $ProgramDataBase $RelSystem)
+}
 
 # 让主脚本可被执行（Windows 不依赖 +x，但保持与 macOS 一致的部署动作）。
 Write-Host "已部署 SubFix 运行时到：$Target"

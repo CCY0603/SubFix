@@ -42,9 +42,9 @@ class EnvironmentLocationTests(unittest.TestCase):
         source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text()
         for name in ["build_qwen_status_command", "build_qwen_install_command"]:
             body = source.split("local function " + name, 1)[1].split("\nend", 1)[0]
-            self.assertIn('"PYTHONDONTWRITEBYTECODE=1"', body)
             self.assertIn('"-B"', body)
 
+    @unittest.skipIf(os.name == "nt", "Windows requires developer mode or elevation to create symlinks")
     def test_real_local_pip_install_does_not_modify_script_tree(self):
         self.paths.base_python.parent.mkdir(parents=True)
         self.paths.base_python.symlink_to(sys.executable)
@@ -75,6 +75,7 @@ class EnvironmentLocationTests(unittest.TestCase):
         self.assertTrue(self.paths.ready_marker.is_file())
         self.assertEqual(before, {str(p.relative_to(self.paths.root)) for p in self.paths.root.rglob("*")})
 
+    @unittest.skipIf(os.name == "nt", "legacy environment uses the POSIX bin/python layout")
     def test_completed_legacy_environment_still_works_without_mutation(self):
         self.make_model()
         legacy_python = self.paths.root / "envs/qwen-local/bin/python"

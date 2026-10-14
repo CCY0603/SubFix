@@ -6,7 +6,6 @@ from __future__ import annotations
 import difflib
 import hashlib
 import itertools
-import json
 import math
 import re
 import statistics
@@ -333,16 +332,67 @@ def compose_track_audio(
     total_samples = max(1, int(math.ceil((timeline_end - timeline_start) / fps * sample_rate)))
     mixed = array("h", [0]) * total_samples
     overlap_sample_count = 0
+    # P6：covered 记录「已被先前片段写过的目标区间」（按起点排序、互不相交）。
+    # 轨道片段在 Resolve 里首尾相接、互不重叠：新区间与 covered 不相交的部分直接用
+    # array 切片批量拷贝（C 层赋值，替代逐样本 Python 循环）；只有与已写区间相交的
+    # 小区间才退回逐样本加法+钳制，并严格沿用旧的 overlap 计数判定
+    # （写入前 mixed[target] != 0 即计一次，包含「先前片段在该点写了 0」的边界语义），
+    # 因此处理顺序与旧实现一致，数值与统计字典逐字段等价。
+    covered: list[tuple[int, int]] = []
+
+    def _add_covered(start: int, end: int) -> None:
+        if start >= end:
+            return
+        merged: list[tuple[int, int]] = []
+        inserted = False
+        for c0, c1 in covered:
+            if c1 < start:
+                merged.append((c0, c1))
+            elif c0 > end:
+                if not inserted:
+                    merged.append((start, end))
+                    inserted = True
+                merged.append((c0, c1))
+            else:
+                start = min(start, c0)
+                end = max(end, c1)
+        if not inserted:
+            merged.append((start, end))
+        covered[:] = merged
+
     for item, path, _sample_count in valid:
         _rate, samples = _read_mono_pcm16(path)
         offset = int(round((int(item.get("timeline_start_frame") or 0) - timeline_start) / fps * sample_rate))
-        for index, value in enumerate(samples):
-            target = offset + index
-            if target < 0 or target >= total_samples:
-                continue
-            if mixed[target] != 0:
-                overlap_sample_count += 1
-            mixed[target] = max(-32768, min(32767, mixed[target] + int(value)))
+        # 钳制到混音缓冲内的目标区间 [span_start, span_end) 及对应的源下标
+        span_start = max(0, offset)
+        span_end = min(total_samples, offset + len(samples))
+        if span_start >= span_end:
+            continue
+        overlap_hits: list[tuple[int, int]] = []
+        for c0, c1 in covered:
+            hit_start = max(span_start, c0)
+            hit_end = min(span_end, c1)
+            if hit_start < hit_end:
+                overlap_hits.append((hit_start, hit_end))
+        # 不相交的空洞区间收集起来一次性切片拷贝；相交区间逐样本累加
+        copy_pieces: list[tuple[int, int]] = []
+        cursor = span_start
+        for hit_start, hit_end in overlap_hits:
+            if cursor < hit_start:
+                copy_pieces.append((cursor, hit_start))
+            for target in range(hit_start, hit_end):
+                value = samples[target - offset]
+                if mixed[target] != 0:
+                    overlap_sample_count += 1
+                mixed[target] = max(-32768, min(32767, mixed[target] + int(value)))
+            cursor = max(cursor, hit_end)
+        if cursor < span_end:
+            copy_pieces.append((cursor, span_end))
+        for dest_start, dest_end in copy_pieces:
+            src_start = dest_start - offset
+            src_end = dest_end - offset
+            mixed[dest_start:dest_end] = samples[src_start:src_end]
+        _add_covered(span_start, span_end)
     _write_mono_pcm16(Path(output_path), sample_rate, mixed)
     return {
         "timeline_start_frame": timeline_start,
@@ -435,6 +485,17 @@ def prepare_track_context_windows(
         track_path = output_dir / f"track_{track_index:03d}.wav"
         composite = compose_track_audio(items, track_path)
         fps = float(items[0].get("fps") or items[0].get("batch_fps") or 30.0)
+        # 合轨后单个窗口无法把每个字归因到某个源 item，这里在轨道级聚合源
+        # batch 的排序/序号信息并随窗口透传，供断句行回填 Lua 仲裁所需字段。
+        track_order = min((int(item.get("track_order") or 0) for item in items), default=0)
+        track_item_index = min((int(item.get("item_index") or 0) for item in items), default=0)
+        source_batch_ids = list(
+            dict.fromkeys(
+                str(item.get("batch_id") or "")
+                for item in items
+                if str(item.get("batch_id") or "")
+            )
+        )
         windows = build_context_windows(
             int(composite["timeline_start_frame"]),
             int(composite["timeline_end_frame"]),
@@ -451,7 +512,15 @@ def prepare_track_context_windows(
                 int(window["end_frame"]),
                 fps,
             )
-            prepared_windows.append({**window, "audio_path": str(window_path)})
+            prepared_windows.append(
+                {
+                    **window,
+                    "audio_path": str(window_path),
+                    "track_order": track_order,
+                    "item_index": track_item_index,
+                    "source_batch_ids": source_batch_ids,
+                }
+            )
         context_window_count += len(prepared_windows)
         prepared.append(
             {
@@ -460,6 +529,9 @@ def prepare_track_context_windows(
                 "timeline_start_frame": int(composite["timeline_start_frame"]),
                 "timeline_end_frame": int(composite["timeline_end_frame"]),
                 "item_count": int(composite["item_count"]),
+                "track_order": track_order,
+                "item_index": track_item_index,
+                "source_batch_ids": source_batch_ids,
                 "audio_path": str(track_path),
                 "windows": prepared_windows,
             }
@@ -555,7 +627,7 @@ def dedupe_overlap_units(units: list[dict[str, Any]], nearby_frames: int = 2) ->
         ]
         for index in active_indices:
             existing = accepted[index]
-            if normalize_text(existing.get("text")) != text or not text:
+            if not text or normalize_text(existing.get("text")) != text:
                 continue
             starts_near = abs(int(existing.get("start_frame") or 0) - int(unit.get("start_frame") or 0)) <= nearby_frames
             existing_window = int(existing.get("window_index") or 0)
@@ -2264,6 +2336,56 @@ def _segmentation_length_parameters(
     return minimum, median, preferred_maximum, maximum
 
 
+def _segment_row_source_fields(units: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-unit provenance/acoustic fields onto one segmented row.
+
+    A leaf segmentation group never crosses speaker tracks (track changes are
+    hard split points), so track-level identity comes from the first unit.
+    ``speaker_score_db`` is the median unit score -- the same statistic the
+    cross-mic arbitration uses -- so Lua-side duplicate arbitration compares
+    meaningful values instead of every row tying at 0 (the field previously
+    never reached the rows). batch_id/track_order/item_index originate from
+    the source work items and are track-level once items are composited.
+    """
+    if not units:
+        return {
+            "track_index": 0,
+            "speaker_track_index": 0,
+            "speaker_score_db": 0.0,
+            "speaker_decision": "",
+            "batch_id": "",
+            "track_order": 0,
+            "item_index": 0,
+        }
+    first = units[0]
+    track_index = int(first.get("track_index") or first.get("speaker_track_index") or 0)
+    scores = [
+        float(unit["speaker_score_db"])
+        for unit in units
+        if unit.get("speaker_score_db") is not None
+    ]
+    speaker_score_db = round(statistics.median(scores), 3) if scores else 0.0
+    speaker_decision = next(
+        (str(unit.get("speaker_decision") or "") for unit in units if str(unit.get("speaker_decision") or "")),
+        "",
+    )
+    batch_id = next(
+        (str(unit.get("batch_id") or "") for unit in units if str(unit.get("batch_id") or "")),
+        "",
+    )
+    track_order = min((int(unit.get("track_order") or 0) for unit in units), default=0)
+    item_index = min((int(unit.get("item_index") or 0) for unit in units), default=0)
+    return {
+        "track_index": track_index,
+        "speaker_track_index": int(first.get("speaker_track_index") or track_index),
+        "speaker_score_db": speaker_score_db,
+        "speaker_decision": speaker_decision,
+        "batch_id": batch_id,
+        "track_order": track_order,
+        "item_index": item_index,
+    }
+
+
 def segment_canonical_units(
     units: list[dict[str, Any]],
     mode: str,
@@ -2358,7 +2480,7 @@ def segment_canonical_units(
                 int(ordered[0].get("start_frame") or 0) + 1,
                 int(ordered[-1].get("end_frame") or 0),
             ),
-            "speaker_track_index": int(ordered[0].get("track_index") or 0),
+            **_segment_row_source_fields(ordered),
             "segmentation_decision": "v4_unsplit_complete_region",
             "independent_vad": any(bool(unit.get("independent_vad")) for unit in ordered),
         }
@@ -2431,7 +2553,7 @@ def segment_canonical_units(
                 "text": text,
                 "start_frame": start_frame,
                 "end_frame": max(start_frame + 1, end_frame),
-                "speaker_track_index": int(ordered[start].get("track_index") or 0),
+                **_segment_row_source_fields(ordered[start:end]),
                 "segmentation_decision": "v4_boundary_dp",
                 "independent_vad": any(bool(unit.get("independent_vad")) for unit in ordered[start:end]),
             }
@@ -3017,10 +3139,6 @@ def _map_manual_boundary_positions(source_text: str, manual_chunks: list[str]) -
                 break
         boundaries.append(mapped_position)
     return boundaries
-
-
-def _map_manual_boundaries(source_text: str, manual_chunks: list[str]) -> set[int]:
-    return {position for position in _map_manual_boundary_positions(source_text, manual_chunks) if position is not None}
 
 
 def _source_position_for_frame(plugin_rows: list[dict[str, Any]], frame: int) -> int | None:

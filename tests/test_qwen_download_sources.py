@@ -1,6 +1,7 @@
 """Domestic downloads must not contact Hugging Face unless the primary fails."""
 
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -125,6 +126,7 @@ def test_incomplete_primary_download_triggers_fallback(tmp_path, monkeypatch):
     assert sources == ["modelscope", "huggingface"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="legacy POSIX virtualenv layout is not reused on Windows")
 def test_installed_legacy_environment_is_not_migrated_or_redownloaded(tmp_path, monkeypatch):
     manager = load_manager_module()
     paths = make_paths(manager, tmp_path)

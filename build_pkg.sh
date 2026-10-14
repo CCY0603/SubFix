@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_NAME="${PKG_NAME:-SubFix}"
 IDENTIFIER="${IDENTIFIER:-com.mediastorm.subfix}"
 SOURCE_FILE="${SOURCE_FILE:-${SCRIPT_DIR}/SubFix.lua}"
-GENERATOR_FILE="${GENERATOR_FILE:-${SCRIPT_DIR}/生成选区字幕.lua}"
+# 独立的「生成选区字幕.lua」仅保留在仓库内作为手动调试入口，不再随发布包部署。
 GENERATE_CORE_FILE="${GENERATE_CORE_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_generate_selection_core.lua}"
 PROCESS_GROUP_FILE="${PROCESS_GROUP_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_process_group.py}"
 UPDATE_HELPER_FILE="${UPDATE_HELPER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_update.py}"
@@ -48,7 +48,7 @@ OUTPUT_ZIP_PATH="${RELEASE_ROOT}/${OUTPUT_ZIP_NAME}"
 
 echo "📦 开始构建 ${PKG_NAME} v${VERSION} 安装包..."
 
-for required in "$SOURCE_FILE" "$GENERATOR_FILE" "$GENERATE_CORE_FILE" "$PROCESS_GROUP_FILE" "$UPDATE_HELPER_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$GENERATE_TEXTNORM_FILE" "$QWEN_LOCAL_MANAGER_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
+for required in "$SOURCE_FILE" "$GENERATE_CORE_FILE" "$PROCESS_GROUP_FILE" "$UPDATE_HELPER_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$GENERATE_TEXTNORM_FILE" "$QWEN_LOCAL_MANAGER_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
     if [ ! -f "$required" ]; then
         echo "❌ 错误：源文件不存在：$required"
         exit 1
@@ -62,7 +62,6 @@ mkdir -p "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support" "$PAYLOAD_DIR/${INSTALL_
 
 echo "📄 拷贝源文件到安装载荷目录..."
 cp "$SOURCE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/SubFix.lua"
-cp "$GENERATOR_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/生成选区字幕.lua"
 cp "$GENERATE_CORE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_selection_core.lua"
 cp "$PROCESS_GROUP_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_process_group.py"
 cp "$UPDATE_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_update.py"
@@ -76,7 +75,6 @@ cp "$SEGMENTATION_PROFILE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/se
 cp "$SEGMENTATION_PROFILE_V3_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/segmentation_profile_v3.json"
 cp "$SEGMENTATION_PROFILE_V4_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/segmentation_profile_v4.json"
 chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/SubFix.lua"
-chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/生成选区字幕.lua"
 chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_asr_transcribe.py"
 chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_process_group.py"
 chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/setup_asr_env.sh"
@@ -98,6 +96,17 @@ fi
 
 if [ -z "$UNINSTALLER_ARTIFACT_PATH" ]; then
     echo "❌ 错误：删除程序构建失败：$UNINSTALLER_BUILD_DIR"
+    exit 1
+fi
+
+# 用户菜单只允许出现 SubFix/SubFix.lua 一个入口；独立「生成选区字幕」菜单不再部署。
+menu_lua_count="$(find "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix" -maxdepth 1 -type f -name '*.lua' | wc -l | tr -d '[:space:]')"
+if [[ "$menu_lua_count" != "1" || ! -f "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/SubFix.lua" ]]; then
+    echo "❌ 错误：用户菜单载荷必须只含 SubFix/SubFix.lua 一个 Lua 入口" >&2
+    exit 1
+fi
+if [[ -e "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/生成选区字幕.lua" ]]; then
+    echo "❌ 错误：载荷不得包含已退役的独立菜单 SubFix/生成选区字幕.lua" >&2
     exit 1
 fi
 
@@ -140,7 +149,6 @@ fi
 
 echo "📦 整理分发目录..."
 cp "$SOURCE_FILE" "${RELEASE_DIR}/SubFix/SubFix.lua"
-cp "$GENERATOR_FILE" "${RELEASE_DIR}/SubFix/生成选区字幕.lua"
 cp "$GENERATE_CORE_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_selection_core.lua"
 cp "$PROCESS_GROUP_FILE" "${RELEASE_DIR}/.subfix_support/subfix_process_group.py"
 cp "$UPDATE_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_update.py"
@@ -172,7 +180,6 @@ echo "✅ 分发 ZIP 已生成：$OUTPUT_ZIP_PATH"
 echo ""
 echo "💡 分发目录包含："
 echo "   - 安装程序：${OUTPUT_PKG_NAME}"
-echo "   - 主入口：SubFix/SubFix.lua"
-echo "   - 生成入口：SubFix/生成选区字幕.lua"
+echo "   - 唯一用户菜单入口：SubFix/SubFix.lua"
 echo "   - 支持文件：.subfix_support/"
 echo "   - 删除程序：$(basename "$UNINSTALLER_ARTIFACT_PATH")"

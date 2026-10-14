@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import platform
-from pathlib import Path, PurePath
+from pathlib import Path, PurePosixPath
 import shutil
 import tempfile
 from typing import Any, Callable
@@ -17,15 +17,20 @@ from urllib.request import Request, urlopen
 import zipfile
 
 
-REPOSITORY = "HooperH/SubFix"
+REPOSITORY = "CCY0603/SubFix"
 RELEASE_API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 def _resolve_utility_roots() -> "tuple[Path, Path]":
     if platform.system() == "Windows":
         appdata = Path(os.environ.get("APPDATA", ""))
         programdata = Path(os.environ.get("ProgramData", ""))
-        rel = "Blackmagic Design\\DaVinci Resolve\\Fusion\\Scripts\\Utility"
-        user = appdata / rel if str(appdata) else Path.home() / rel
-        system = programdata / rel if str(programdata) else Path(programdata) / rel
+        # Resolve 的用户级脚本目录比全用户多一层 Support（与安装器、
+        # SubFix.lua 的 subfix_dr_utility_root() 保持一致）：
+        #   用户级：%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility
+        #   全用户：%ProgramData%\Blackmagic Design\DaVinci Resolve\Fusion\Scripts\Utility
+        user_rel = "Blackmagic Design\\DaVinci Resolve\\Support\\Fusion\\Scripts\\Utility"
+        system_rel = "Blackmagic Design\\DaVinci Resolve\\Fusion\\Scripts\\Utility"
+        user = appdata / user_rel if str(appdata) else Path.home() / user_rel
+        system = programdata / system_rel if str(programdata) else Path(programdata) / system_rel
         return user, system
     home = Path.home()
     rel = "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
@@ -34,10 +39,12 @@ def _resolve_utility_roots() -> "tuple[Path, Path]":
 
 USER_UTILITY_ROOT, SYSTEM_UTILITY_ROOT = _resolve_utility_roots()
 MANIFEST_NAME = "subfix-update-manifest.json"
+# 白名单、manifest、zip entry 一律使用 POSIX 相对路径（zip 标准分隔符为 "/"），
+# 否则在 Windows 上 str(PurePath("SubFix/SubFix.lua")) 会变成反斜杠形式，
+# 与 zip entry/白名单永远不相等，导致在线更新必然被判为「未授权文件」。
 UPDATE_FILE_PATHS = frozenset(
     {
         "SubFix/SubFix.lua",
-        "SubFix/生成选区字幕.lua",
         ".subfix_support/subfix_generate_selection_core.lua",
         ".subfix_support/subfix_process_group.py",
         ".subfix_support/subfix_update.py",
@@ -47,6 +54,7 @@ UPDATE_FILE_PATHS = frozenset(
         ".subfix_support/subfix_generate_textnorm.py",
         ".subfix_support/subfix_qwen_local_manager.py",
         ".subfix_support/bin/ffmpeg",
+        ".subfix_support/bin/ffmpeg.exe",
         ".subfix_support/licenses/FFmpeg-LGPL-2.1.txt",
         ".subfix_support/setup_asr_env.sh",
         ".subfix_support/setup_asr_env.ps1",
@@ -55,6 +63,12 @@ UPDATE_FILE_PATHS = frozenset(
         ".subfix_support/segmentation_profile_v4.json",
     }
 )
+
+
+def normalize_relative_path(value: str) -> str:
+    """Normalize manifest/zip relative paths to the POSIX form used in the whitelist."""
+    text = str(value or "").replace("\\", "/")
+    return PurePosixPath(text).as_posix()
 
 
 class UpdateError(RuntimeError):
@@ -176,13 +190,25 @@ def _safe_update_files(archive: zipfile.ZipFile, version: str) -> list[str]:
     files = manifest.get("files")
     if not isinstance(files, list) or not files or any(not isinstance(item, str) for item in files):
         raise UpdateError("更新包 manifest 文件列表错误")
-    normalized_files = [str(PurePath(item)) for item in files]
+    normalized_files = [normalize_relative_path(item) for item in files]
     if len(normalized_files) != len(set(normalized_files)) or any(
-        item.startswith("/") or ".." in PurePath(item).parts or item not in UPDATE_FILE_PATHS
+        item.startswith("/")
+        or ":" in item
+        or ".." in PurePosixPath(item).parts
+        or item not in UPDATE_FILE_PATHS
         for item in normalized_files
     ):
         raise UpdateError("更新包包含未授权文件")
-    archive_files = {info.filename for info in archive.infolist() if not info.is_dir()}
+    archive_files = set()
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        entry_name = info.filename
+        # zip entry 必须就是 POSIX 相对路径；反斜杠/绝对路径条目一律拒绝，
+        # 避免不同平台解压语义差异把文件写到白名单目录之外。
+        if entry_name != normalize_relative_path(entry_name) or entry_name.startswith("/") or ":" in entry_name:
+            raise UpdateError("更新包包含非法路径条目")
+        archive_files.add(entry_name)
     if archive_files != {MANIFEST_NAME, *normalized_files}:
         raise UpdateError("更新包内容与 manifest 不一致")
     return normalized_files
@@ -193,39 +219,63 @@ def _safe_destination(target_root: Path, relative_path: str) -> Path:
     parent = target_root
     if parent.is_symlink():
         raise UpdateError("拒绝写入符号链接目录")
-    # 仅允许在用户 Resolve 脚本目录的真实子目录中替换白名单文件。
-    for part in PurePath(relative_path).parts[:-1]:
+    # 仅允许在 Resolve 脚本目录的真实子目录中替换白名单文件。
+    posix_path = PurePosixPath(relative_path)
+    for part in posix_path.parts[:-1]:
         parent = parent / part
         if parent.is_symlink():
             raise UpdateError(f"拒绝写入符号链接目录: {relative_path}")
         parent.mkdir(exist_ok=True)
-    return parent / PurePath(relative_path).name
+    return parent / posix_path.name
 
 
-def cleanup_legacy_system_menu(target_root: Path) -> None:
-    """Remove the previous system-level menu only after a user-level update succeeds."""
-    if target_root != USER_UTILITY_ROOT:
-        return
-    menu_directory = SYSTEM_UTILITY_ROOT / "SubFix"
+def _remove_legacy_menu_within_root(root: Path) -> None:
+    """Delete stale single-menu copies that live in the same Utility root.
+
+    The current install keeps SubFix/SubFix.lua, so that live file is never
+    touched here; only the retired 生成选区字幕 menu entry and the even older
+    English launcher names are removed. An empty legacy ``SubFix`` menu
+    directory is pruned as well; a directory still holding the live
+    SubFix.lua (or any unknown file) is left untouched.
+    """
+    menu_directory = root / "SubFix"
     legacy_paths = (
-        menu_directory / "SubFix.lua",
         menu_directory / "生成选区字幕.lua",
-        SYSTEM_UTILITY_ROOT / "SubFix.lua",
-        SYSTEM_UTILITY_ROOT / "SubFix_GenerateSelectionSubtitles.lua",
+        menu_directory / "SubFix_GenerateSelectionSubtitles.lua",
+        root / "SubFix_GenerateSelectionSubtitles.lua",
+        root / "SubFix.lua",
     )
-    try:
-        if menu_directory.is_symlink():
-            menu_directory.unlink()
-        else:
-            for legacy_path in legacy_paths:
-                if legacy_path.is_file() or legacy_path.is_symlink():
-                    legacy_path.unlink()
-        if menu_directory.is_dir() and not menu_directory.is_symlink():
+    for legacy_path in legacy_paths:
+        if legacy_path.is_file() or legacy_path.is_symlink():
+            legacy_path.unlink()
+    if menu_directory.is_dir() and not menu_directory.is_symlink():
+        try:
+            # 仅在目录已空时移除；含现役 SubFix.lua 或未知文件则保留，绝不扩大删除范围。
             menu_directory.rmdir()
-    except OSError:
-        # A legacy root-owned install may require the corrected .pkg once;
-        # never fail a verified user-level update solely because of that stale copy.
-        return
+        except OSError:
+            pass
+
+
+def cleanup_legacy_menu_files(target_root: Path) -> None:
+    """Best-effort cleanup after a verified update succeeds.
+
+    * Inside the updated root: remove the retired single-menu Lua entries.
+    * Also sweep the *other* well-known root (user <-> system), because
+      Resolve scans both script trees and a stale copy there keeps showing
+      the retired standalone menu. Root-owned files may require admin and
+      their failure must never fail a verified update.
+    """
+    candidate_roots = [Path(target_root)]
+    if Path(target_root) == USER_UTILITY_ROOT:
+        candidate_roots.append(SYSTEM_UTILITY_ROOT)
+    elif Path(target_root) == SYSTEM_UTILITY_ROOT:
+        candidate_roots.append(USER_UTILITY_ROOT)
+    for root in candidate_roots:
+        try:
+            _remove_legacy_menu_within_root(root)
+        except OSError:
+            # 系统级残留可能需要管理员权限；不因旧副本清理失败而回滚已验证的更新。
+            continue
 
 
 def install_archive(archive_path: Path, expected_sha256: str, version: str, target_root: Path = USER_UTILITY_ROOT) -> None:
@@ -256,7 +306,7 @@ def install_archive(archive_path: Path, expected_sha256: str, version: str, targ
                     if os.name != "nt" and relative_path == ".subfix_support/bin/ffmpeg":
                         destination.chmod(0o755)
                     replaced.append(destination)
-                cleanup_legacy_system_menu(target_root)
+                cleanup_legacy_menu_files(target_root)
             except Exception as exc:
                 for destination in reversed(replaced):
                     original = backups[destination]

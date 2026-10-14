@@ -21,10 +21,50 @@ v2.0.0 - 2026-03-18
   4. 大模型 AI 纠错引擎
 --]]
 
+-- ============================================================================
+-- 全局关闭 LuaJIT JIT 编译器（进程级，只需一次，对随后 dofile 的 core 同样生效）。
+-- 背景：Resolve 自带 LuaJIT 2.1.0-beta3（2017 老 beta）。在「UI 回调 + FFI 宽字符/
+-- 子进程链路 + 嵌套 dispatcher:RunLoop()」组合下，JIT 会把个别热路径（轮询循环、
+-- 字符串/模式处理等）误编译为写坏 C 堆的代码，随后在任意一次 malloc/free
+-- （LuaJIT 内置 dlmalloc 的 unlink）处延迟爆炸：fuscript.exe APPCRASH、
+-- 故障模块 lua5.1.dll、异常 c0000005。实测故障点随机（状态检测清理期/子进程
+-- 启动后 1 秒都出现过）、无任何 Lua 报错、pcall 无法拦截；WER 已多次记录同一
+-- 函数区间内的随机偏移。本插件为 UI/文件/网络/子进程等待密集型，热点不在 Lua
+-- 计算，解释执行无实际性能损失；关闭 JIT 同时消除「即时构造的 cdata 参数在
+-- JIT 快照下被提前 GC」一类不确定行为。
+-- ============================================================================
+if not _G.SUBFIX_JIT_DISABLED then
+    _G.SUBFIX_JIT_DISABLED = true
+    pcall(function()
+        local jit_mod = require("jit")
+        jit_mod.off()
+        if jit_mod.flush then pcall(jit_mod.flush) end
+    end)
+end
+
+-- 控制台日志总闸：默认开启 = 与历史行为完全一致；需要控制台安静时改为 false 后重启达芬奇。
+-- 日志面板环形缓冲与文件落盘（LogMsg）是独立链路，不受本开关影响。
+SUBFIX_CONSOLE_LOG_ENABLED = true
+do
+    local native_print = print
+    local function gated_print(...)
+        if SUBFIX_CONSOLE_LOG_ENABLED then
+            return native_print(...)
+        end
+    end
+    _G.print = gated_print
+    print = gated_print
+end
+
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.3.0"
+SUBFIX_VERSION = "3.3.1"
+
+-- AI 详细日志开关：默认关闭——不向控制台/日志打印字幕原文、请求体、API 完整响应，
+-- 避免未公开文稿随控制台或日志外泄。排查 AI 问题时设置环境变量
+-- SUBFIX_DEBUG_AI=1 后重启达芬奇即可临时打开（改完去掉该变量再重启即恢复）。
+SUBFIX_AI_DEBUG_VERBOSE = (tostring(os.getenv("SUBFIX_DEBUG_AI") or ""):match("^1$") ~= nil)
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -149,21 +189,77 @@ end
 function subfix_wide(text)
     local w = subfix_utf8_to_utf16le(tostring(text or ""))
     local buf = SUBFIX_FFI.new("char[?]", #w + 2)
-    SUBFIX_FFI.copy(buf, w .. "\0\0")
+    -- 第 3 参必须显式给长度：ffi.copy 对 Lua 字符串源默认拷 #src+1（多 1 个隐式 NUL），
+    -- 会越过 #w+2 的缓冲区写穿 1 字节、踩坏相邻 GC 对象，事后在 GC free 处随机崩溃。
+    SUBFIX_FFI.copy(buf, w .. "\0\0", #w + 2)
     return SUBFIX_FFI.cast("wchar_t*", buf)
 end
 
-function subfix_hidden_shell(program, parameters)
+-- 构造多个 UTF-16 宽字符参数。返回 anchors（底层数组，必须以 local 持有覆盖整个 C 调用）
+-- 与 ptrs（wchar_t* 指针）。注意：ffi.cast 出的指针不会持有 ffi.new 的数组，连续构造
+-- 多个 subfix_wide 时，前一个数组可能在后续 ffi.new 触发 GC 时被回收，造成悬垂指针；
+-- 因此多参数调用（如 ShellExecuteW）必须用本函数把每个数组都锚定在表里。
+function subfix_wide_anchored(...)
+    local anchors, ptrs = {}, {}
+    for i, text in ipairs({ ... }) do
+        local w = subfix_utf8_to_utf16le(tostring(text or ""))
+        local buf = SUBFIX_FFI.new("char[?]", #w + 2)
+        SUBFIX_FFI.copy(buf, w .. "\0\0", #w + 2)
+        anchors[i] = buf
+        ptrs[i] = SUBFIX_FFI.cast("wchar_t*", buf)
+    end
+    return anchors, ptrs
+end
+
+function subfix_hidden_shell(program, parameters, no_fallback)
     if SUBFIX_SHELL_EXECUTE_W and SUBFIX_FFI then
+        local launch_result
         local ok = pcall(function()
-            SUBFIX_SHELL_EXECUTE_W(nil, subfix_wide("open"), subfix_wide(program),
-                subfix_wide(parameters or ""), subfix_wide(""), 0)
+            local anchors, wp = subfix_wide_anchored("open", program, parameters or "", "")
+            launch_result = SUBFIX_SHELL_EXECUTE_W(nil, wp[1], wp[2], wp[3], wp[4], 0)
         end)
-        if ok then return true end
+        -- ShellExecuteW 成功返回 >32 的伪句柄；<=32 为错误码（2=找不到文件等）。
+        -- 旧代码只看 pcall：返回错误码时不抛异常，会跳过回退且误报成功。
+        if ok and (tonumber(launch_result) or 0) > 32 then return true end
+        -- no_fallback：只发一次宽字符启动、成败由调用方凭 PID/输出文件等进程证据判定。
+        -- 绝不能在返回 <=32 时自行补一次 start：达芬奇内嵌 LuaJIT 下 ShellExecuteW 可能
+        -- 进程已拉起却返回 <=32，补启动会让同一个 runner 并发执行两遍，后一个抢不到输出
+        -- 文件重定向句柄，瞬间以 rc=0 写 done，前台误判“秒成功”（实为空结果）。
+        if no_fallback then return false end
     end
     -- 回退：仍可能闪窗，但保证功能可用
     os.execute('start "" /b ' .. subfix_dq(program) .. " " .. tostring(parameters or ""))
     return true
+end
+
+-- 等待后台启动器落盘 PID（宽字符启动返回值不可信时的唯一可靠证据）。
+-- 正常链路 powershell 启动后 0.5s 内写 PID；给 3s 窗口，超时即认定没启动。
+function subfix_wait_launch_pid(pid_file, timeout_seconds)
+    if not pid_file or pid_file == "" then return false end
+    local deadline = (os.clock() or 0) + (tonumber(timeout_seconds) or 3)
+    repeat
+        local text = trim_text(read_text_file(pid_file) or "")
+        if tonumber(text) ~= nil then return true end
+        subfix_sleep(0.05)
+    until (os.clock() or 0) >= deadline
+    return false
+end
+
+-- 单宽字符参数（路径）原生 API 的安全调用包装。
+-- 关键：ffi.cast 返回的指针【不持有】ffi.new 数组。旧写法 Fn(subfix_wide(path)) 中，
+-- subfix_wide 一返回数组就失去 Lua 引用，而 LuaJIT 解释器在函数 call/return 边界会
+-- 推进 GC；若数组在此刻被回收，原生 API 就读写已被重新分配的内存，踩坏 LuaJIT 的
+-- C 堆，事后在任意一次 malloc/free（lj_alloc unlink）处以 c0000005 随机崩溃
+-- （fuscript.exe APPCRASH、故障模块 lua5.1.dll、无 Lua 报错）。本函数把数组锚定在
+-- 自己的栈帧 local 上，覆盖整个 fn(ptr, ...) 调用，返回前绝不可能被回收。
+-- 用法：subfix_wcall(SUBFIX_FFI.C.CreateFileW, path, GENERIC_WRITE, ...)
+function subfix_wcall(fn, path, ...)
+    if not (SUBFIX_FFI and fn) then return nil end
+    local wide = subfix_utf8_to_utf16le(subfix_path_to_utf8(tostring(path or "")))
+    local buf = SUBFIX_FFI.new("char[?]", #wide + 2)
+    -- 显式长度：字符串源默认会多拷 1 个隐式 NUL，越界 1 字节会踩坏相邻 GC 块头。
+    SUBFIX_FFI.copy(buf, wide .. "\0\0", #wide + 2)
+    return fn(SUBFIX_FFI.cast("wchar_t*", buf), ...)
 end
 
 -- ffi 初始化：包在立即执行的函数里，local 占用的是函数帧而非主 chunk 槽位。
@@ -213,7 +309,12 @@ end)();
                               void* hTemplateFile);
             int WriteFile(void* hFile, const char* lpBuffer, unsigned long nNumberOfBytesToWrite,
                           unsigned long* lpNumberOfBytesWritten, void* lpOverlapped);
+            int ReadFile(void* hFile, void* lpBuffer, unsigned long nNumberOfBytesToRead,
+                         unsigned long* lpNumberOfBytesRead, void* lpOverlapped);
+            unsigned long GetFileSize(void* hFile, unsigned long* lpFileSizeHigh);
             int CloseHandle(void* hObject);
+            int DeleteFileW(const wchar_t* lpFileName);
+            unsigned long GetFileAttributesW(const wchar_t* lpFileName);
             int MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char* lpMultiByteStr,
                                     int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
             int WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags, const wchar_t* lpWideCharStr,
@@ -231,8 +332,7 @@ function subfix_create_directory(path)
     if p == "" then return false end
     if SUBFIX_IS_WINDOWS and SUBFIX_FFI and SUBFIX_FFI.C and SUBFIX_FFI.C.CreateDirectoryW then
         local function try_mkdir(one)
-            local w = subfix_wide(one)
-            if SUBFIX_FFI.C.CreateDirectoryW(w, nil) ~= 0 then return true end
+            if subfix_wcall(SUBFIX_FFI.C.CreateDirectoryW, one, nil) ~= 0 then return true end
             local ge = SUBFIX_FFI.C.GetLastError
             local e = ge and ge() or 0
             return e == 183
@@ -334,8 +434,8 @@ function subfix_write_file_bytes(path, data)
             local CREATE_ALWAYS = 2
             local FILE_ATTRIBUTE_NORMAL = 0x00000080
             local invalid = SUBFIX_FFI.cast("void*", -1)
-            local handle = SUBFIX_FFI.C.CreateFileW(subfix_wide(subfix_path_to_utf8(p)), GENERIC_WRITE,
-                FILE_SHARE_READ, nil, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nil)
+            local handle = subfix_wcall(SUBFIX_FFI.C.CreateFileW, p,
+                GENERIC_WRITE, FILE_SHARE_READ, nil, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nil)
             if handle == nil or handle == invalid then
                 error("CreateFileW 失败(errno=" .. tostring(SUBFIX_FFI.C.GetLastError()) .. ")")
             end
@@ -370,9 +470,63 @@ function subfix_write_file_bytes(path, data)
     return true
 end
 
+-- 统一读取字节串（二进制）。先试 ANSI io.open；Windows 下失败（多为路径含当前代码页
+-- 之外的字符，如非中文系统上的中文用户名/媒体目录）再用 CreateFileW 宽字符读取。
+-- 成功返回字符串，失败返回 nil。仅供本模块内部按 UTF-8 解读。
+function subfix_read_file_bytes(path)
+    local p = tostring(path or "")
+    if p == "" then return nil end
+    local file = io.open(p, "rb")
+    if file then
+        local content = file:read("*a")
+        file:close()
+        return content
+    end
+    if SUBFIX_IS_WINDOWS and SUBFIX_FFI and SUBFIX_FFI.C and SUBFIX_FFI.C.CreateFileW
+        and SUBFIX_FFI.C.ReadFile and SUBFIX_FFI.C.GetFileSize then
+        local ok, content = pcall(function()
+            local GENERIC_READ = 0x80000000
+            local FILE_SHARE_RW = 0x00000003
+            local OPEN_EXISTING = 3
+            local FILE_ATTRIBUTE_NORMAL = 0x00000080
+            local INVALID_HANDLE = SUBFIX_FFI.cast("void*", -1)
+            local handle = subfix_wcall(SUBFIX_FFI.C.CreateFileW, p,
+                GENERIC_READ, FILE_SHARE_RW, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nil)
+            if handle == nil or handle == INVALID_HANDLE then
+                error("CreateFileW 失败(errno=" .. tostring(SUBFIX_FFI.C.GetLastError()) .. ")")
+            end
+            local size = tonumber(SUBFIX_FFI.C.GetFileSize(handle, nil)) or 0
+            local total, n = 0, size
+            local buffer = SUBFIX_FFI.new("char[?]", math.max(n, 1))
+            local read_dword = SUBFIX_FFI.new("unsigned long[1]")
+            while total < n do
+                if SUBFIX_FFI.C.ReadFile(handle, buffer + total, n - total, read_dword, nil) == 0 then
+                    break
+                end
+                local got = tonumber(read_dword[0]) or 0
+                if got <= 0 then break end
+                total = total + got
+            end
+            SUBFIX_FFI.C.CloseHandle(handle)
+            return SUBFIX_FFI.string(buffer, total)
+        end)
+        if ok and type(content) == "string" then return content end
+    end
+    return nil
+end
+
+-- 宽字符删除单个文件（ANSI os.remove 失败时兜底）；失败静默。
+function subfix_delete_file_wide(path)
+    local p = tostring(path or "")
+    if p == "" then return end
+    if SUBFIX_IS_WINDOWS and SUBFIX_FFI and SUBFIX_FFI.C and SUBFIX_FFI.C.DeleteFileW then
+        pcall(function() subfix_wcall(SUBFIX_FFI.C.DeleteFileW, p) end)
+    end
+end
+
 -- 无窗口命令捕获：Windows 经隐藏启动（ShellExecuteW SW_HIDE + PowerShell -WindowStyle Hidden -Wait）
 -- 把命令输出落盘后读回，彻底避免 cmd 控制台闪烁；mac/无 ffi 回退 io.popen。
-function subfix_run_capture(cmd)
+function subfix_run_capture(cmd, timeout_ms)
     if (not SUBFIX_IS_WINDOWS) or (not SUBFIX_FFI) or (not SUBFIX_SHELL_EXECUTE_W) then
         local handle = io.popen(tostring(cmd) .. " 2>&1")
         if not handle then return false, "" end
@@ -381,37 +535,69 @@ function subfix_run_capture(cmd)
         if okc == true or code == 0 then return true, output end
         return false, output
     end
+    local timeout = tonumber(timeout_ms) or 30000
     local temp_base = subfix_temp_dir()
     local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
     local out_file = temp_base .. "subfix_cap_out_" .. uid
     local done_file = temp_base .. "subfix_cap_done_" .. uid
+    local pid_file = temp_base .. "subfix_cap_pid_" .. uid
+    local host_pid_file = temp_base .. "subfix_cap_hpid_" .. uid
     local runner = out_file .. ".cmd"
     local ps1 = out_file .. ".ps1"
-    local rh = io.open(runner, "wb")
-    if not rh then return false, "" end
-    rh:write("@echo off\r\n")
-    rh:write("chcp 65001 >nul\r\n")
-    rh:write(tostring(cmd):gsub("%%", "%%%%") .. " > " .. subfix_dq(out_file) .. " 2>&1\r\n")
-    rh:write("echo done > " .. subfix_dq(done_file) .. "\r\n")
-    rh:close()
-    local ph = io.open(ps1, "wb")
-    if not ph then
-        subfix_remove_temp(out_file, done_file)
+    -- 宽字符写出，TEMP 含中文用户名也能落盘；.cmd 不带 BOM（cmd 首行遇 BOM 会报错）。
+    local runner_content = "@echo off\r\n"
+        .. "chcp 65001 >nul\r\n"
+        .. (tostring(cmd):gsub("%%", "%%%%")) .. " > " .. subfix_dq(out_file) .. " 2>&1\r\n"
+        .. "echo done > " .. subfix_dq(done_file) .. "\r\n"
+    if not subfix_write_file_bytes(runner, runner_content) then return false, "" end
+    -- Windows PowerShell 5.1 对无 BOM 的 .ps1 按 ANSI 解读，会把其中的中文路径读坏；
+    -- 显式写 UTF-8 BOM，让 PowerShell 按 UTF-8 解码。
+    -- 启动后先把宿主 powershell 与 runner cmd 的 PID 落盘再等待：Lua 侧超时后
+    -- 可凭 PID 用 taskkill /T 回收整棵进程树，避免卡死进程残留、输出文件被锁。
+    local ps1_content = "\239\187\191"
+        .. "$ErrorActionPreference = 'SilentlyContinue'\r\n"
+        .. "[IO.File]::WriteAllText('" .. host_pid_file .. "', $PID)\r\n"
+        .. "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c','" .. runner
+        .. "') -PassThru -WindowStyle Hidden\r\n"
+        .. "[IO.File]::WriteAllText('" .. pid_file .. "', $p.Id)\r\n"
+        .. "$p.WaitForExit()\r\n"
+    if not subfix_write_file_bytes(ps1, ps1_content) then
+        subfix_remove_temp(out_file, done_file, pid_file, host_pid_file)
         return false, ""
     end
-    ph:write("$p = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c','" .. runner .. "') -PassThru -WindowStyle Hidden -Wait\r\n")
-    ph:close()
     local powershell = tostring(os.getenv("SystemRoot") or "C:\\Windows") .. "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-    subfix_hidden_shell(powershell, "-NoProfile -ExecutionPolicy Bypass -File " .. subfix_dq(ps1))
+    local ps_arguments = "-NoProfile -ExecutionPolicy Bypass -File " .. subfix_dq(ps1)
+    -- 返回值不可信：只发一次宽字符启动，凭 PID 文件确认；3 秒无 PID 才回退 ANSI start，
+    -- 避免同一 runner 被并发启动两遍（第二个抢不到输出重定向会秒写 done，读到空结果）。
+    subfix_hidden_shell(powershell, ps_arguments, true)
+    if not subfix_wait_launch_pid(pid_file, 3) then
+        os.execute('start "" /b ' .. subfix_dq(powershell) .. " " .. ps_arguments)
+    end
     local waited = 0
-    while waited < 30000 do
-        local df = io.open(done_file, "r")
-        if df then df:close(); break end
+    while waited < timeout do
+        if file_exists(done_file) then break end
         subfix_sleep(0.05)
         waited = waited + 50
     end
+    -- 超时（done 标记缺失）：如实返回失败，并杀掉卡死的 runner 进程树与宿主 powershell。
+    local timed_out = not file_exists(done_file)
+    if timed_out then
+        local taskkill = tostring(os.getenv("SystemRoot") or "C:\\Windows") .. "\\System32\\taskkill.exe"
+        local runner_pid = trim_text(read_text_file(pid_file) or "")
+        local host_pid = trim_text(read_text_file(host_pid_file) or "")
+        if runner_pid ~= "" then
+            pcall(function() subfix_hidden_shell(taskkill, "/F /T /PID " .. runner_pid) end)
+        end
+        if host_pid ~= "" then
+            pcall(function() subfix_hidden_shell(taskkill, "/F /PID " .. host_pid) end)
+        end
+        pcall(LogMsg, "外部命令等待超时（" .. tostring(timeout) .. "ms），已终止: " .. tostring(cmd))
+    end
     local output = read_text_file(out_file) or ""
-    subfix_remove_temp(out_file, done_file)
+    subfix_remove_temp(out_file, done_file, pid_file, host_pid_file)
+    if timed_out then
+        return false, output
+    end
     return true, output
 end
 
@@ -427,7 +613,12 @@ function subfix_remove_temp(...)
             -- 只用 os.remove（不走 os.execute/cmd）：从无控制台的达芬奇里调用 os.execute
             -- 每次都会弹出一个控制台窗口，AI 批处理反复清理临时文件会造成“一直闪烁”。
             for _, suffix in ipairs({"", ".cmd", ".ps1"}) do
-                pcall(function() os.remove(f .. suffix) end)
+                local target = f .. suffix
+                local removed = os.remove(target)
+                -- ANSI os.remove 删不掉含非当前代码页字符的路径时，用 DeleteFileW 兜底。
+                if not removed and file_exists(target) then
+                    subfix_delete_file_wide(target)
+                end
             end
         end
     end
@@ -498,27 +689,37 @@ function subfix_launch_background(inner_cmd, stdout_file, pid_file, done_file, e
         -- .ps1（记录子进程 PID），用 start "" /b + -File 启动，无嵌套引号。
         local runner_path = tostring(stdout_file) .. ".cmd"
         local ps1_path = tostring(stdout_file) .. ".ps1"
-        local handle = io.open(runner_path, "wb")
-        if not handle then return end
-        handle:write("@echo off\r\n")
-        handle:write("chcp 65001 >nul\r\n")
-        -- 批处理文件里 % 必须转义成 %%，否则 curl -w "%{http_code}" 里的 % 会被 cmd 吞掉。
-        handle:write(tostring(inner_cmd):gsub("%%", "%%%%") .. " > " .. subfix_dq(stdout_file) .. " 2>&1\r\n")
+        -- 宽字符写出（TEMP 含中文用户名也能落盘）；.cmd 不带 BOM（cmd 首行遇 BOM 会报错）。
+        local runner_parts = {
+            "@echo off\r\n",
+            "chcp 65001 >nul\r\n",
+            -- 批处理文件里 % 必须转义成 %%，否则 curl -w "%{http_code}" 里的 % 会被 cmd 吞掉。
+            (tostring(inner_cmd):gsub("%%", "%%%%")) .. " > " .. subfix_dq(stdout_file) .. " 2>&1\r\n",
+        }
         if exit_file and exit_file ~= "" then
-            handle:write("echo %ERRORLEVEL% > " .. subfix_dq(exit_file) .. "\r\n")
+            runner_parts[#runner_parts + 1] = "echo %ERRORLEVEL% > " .. subfix_dq(exit_file) .. "\r\n"
         end
-        handle:write("echo done > " .. subfix_dq(done_file) .. "\r\n")
-        handle:close()
-        local ps = io.open(ps1_path, "wb")
-        if not ps then return end
-        ps:write("$p = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c','" .. runner_path
-            .. "') -PassThru -WindowStyle Hidden\r\n")
-        ps:write("$p.Id | Out-File -FilePath '" .. pid_file .. "' -Encoding ascii\r\n")
-        ps:close()
+        runner_parts[#runner_parts + 1] = "echo done > " .. subfix_dq(done_file) .. "\r\n"
+        if not subfix_write_file_bytes(runner_path, table.concat(runner_parts)) then return end
+        -- .ps1 显式写 UTF-8 BOM：Windows PowerShell 5.1 对无 BOM 脚本按 ANSI 解码，
+        -- 会把其中的中文 runner/pid 路径读坏。
+        local ps1_content = "\239\187\191"
+            .. "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c','" .. runner_path
+            .. "') -PassThru -WindowStyle Hidden\r\n"
+            .. "$p.Id | Out-File -FilePath '" .. pid_file .. "' -Encoding ascii\r\n"
+        if not subfix_write_file_bytes(ps1_path, ps1_content) then return end
         local powershell = tostring(os.getenv("SystemRoot") or "C:\\Windows")
             .. "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
         -- 无窗口启动（ShellExecuteW SW_HIDE），避免每次批量请求弹出控制台闪烁。
-        subfix_hidden_shell(powershell, "-NoProfile -ExecutionPolicy Bypass -File " .. subfix_dq(ps1_path))
+        -- ShellExecuteW 走 UTF-16，ps1 路径含中文也能正确传给 powershell。
+        -- 返回值不可信：只发一次宽字符启动，凭 PID 文件确认；3 秒无 PID 才回退 ANSI start，
+        -- 避免同一 runner 被并发启动两遍（第二个抢不到 stdout 重定向会秒写 done，
+        -- 上层把空输出当成成功响应）。
+        local bg_ps_arguments = "-NoProfile -ExecutionPolicy Bypass -File " .. subfix_dq(ps1_path)
+        subfix_hidden_shell(powershell, bg_ps_arguments, true)
+        if not subfix_wait_launch_pid(pid_file, 3) then
+            os.execute('start "" /b ' .. subfix_dq(powershell) .. " " .. bg_ps_arguments)
+        end
         return
     else
         local bg_cmd = string.format(
@@ -556,10 +757,37 @@ function subfix_kill_pid(pid_file)
     end)
 end
 
--- 跨平台短暂休眠：macOS 用 sleep，Windows 用 Lua 自旋（cmd 的 timeout 不支持亚秒）。
+-- Windows 下优先用 kernel32 Sleep 真正让出线程；旧实现是 os.clock() 忙等，
+-- 在 0.05~0.15s 的完成轮询循环里会把一个 CPU 核打满。
+-- cdef 与 .subfix_support/core 保持同一签名（同 VM 重复 cdef 会报错，pcall 吞掉即可，
+-- 已声明过的符号仍可从新加载的 kernel32 句柄上调用）。只调用标量参数系统函数，不涉及
+-- 任何 cdata 数组/指针，规避既往 ffi.copy 越界类风险。
+subfix_kernel32 = nil
+if SUBFIX_IS_WINDOWS then
+    local ok_ffi, ffi_mod = pcall(require, "ffi")
+    if ok_ffi then
+        pcall(function()
+            ffi_mod.cdef[[void Sleep(unsigned long dwMilliseconds);]]
+        end)
+        local ok_load, kernel32 = pcall(function() return ffi_mod.load("kernel32") end)
+        if ok_load and kernel32 then
+            subfix_kernel32 = kernel32
+        end
+    end
+end
+
+-- 跨平台短暂休眠：Windows 优先 kernel32 Sleep（不可用时回退 Lua 自旋兜底）；
+-- macOS 用 /usr/bin/sleep（cmd 的 timeout 不支持亚秒）。
 function subfix_sleep(seconds)
     local sec = tonumber(seconds) or 0
+    if sec <= 0 then return end
     if SUBFIX_IS_WINDOWS then
+        if subfix_kernel32 then
+            local ms = math.floor(sec * 1000 + 0.5)
+            if ms < 1 then ms = 1 end
+            pcall(function() subfix_kernel32.Sleep(ms) end)
+            return
+        end
         local target = (os.clock() or 0) + sec
         while (os.clock() or 0) < target do end
     else
@@ -578,9 +806,10 @@ SUBFIX_WINDOW_GEOMETRY = SUBFIX_WINDOW_GEOMETRY or {}
 
 -- 窗口尺寸集中管理：预览字幕树需要足够横向空间，否则长字幕会被视口裁断（列宽由
 -- apply_preview_tree_layout 按此宽度推算，改宽度时无需另外改列宽）。
+-- 1240×760：三步工作台（识别页纵向展开 + 底栏三行固定区块）在 1080p/150% 缩放下
+-- 默认打开即完整；更小的屏幕由 centered_geometry 自动钳制，内容最小高已收敛到可放下。
 SUBFIX_WINDOW_SIZE = SUBFIX_WINDOW_SIZE or {
-    mini = {width = 680, height = 500},
-    full = {width = 860, height = 700},
+    full = {width = 1240, height = 760},
 }
 
 -- Fusion UIManager 逐项颜色（TextColor[]/BackgroundColor[]）取 0–1 浮点；
@@ -589,58 +818,245 @@ ui_color = ui_color or function(r, g, b, a)
     return {R = r / 255, G = g / 255, B = b / 255, A = (a or 255) / 255}
 end
 
--- 切换按钮样式：未选中=深灰底+灰边框+灰白字；选中=深底+橙色描边+橙字（描边高亮）。
-SUBFIX_BTN_BASE = SUBFIX_BTN_BASE or "QPushButton{font-size:13px;background-color:#243240;color:#D6DDE7;border:1px solid #34506b;border-radius:4px;padding:4px 10px;}"
-SUBFIX_BTN_SELECTED = SUBFIX_BTN_SELECTED or "QPushButton{font-size:13px;background-color:#1A212B;color:#FF6A00;font-weight:bold;border:1px solid #FF6A00;border-radius:4px;padding:4px 10px;} QPushButton:hover{background-color:#243240;border:1px solid #FF8C33;}"
--- 切换按钮统一样式（基于 Qt :checked 伪状态驱动选中态，避免运行时改写 StyleSheet 不生效）。
-SUBFIX_BTN_TOGGLE = SUBFIX_BTN_TOGGLE or [[
-QPushButton{font-size:13px;background-color:#243240;color:#D6DDE7;border:1px solid #34506b;border-radius:4px;padding:4px 10px;}
-QPushButton:hover{background-color:#2c3e52;border:1px solid #FF8C33;}
-QPushButton:checked{background-color:#1A212B;color:#FF6A00;font-weight:bold;border:1px solid #FF6A00;}
-QPushButton:checked:hover{background-color:#243240;border:1px solid #FF8C33;}
-]]
+-- ============================================================
+-- 统一设计令牌 SUBFIX_DESIGN：色板/字号/间距/圆角的唯一来源。
+-- 宿主窗口与 .subfix_support 生成面板（embedded，同 VM）共用本表；
+-- 该模块 standalone 调试窗在本表缺失时使用各自兜底常量。
+-- 对比度依据 WCAG 2.1（sRGB 相对亮度手算）：橙底 #FF6A00 上一律使用
+-- 深色字 #1A212B（≈5.6:1，过 AA 4.5:1）；白字在橙上仅 ≈2.8:1，已弃用。
+-- ============================================================
+-- Quiet Pro 色板（v2）：中性炭灰阶，去除旧版蓝灰/纯灰混色；层级靠明度差而非描边。
+-- 橙色 #FF6A00 品牌色保留，但只允许出现在：每视图唯一主按钮 / 当前 Tab 指示 /
+-- 跟随状态点。所有选中态一律走中性 selected 面。
+SUBFIX_DESIGN = SUBFIX_DESIGN or {
+    color = {
+        page = "#16181C",        -- 页面底（中性炭黑）
+        container = "#1F2229",   -- 容器/默认按钮面
+        selected = "#2E333D",    -- 中性选中面（树/音轨/分段控件 checked）
+        input = "#12141A",       -- 输入框/树底
+        secondary = "#1F2229",   -- 次级按钮底（与容器同阶，弱化描边区分）
+        text = "#E6E9EF",        -- 主文字
+        text_tree = "#D3D7E0",   -- 树文字（on input ≈12:1）
+        text_muted = "#9099A8",  -- 元信息/次要标签
+        text_disabled = "#6B7280",
+        border = "#333842",      -- 常规弱描边
+        border_soft = "#2A2E37", -- 几乎隐形的描边（次级按钮）
+        border_hover = "#3D4350",
+        border_focus = "#4A5560",
+        hover = "#2A2E37",       -- 中性 hover 面
+        hover_soft = "#2A2E37",
+        pressed_soft = "#1A1D23",
+        accent = "#FF6A00",
+        accent_hover = "#FF7D1F",
+        accent_pressed = "#E86200",
+        accent_soft_bg = "#3A2514", -- 描边橙按钮的 hover 暗橙面
+        on_accent = "#14161A",   -- 橙底上的深色文字/图标
+        -- 状态语义色（均在 page 底上过 AA）：成功绿粉/警示琥珀/危险红粉/信息蓝
+        success = "#A0E6B4",
+        warning = "#F2B544",
+        danger = "#F0988C",
+        info = "#8FB6D9",
+    },
+    -- 字号梯级：元信息 12 / 控件 13 / 正文 14 / 区块标题 16
+    -- family 由 QSS font-family 注入；缺失时回退 Fusion/系统默认（YaHei 仍是实际字形）。
+    font = {meta = 12, control = 13, body = 14, title = 16, family = "Microsoft YaHei UI"},
+    -- 4pt 间距网格
+    space = {xs = 4, sm = 8, md = 12, lg = 16},
+    radius = 6,
+}
 
--- 主操作按钮样式（橙底白字，对齐“生成字幕选区”窗口的确认按钮）：14px、5px 圆角、橙悬停。
-SUBFIX_BTN_ACCENT = SUBFIX_BTN_ACCENT or "QPushButton{font-size:14px;background-color:#FF6A00;color:#FFFFFF;font-weight:bold;border:1px solid #FF6A00;border-radius:5px;padding:6px 12px;} QPushButton:hover{background-color:#CC5600;}"
+do
+    local d = SUBFIX_DESIGN
+    local c = d.color
+    -- 字体族片段：注入所有带文字的 QSS 规则（仅在 QWidget 上声明在 Fusion 下
+    -- 不会稳定级联到子控件）。family 缺失时为空串，不影响其余属性。
+    local ff = ""
+    if d.font and d.font.family and d.font.family ~= "" then
+        ff = "font-family:'" .. d.font.family .. "';"
+    end
+    -- 选中态 hover 用的轻微提亮面（selected #2E333D 之上一阶）。
+    local selected_hover = "#343944"
+    local selected_border = "#3D4350"
 
--- 次级按钮样式（非主操作：刷新字幕/检查更新/还原/撤回/清空/精修4按钮/配置/选目录/轨道微调▲▼）：
--- 保留原本“原生深灰底 #282828 + 灰边”的观感，只把圆角统一为与 SUBFIX_BTN_ACCENT 相同的 5px。
--- （原生 Fusion 按钮不走 QSS，圆角≈2px，与橙色按钮的 5px 不一致，故显式声明。）
-SUBFIX_BTN_SECONDARY = SUBFIX_BTN_SECONDARY or [[
-QPushButton{font-size:13px;background-color:#282828;color:#D6DDE7;border:1px solid #454545;border-radius:5px;padding:4px 10px;}
-QPushButton:hover{background-color:#333333;border:1px solid #6E6E6E;}
-QPushButton:pressed{background-color:#1F1F1F;border:1px solid #454545;}
-QPushButton:disabled{color:#7A7A7A;border:1px solid #3A3A3A;}
-]]
+    -- 基础按钮（Quiet Pro 幽灵系，13px）：用于弹窗与分段容器；
+    -- 默认弱描边、hover 才浮现中性面，全程不泛橙。
+    SUBFIX_BTN_BASE = SUBFIX_BTN_BASE or ([[
+QPushButton{%sfont-size:%dpx;background-color:%s;color:%s;border:1px solid %s;border-radius:%dpx;padding:5px 12px;}
+QPushButton:hover{background-color:%s;border:1px solid %s;}
+QPushButton:disabled{color:%s;border:1px solid #3A3A3A;}
+]]):format(ff, d.font.control, c.container, c.text, c.border_soft, d.radius, c.hover, c.border_hover, c.text_disabled)
 
--- 轨道微调 ▲▼ 等超小按钮专用：圆角与上者一致（5px），但不带水平内边距，
--- 否则 QSS 的 padding 会把 20px 宽的小按钮撑大，挤坏“字幕轨 1 ▲▼”这行布局。
-SUBFIX_BTN_SECONDARY_TIGHT = SUBFIX_BTN_SECONDARY_TIGHT or [[
-QPushButton{font-size:10px;background-color:#282828;color:#D6DDE7;border:1px solid #454545;border-radius:5px;padding:0px;}
-QPushButton:hover{background-color:#333333;border:1px solid #6E6E6E;}
-QPushButton:pressed{background-color:#1F1F1F;border:1px solid #454545;}
-]]
+    -- 选中态（Quiet Pro）：中性提亮面 + 白字，不再使用橙描边/橙字。
+    -- “选项”与“动作”靠颜色强度区分：选中的选项是中性灰，主操作才是满橙。
+    SUBFIX_BTN_SELECTED = SUBFIX_BTN_SELECTED or ([[
+QPushButton{%sfont-size:%dpx;background-color:%s;color:#FFFFFF;font-weight:bold;border:1px solid %s;border-radius:%dpx;padding:5px 12px;}
+QPushButton:hover{background-color:%s;border:1px solid %s;}
+]]):format(ff, d.font.control, c.selected, selected_border, d.radius, selected_hover, c.border_hover)
 
--- 主窗口深色根样式表（与“生成字幕选区”视觉一致）。注意：不含通用 QPushButton 规则，
--- 以免把“检查更新/还原/撤回/清空/精修4按钮”等原生按钮染成深灰底（用户要求其余按钮保持原生）。
--- 深色背景只落在 QWidget/Label/输入控件/下拉/字幕树/Tab 标签上；Fusion 下 QWidget 背景不会覆盖 QPushButton 自带背景。
-SUBFIX_MAIN_ROOT_STYLESHEET = SUBFIX_MAIN_ROOT_STYLESHEET or [[
-QWidget { font-size: 14px; color: #D6DDE7; background-color: #1A212B; }
-QLabel { font-size: 14px; color: #D6DDE7; background-color: transparent; }
-QLineEdit, QTextEdit, QComboBox { background-color: #0F141A; color: #D6DDE7; border: 1px solid #34506b; border-radius: 5px; padding: 6px; font-size: 14px; }
-QTreeWidget { background-color: #0F141A; color: #D6DDE7; border: 1px solid #34506b; border-radius: 5px; font-size: 14px; selection-background-color: #FF6A00; selection-color: #FFFFFF; }
-QTreeWidget::item:selected { background-color: #FF6A00; color: #FFFFFF; }
-QTreeWidget::item:!selected:hover { background-color: #243240; }
+    -- 切换按钮：Qt :checked 伪状态驱动选中态（Fusion 运行时改写 StyleSheet 不生效）。
+    -- checked = 中性选中面；未选中与基础按钮同阶。
+    SUBFIX_BTN_TOGGLE = SUBFIX_BTN_TOGGLE or ([[
+QPushButton{%sfont-size:%dpx;background-color:%s;color:%s;border:1px solid %s;border-radius:%dpx;padding:4px 10px;}
+QPushButton:hover{background-color:%s;border:1px solid %s;}
+QPushButton:checked{background-color:%s;color:#FFFFFF;font-weight:bold;border:1px solid %s;}
+QPushButton:checked:hover{background-color:%s;border:1px solid %s;}
+]]):format(ff, d.font.control, c.container, c.text, c.border_soft, d.radius,
+        c.hover, c.border_hover,
+        c.selected, selected_border,
+        selected_hover, selected_border)
+
+    -- 主操作按钮：橙底 + 深色字（过 AA），hover 提亮、pressed 略深。
+    -- 每个视图最多只允许出现一个（开始生成 / 开始 AI 处理 / 保存修改）。
+    -- 字重只能用 400：Microsoft YaHei UI 只随 Regular(400)/Bold(700) 两个字面，
+    -- 500/600 在 Windows 上走【合成伪粗体】，小字中文必然发糊（实测）；700 在 16px
+    -- 以下中文笔画也会粘连。正解是 400 真实 hinted 字面 + 放大到 16px，靠字号撑气势。
+    SUBFIX_BTN_ACCENT = SUBFIX_BTN_ACCENT or ([[
+QPushButton{%sfont-size:16px;font-weight:normal;background-color:%s;color:%s;border:1px solid %s;border-radius:%dpx;padding:6px 18px;}
+QPushButton:hover{background-color:%s;color:%s;border:1px solid %s;}
+QPushButton:pressed{background-color:%s;color:%s;border:1px solid %s;}
+QPushButton:disabled{background-color:#3A3A3A;color:%s;border:1px solid #3A3A3A;}
+]]):format(ff, c.accent, c.on_accent, c.accent, d.radius,
+        c.accent_hover, c.on_accent, c.accent_hover,
+        c.accent_pressed, c.on_accent, c.accent_pressed,
+        c.text_disabled)
+
+    -- 描边橙按钮（次强动作）：透明底 + 橙边 + 橙字，如“执行批量替换”。
+    -- 强度介于满橙主按钮与幽灵按钮之间；pressed 收成满橙。
+    SUBFIX_BTN_ACCENT_OUTLINE = SUBFIX_BTN_ACCENT_OUTLINE or ([[
+QPushButton{%sfont-size:%dpx;background-color:transparent;color:%s;font-weight:bold;border:1px solid %s;border-radius:%dpx;padding:5px 12px;}
+QPushButton:hover{background-color:%s;border:1px solid %s;}
+QPushButton:pressed{background-color:%s;color:%s;border:1px solid %s;}
+QPushButton:disabled{background-color:transparent;color:%s;border:1px solid #3A3A3A;}
+]]):format(ff, d.font.control, c.accent, c.accent, d.radius,
+        c.accent_soft_bg, c.accent_hover,
+        c.accent_pressed, c.on_accent, c.accent_pressed,
+        c.text_disabled)
+
+    -- 次级幽灵按钮：刷新/检查更新/导出/退出/还原/撤回/清空/配置/更新时间线等。
+    -- 与容器同色底 + 几乎隐形的描边，hover 才浮现。
+    SUBFIX_BTN_SECONDARY = SUBFIX_BTN_SECONDARY or ([[
+QPushButton{%sfont-size:%dpx;background-color:%s;color:%s;border:1px solid %s;border-radius:%dpx;padding:5px 12px;}
+QPushButton:hover{background-color:%s;border:1px solid %s;}
+QPushButton:pressed{background-color:%s;border:1px solid %s;}
+QPushButton:disabled{color:%s;border:1px solid #3A3A3A;}
+]]):format(ff, d.font.control, c.secondary, c.text, c.border_soft, d.radius,
+        c.hover_soft, c.border_hover,
+        c.pressed_soft, c.border_soft,
+        c.text_disabled)
+
+    -- 轨道微调 ▲▼ 等超小按钮：无水平内边距，避免撑坏“字幕轨 1 ▲▼”行。
+    SUBFIX_BTN_SECONDARY_TIGHT = SUBFIX_BTN_SECONDARY_TIGHT or ([[
+QPushButton{%sfont-size:10px;background-color:%s;color:%s;border:1px solid %s;border-radius:%dpx;padding:0px;}
+QPushButton:hover{background-color:%s;border:1px solid %s;}
+QPushButton:pressed{background-color:%s;border:1px solid %s;}
+]]):format(ff, c.secondary, c.text, c.border_soft, d.radius,
+        c.hover_soft, c.border_hover, c.pressed_soft, c.border_soft)
+
+    -- 主窗口根样式表（Quiet Pro）。刻意不含通用 QPushButton 规则：未显式赋样式的
+    -- 按钮保留 Fusion 原生观感。选中态（树/下拉弹层）一律中性提亮面 + 白字；
+    -- 橙色只留在 QTabBar 当前页下划线（:selected）。
+    SUBFIX_MAIN_ROOT_STYLESHEET = SUBFIX_MAIN_ROOT_STYLESHEET or ([[
+QWidget { %sfont-size: %dpx; color: %s; background-color: %s; }
+QLabel { font-size: %dpx; color: %s; background-color: transparent; }
+QLineEdit, QTextEdit, QComboBox { %sbackground-color: %s; color: %s; border: 1px solid %s; border-radius: %dpx; padding: 6px; font-size: %dpx; }
+QTreeWidget { %sbackground-color: %s; color: %s; border: 1px solid %s; border-radius: %dpx; font-size: %dpx; selection-background-color: %s; selection-color: %s; }
+QTreeWidget::item:selected { background-color: %s; color: #FFFFFF; }
+QTreeWidget::item:!selected:hover { background-color: %s; }
 QTreeWidget::item { padding: 6px; }
-QHeaderView::section { background-color: #243240; color: #D6DDE7; border: 1px solid #34506b; padding: 4px; }
-QTabBar::tab { background-color: #243240; color: #D6DDE7; border: 1px solid #34506b; border-bottom: none; padding: 6px 14px; font-size: 14px; }
-QTabBar::tab:selected { background-color: #FF6A00; color: #FFFFFF; font-weight: bold; }
-QTabBar::tab:!selected:hover { background-color: #2c3e52; }
-QComboBox QAbstractItemView { background-color: #0F141A; color: #D6DDE7; selection-background-color: #FF6A00; }
-]]
+QHeaderView::section { %sbackground-color: %s; color: %s; border: 1px solid %s; padding: 4px; }
+QTabBar::tab { %sbackground-color: transparent; color: %s; border: none; border-bottom: 2px solid transparent; padding: 8px 18px; font-size: %dpx; }
+QTabBar::tab:selected { background-color: transparent; color: %s; font-weight: bold; border-bottom: 2px solid %s; }
+QTabBar::tab:!selected:hover { background-color: %s; color: %s; }
+QComboBox QAbstractItemView { background-color: %s; color: %s; selection-background-color: %s; selection-color: #FFFFFF; }
+]]):format(ff, d.font.body, c.text, c.page,
+        d.font.body, c.text,
+        ff, c.input, c.text, c.border, d.radius, d.font.body,
+        ff, c.input, c.text_tree, c.border, d.radius, d.font.body, c.selected, c.text,
+        c.selected,
+        c.hover,
+        ff, c.container, c.text_muted, c.border_soft,
+        ff, c.text_muted, d.font.body,
+        c.accent, c.accent,
+        c.hover, c.text,
+        c.input, c.text, c.selected)
+
+    -- 容器面板样式表：供 core embedded 右栏复用。与宿主根样式的差别仅在于
+    -- 包含一条通用 QPushButton 规则（次级幽灵按钮观感），使右栏未显式赋样式的按钮
+    -- （重新检测选区/管理…/文稿…/取消生成）与左栏次级按钮完全一致。
+    local panel_qss = ([[
+QWidget { %sfont-size: %dpx; color: %s; background-color: %s; }
+QLabel { font-size: %dpx; color: %s; background-color: transparent; }
+QPushButton { %sfont-size: %dpx; background-color: %s; color: %s; border: 1px solid %s; border-radius: %dpx; padding: 5px 12px; }
+QPushButton:hover { background-color: %s; border: 1px solid %s; }
+QPushButton:pressed { background-color: %s; border: 1px solid %s; }
+QPushButton:disabled { color: %s; border: 1px solid #3A3A3A; }
+QLineEdit, QTextEdit, QComboBox { %sbackground-color: %s; color: %s; border: 1px solid %s; border-radius: %dpx; padding: 6px; font-size: %dpx; }
+QTreeWidget { %sbackground-color: %s; color: %s; border: 1px solid %s; border-radius: %dpx; font-size: %dpx; selection-background-color: %s; selection-color: %s; }
+QTreeWidget::item:selected { background-color: %s; color: #FFFFFF; }
+QTreeWidget::item:!selected:hover { background-color: %s; }
+QTreeWidget::item { padding: 6px; }
+QComboBox QAbstractItemView { background-color: %s; color: %s; selection-background-color: %s; selection-color: #FFFFFF; }
+]]):format(ff, d.font.body, c.text, c.page,
+        d.font.body, c.text,
+        ff, d.font.control, c.secondary, c.text, c.border_soft, d.radius,
+        c.hover_soft, c.border_hover,
+        c.pressed_soft, c.border_soft,
+        c.text_disabled,
+        ff, c.input, c.text, c.border, d.radius, d.font.body,
+        ff, c.input, c.text_tree, c.border, d.radius, d.font.body, c.selected, c.text,
+        c.selected,
+        c.hover,
+        c.input, c.text, c.selected)
+
+    -- 暴露给同 VM 的 embedded 模块（standalone 时该模块使用自有兜底）。
+    d.styles = {
+        btn_base = SUBFIX_BTN_BASE,
+        btn_selected = SUBFIX_BTN_SELECTED,
+        btn_toggle = SUBFIX_BTN_TOGGLE,
+        btn_accent = SUBFIX_BTN_ACCENT,
+        btn_accent_outline = SUBFIX_BTN_ACCENT_OUTLINE,
+        btn_secondary = SUBFIX_BTN_SECONDARY,
+        btn_secondary_tight = SUBFIX_BTN_SECONDARY_TIGHT,
+        panel = panel_qss,
+    }
+end
+
+-- 设计令牌里的 #RRGGBB → Fusion 逐项颜色（0–1 浮点）。
+function subfix_hex_color(hex)
+    local h = tostring(hex or ""):gsub("#", "")
+    local r = tonumber(h:sub(1, 2), 16)
+    local g = tonumber(h:sub(3, 4), 16)
+    local b = tonumber(h:sub(5, 6), 16)
+    if r and g and b then
+        return ui_color(r, g, b)
+    end
+    return ui_color(214, 221, 231)
+end
 
 function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
-    if SUBFIX_IS_WINDOWS then return nil end
+    if SUBFIX_IS_WINDOWS then
+        -- Resolve/Fusion 使用 LuaJIT，可通过 user32 获取主屏幕尺寸；失败时返回 nil，
+        -- 由 Geometry 兜底（宽窗口仍能在 1366×768 这类常见屏幕上由 centered_geometry 钳制）。
+        local ok_ffi, ffi = pcall(require, "ffi")
+        if ok_ffi then
+            local ok_cdef = pcall(function()
+                ffi.cdef[[
+                    int GetSystemMetrics(int nIndex);
+                ]]
+            end)
+            if ok_cdef then
+                local ok_user32, user32 = pcall(function() return ffi.load("user32") end)
+                if ok_user32 and user32 then
+                    local width = tonumber(user32.GetSystemMetrics(0))
+                    local height = tonumber(user32.GetSystemMetrics(1))
+                    if width and height and width > 0 and height > 0 then
+                        return {x = 0, y = 0, width = width, height = height}
+                    end
+                end
+            end
+        end
+        return nil
+    end
     if not (io and io.popen) then return nil end
 
     -- JXA 的返回值写入 stdout；console.log 写入 stderr，会被下面的重定向丢弃。
@@ -706,6 +1122,10 @@ function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)
     local screen = SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     if not screen then return fallback_geometry end
 
+    -- 屏幕过小（笔记本 1366×768 等）时钳制窗口尺寸，避免超出屏幕后标题栏不可拖。
+    if width > screen.width - 20 then width = math.max(320, screen.width - 20) end
+    if height > screen.height - 40 then height = math.max(240, screen.height - 40) end
+
     local x = screen.x
     local y = screen.y
     if width <= screen.width then x = math.floor(screen.x + (screen.width - width) / 2) end
@@ -727,12 +1147,20 @@ current_track = 1
 current_subtitle_target_track = 1
 current_fps = 24.0
 current_tl_start_frame = 0
-timeline_offset = 0
 workflow_log_buffer = ""
 workflow_log_window = nil
+-- P4：日志环形缓冲（定长 500 行，head 指向最新行，O(1) 写入）+ 落盘 pending 批量队列。
+-- 旧实现每行前插字符串（O(n²)）且每条都 io.open/write/close，生成高峰期放大 CPU/磁盘。
+WORKFLOW_LOG_RING_CAP = 500
+workflow_log_ring = {}        -- 环形存储（1..CAP）
+workflow_log_ring_head = 0    -- 最新行所在位
+workflow_log_ring_count = 0   -- 已存行数（<= CAP）
+workflow_log_pending_lines = nil
+workflow_log_pending_bytes = 0
+workflow_log_view_dirty = false
+workflow_log_timers_ready = false
 AIConfigPopWin = nil
 NormalizeLengthConfigWin = nil
-mini_win = nil
 win = nil
 active_window = nil
 is_subtitle_loaded = false
@@ -745,7 +1173,6 @@ suppress_provider_change_events = false
 provider_sync_in_progress = false
 provider_combo_bootstrap_in_progress = false
 full_window_ai_controls_initialized = false
-full_window_tree_dirty = false  -- 标记完整版字幕树需要在切换时重新渲染
 current_ai_provider_id = "siliconflow"
 ai_config_popup_visible = false
 ui_timer_handlers = {}
@@ -753,6 +1180,30 @@ startup_refresh_timer = nil
 full_window_deferred_sync_timer = nil
 normalize_length_timer = nil
 pre_delivery_final_check_timer = nil
+-- 自动跟随（低频变化检测版）：750ms 读取一次 timeline:GetCurrentTimecode()。
+-- 已真机证实：Edit 页播放中该调用在进程内不阻塞、快速返回“冻结的陈旧时间码”；
+-- 暂停/拖动播放头后才返回新值。因此唯一触发条件是“时间码（帧）发生变化”：
+-- 播放中值不变 → 不做任何事；暂停或拖动后值变 → 匹配字幕区间并选中一次。
+playhead_follow_timer = nil
+playhead_follow_enabled = false
+playhead_follow_last_row_id = nil
+playhead_follow_last_seen_frame = nil   -- 上一次观测到的时间码帧；变化检测的依据
+playhead_follow_suppress_tree_events = false  -- 程序化选中期间屏蔽树点击事件（防递归）
+playhead_follow_select_timer = nil      -- 重建后延迟一帧补选中（修橙高亮不绘制）
+playhead_follow_pending_row_id = nil
+playhead_follow_suspend_until = 0
+playhead_follow_last_error_at = nil
+playhead_follow_tick_count = 0
+playhead_follow_diag_until = 0
+playhead_follow_diag_last_log = 0
+playhead_follow_last_select_warn_at = nil
+-- 旧外部 Python 轮询器已不再启动；仅保留以下两个变量供 stop_playhead_poller
+-- 在关闭跟随/强退时向旧版本可能残留的轮询进程写 .stop 清理信号。
+playhead_poller_stop_file = nil
+playhead_poller_started = false
+-- 编辑即存（内存）：编辑框 TextChanged 去抖 400ms 自动写回当前行，不写时间线。
+edit_text_autosave_timer = nil
+suppress_edit_text_autosave = false
 pending_normalize_length_window = nil
 pending_pre_delivery_final_check_window = nil
 pending_normalize_length_config_window = nil
@@ -770,13 +1221,21 @@ AI_CURL_PID_FILE = nil             -- 当前后台 curl 子进程 PID 写在这�
 handle_main_window_close = nil
 rebuild_tree_from_rows = nil
 render_rows_to_window = nil
-refresh_preview_windows = nil
 get_row_timecodes = nil
 LogMsg = nil
 update_timeline = nil
 PendingChanges = {}
 pending_change_by_key = {}
 pending_change_item_map = {}
+
+-- 退出前「未应用修改」检测：刷新字幕 / 成功写回时间线后记录基线
+-- （行内容签名 + AI 待审建议数量），退出时与当前内存状态比对。
+subfix_timeline_baseline_sig = nil
+subfix_timeline_baseline_pending_count = 0
+subfix_timeline_baseline_approved_count = 0
+-- 退出确认弹窗重入保护；选区生成忙态由 core 的 on_busy_changed 回调维护。
+subfix_exit_prompt_open = false
+subfix_generation_running = false
 pending_report_window = nil
 pending_report_tree = nil
 pending_report_detail_view = nil
@@ -819,8 +1278,8 @@ SEARCH_VIEW = {
 GATED_ACTION_IDS = {
     "BatchReplaceBtn",
     "BtnStep1", "BtnStep2", "BtnStep3", "BtnStep4",
-    "BtnStep5", "BtnStep6", "BtnStep7", "BtnStep8",
-    "AIFixBtn", "ExportSrtBtn", "UpdateBtn", "ExportBtn"
+    "BtnStep6", "BtnStep7", "BtnStep8",
+    "AIFixBtn", "UpdateBtn", "ExportBtn"
 }
 
 function find_ui_item(id)
@@ -837,28 +1296,13 @@ function find_ui_item(id)
 end
 
 function resolve_window(target_window)
-    return target_window or active_window or mini_win or win
+    return target_window or active_window or win
 end
 
-function is_mini_window(target_window)
-    return mini_win ~= nil and target_window == mini_win
-end
-
-function get_window_control_id(target_window, full_id, mini_id)
-    if is_mini_window(target_window) then
-        return mini_id or full_id
-    end
-    return full_id
-end
-
-function find_window_item(target_window, full_id, mini_id)
+function find_window_item(target_window, full_id)
     local window = resolve_window(target_window)
-    if not window or not window.Find then return nil end
-
-    local id = get_window_control_id(window, full_id, mini_id)
-    if not id then return nil end
-
-    local ok, item = pcall(function() return window:Find(id) end)
+    if not window or not window.Find or not full_id then return nil end
+    local ok, item = pcall(function() return window:Find(full_id) end)
     if ok and item then return item end
     return nil
 end
@@ -896,13 +1340,65 @@ function set_preview_tree_maps_for_window(target_window, data_map, row_id_node_m
     end
 end
 
-switch_stack_page = nil
-switch_stack_page_index_only = nil
+-- 状态文案 → 语义类别（保守关键词匹配；未命中=nil 即中性默认色）。
+-- 顺序：danger > warning > success，避免“已取消…已恢复”被误染成成功绿。
+function subfix_classify_status_kind(text)
+    local msg = tostring(text or "")
+    if msg:find("失败", 1, true) or msg:find("无法", 1, true)
+        or msg:find("错误", 1, true) or msg:find("异常", 1, true)
+        or msg:find("截断", 1, true) or msg:find("未覆盖", 1, true) then
+        return "danger"
+    end
+    if msg:find("❌", 1, true) or msg:find("请输入", 1, true)
+        or msg:find("请先", 1, true) or msg:find("未找到", 1, true)
+        or msg:find("没有", 1, true) or msg:find("未检出", 1, true)
+        or msg:find("已取消", 1, true) or msg:find("漏回", 1, true) then
+        return "warning"
+    end
+    if msg:find("✅", 1, true) or msg:find("成功", 1, true)
+        or msg:find("完成", 1, true) or msg:find("已复制", 1, true)
+        or msg:find("已替换", 1, true) or msg:find("已导入", 1, true)
+        or msg:find("已更新", 1, true) or msg:find("已恢复", 1, true)
+        or msg:find("已切换", 1, true) then
+        return "success"
+    end
+    return nil
+end
 
-function set_window_status_text(target_window, text)
-    local label = find_window_item(target_window, "StatusLabel", "MiniStatusLabel")
+-- 把语义类别落到 StatusLabel 的 TextColor 上（直接属性在 Fusion 运行时有效；
+-- StyleSheet 运行时改写不生效，故不能走 QSS class）。
+function subfix_apply_status_kind(label, kind)
+    if not label or not SUBFIX_DESIGN then return end
+    local map = {success = "success", warning = "warning", danger = "danger", info = "info"}
+    local hex = map[kind] and SUBFIX_DESIGN.color[map[kind]] or SUBFIX_DESIGN.color.text
+    local brush = subfix_hex_color(hex)
+    pcall(function() label.TextColor = brush end)
+end
+
+-- 供各处直接持有 label 的调用点使用：设置文案并自动语义着色。
+function subfix_status_set(label, text, kind)
+    if not label or text == nil then return end
+    local msg = tostring(text)
+    pcall(function() label.Text = msg end)
+    subfix_apply_status_kind(label, kind or subfix_classify_status_kind(msg))
+end
+
+function set_window_status_text(target_window, text, kind)
+    local label = find_window_item(target_window, "StatusLabel")
     if label and text ~= nil then
-        pcall(function() label.Text = text end)
+        -- P12：同文案同语义就不碰 Qt，避免高频轮询里的无效重绘；按窗口记忆，弱键不挡 GC。
+        local signature = tostring(text) .. "|" .. tostring(kind or "")
+        local cache = rawget(_G, "SUBFIX_STATUS_LAST")
+        if not cache then
+            cache = setmetatable({}, {__mode = "k"})
+            rawset(_G, "SUBFIX_STATUS_LAST", cache)
+        end
+        local cache_key = target_window or active_window or win or "_default_status"
+        if cache[cache_key] == signature then
+            return
+        end
+        cache[cache_key] = signature
+        subfix_status_set(label, text, kind)
     end
 end
 
@@ -920,13 +1416,6 @@ function set_gated_actions_enabled(enabled)
             pcall(function() item.Enabled = enabled end)
         end
     end
-    -- 迷你窗口没有完整版同名控件，单独同步其「更新时间线」可用态
-    if mini_win then
-        local mini_update_btn = find_window_item(mini_win, "MiniUpdateBtn")
-        if mini_update_btn then
-            pcall(function() mini_update_btn.Enabled = enabled end)
-        end
-    end
 end
 
 function set_normalize_action_running(running)
@@ -937,84 +1426,135 @@ function set_normalize_action_running(running)
     end
 end
 
-function set_load_status_label(is_loaded, text, target_window)
-    -- 完整版的 LoadStatusLabel 已删除（底部「已加载 N 条」更准确）。
-    -- 极简版仍保留 MiniLoadStatusLabel 提醒用户当前状态。
-    if not is_mini_window(target_window) then
-        return
-    end
-
-    local label = find_window_item(target_window, "MiniLoadStatusLabel")
-    if not label then return end
-
-    local html_text = text
-    if html_text and html_text ~= "" then
-        if html_text:find("正在刷新", 1, true) then
-            html_text = "<font color='#FA8C16'>⏳ 刷新中</font>"
-        elseif html_text:find("请先刷新字幕", 1, true) then
-            html_text = "<font color='#FF4D4F'>⚠️ 未刷新</font>"
-        elseif html_text:find("字幕已加载", 1, true) then
-            html_text = "<font color='#00AA55'>✅ 已加载</font>"
-        elseif html_text:find("全片｜", 1, true) or html_text:find("选区｜", 1, true) then
-            html_text = "<font color='#00AA55'>✅ 已加载</font>"
-        end
-    end
-    if not html_text or html_text == "" then
-        if is_loaded then
-            html_text = "<font color='#00AA55'>✅ 已加载</font>"
-        else
-            html_text = "<font color='#FF4D4F'>⚠️ 未刷新</font>"
-        end
-    end
-
-    pcall(function() label.Text = html_text end)
-end
-
 function set_subtitle_loaded_state(is_loaded, status_text, target_window)
     is_subtitle_loaded = is_loaded
     set_gated_actions_enabled(is_loaded)
-    if is_loaded then
-        set_load_status_label(true, status_text or "<font color='#00AA55'>✅ 字幕已加载</font>", target_window)
-    else
-        set_load_status_label(false, status_text or "<font color='#FF4D4F'>⚠️ 请先刷新字幕</font>", target_window)
-    end
     if type(sync_work_scope_ui) == "function" then
         sync_work_scope_ui(target_window)
     end
-end
-
-function set_mini_subtitle_area_state(target_window, show_tree, message, show_generate_button)
-    local window = resolve_window(target_window)
-    if not window or not is_mini_window(window) then
+    -- 三步工作台：同步空状态、锁定页与自动流转（win 未就绪时静默跳过）。
+    if not win then
         return
     end
-
-    local placeholder = find_window_item(window, "MiniSubtitlePlaceholder")
-    local tree_wrap = find_window_item(window, "MiniSubtitleTreeWrap")
-    local generate_button = find_window_item(window, "MiniGenerateSelectionSubtitlesBtn")
-    local placeholder_label = find_window_item(window, "MiniSubtitlePlaceholderLabel")
-    if placeholder_label and message and message ~= "" then
-        pcall(function() placeholder_label.Text = tostring(message) end)
-    end
-    if type(set_item_hidden) == "function" then
-        set_item_hidden(placeholder, show_tree == true)
-        set_item_hidden(tree_wrap, show_tree ~= true)
-        if generate_button then
-            set_item_hidden(generate_button, show_generate_button ~= true)
+    local w = target_window or win
+    subfix_sync_tree_empty_state(w)
+    if is_loaded then
+        if subfix_pending_goto_refine then
+            subfix_pending_goto_refine = false
+            subfix_goto_tab(1)
+            update_shared_status(w, "选区字幕已生成，开始精修吧")
+        elseif subfix_startup_goto_refine then
+            subfix_startup_goto_refine = false
+            subfix_goto_tab(1)
+        else
+            subfix_refresh_active_tab(w)
         end
     else
-        if placeholder then
-            pcall(function() placeholder.Hidden = show_tree == true end)
-        end
-        if tree_wrap then
-            pcall(function() tree_wrap.Hidden = show_tree ~= true end)
-        end
-        if generate_button then
-            pcall(function() generate_button.Hidden = show_generate_button ~= true end)
+        -- 刷新失败/无字幕：消费待跳转标记，避免下次解锁时意外跳页。
+        subfix_pending_goto_refine = false
+        subfix_startup_goto_refine = false
+        subfix_refresh_active_tab(w)
+    end
+end
+
+-- ========== 三步工作台（① 选区识别 → ② 精修工具 / ③ AI 工作台） ==========
+-- Tab 索引：0 识别 / 1 精修 / 2 AI；Stack 页：0 识别 / 1 精修 / 2 AI / 3 锁定引导。
+subfix_pending_goto_refine = false   -- 生成成功后的一次性自动跳页
+subfix_startup_goto_refine = false  -- 启动自动刷新发现已有字幕时一次性跳页
+
+-- 强制重算布局：先尝试 Fusion 提供的 RecalcLayout（不同版本不一定存在），
+-- 兜底用「Geometry +1px → 下一帧复位」的 nudge（等价 resize，用户实测拖动可修复，
+-- 这里把修复自动化）。修复默认窗口首次 Show 后 WordWrap/Weight 未重算导致的裁切。
+function subfix_recalc_layout(target_window)
+    local w = target_window or win
+    if not w then return end
+    pcall(function() if type(w.RecalcLayout) == "function" then w:RecalcLayout() end end)
+    pcall(function()
+        local root = w:Find("MainRoot")
+        if root and type(root.RecalcLayout) == "function" then root:RecalcLayout() end
+    end)
+end
+
+function subfix_geometry_nudge_relayout(target_window)
+    local w = target_window or win
+    if not w then return end
+    local geom = nil
+    pcall(function() geom = w.Geometry end)
+    if type(geom) ~= "table" or not geom[3] then return end
+    pcall(function() w.Geometry = {geom[1], geom[2], geom[3] + 1, geom[4]} end)
+    subfix_relayout_restore_timer = subfix_relayout_restore_timer or ui:Timer({
+        ID = "SubfixRelayoutRestoreTimer",
+        Interval = 30,
+        SingleShot = true
+    })
+    register_ui_timer(subfix_relayout_restore_timer, function()
+        if not win then return end
+        pcall(function()
+            local g = win.Geometry
+            if type(g) == "table" and g[3] then
+                win.Geometry = {g[1], g[2], geom[3], g[4]}
+            end
+        end)
+        subfix_recalc_layout(win)
+    end)
+    restart_ui_timer(subfix_relayout_restore_timer)
+end
+
+-- 只按 tab 索引重排界面（不回写 TabBar，供 CurrentChanged 事件调用，避免递归）。
+function subfix_apply_tab_layout(tab_index, target_window)
+    local w = target_window or win
+    if not w then return end
+    local slot = w:Find("RecognitionSlot")
+    local stack = w:Find("TabStack")
+    local tree_wrap = w:Find("SubtitleTreeWrap")
+    local edit_area = w:Find("SubtitleEditArea")
+    tab_index = tonumber(tab_index) or 0
+    local on_recognition = tab_index == 0
+    -- Stack 页序：0 精修 / 1 AI / 2 未解锁引导。
+    local page_index = 0
+    if tab_index == 2 then
+        page_index = is_subtitle_loaded and 1 or 2
+    elseif tab_index == 1 then
+        page_index = is_subtitle_loaded and 0 or 2
+    end
+    if slot then pcall(function() slot.Hidden = not on_recognition end) end
+    if stack then
+        pcall(function() stack.Hidden = on_recognition end)
+        if not on_recognition then
+            pcall(function() stack.CurrentIndex = page_index end)
         end
     end
-    pcall(function() window:RecalcLayout() end)
-    pcall(function() window:Update() end)
+    if tree_wrap then pcall(function() tree_wrap.Hidden = on_recognition end) end
+    if edit_area then pcall(function() edit_area.Hidden = on_recognition end) end
+    subfix_recalc_layout(w)
+end
+
+function subfix_refresh_active_tab(target_window)
+    local w = target_window or win
+    local tabs = w and w:Find("MainTabs")
+    local idx = tabs and tonumber(tabs.CurrentIndex) or 0
+    subfix_apply_tab_layout(idx, w)
+end
+
+function subfix_goto_tab(tab_index, target_window)
+    local w = target_window or win
+    local tabs = w and w:Find("MainTabs")
+    if tabs then
+        pcall(function() tabs.CurrentIndex = tonumber(tab_index) or 0 end)
+    end
+    subfix_apply_tab_layout(tab_index, w)
+end
+
+-- 无字幕时树区显示空状态引导；有数据恢复树。
+function subfix_sync_tree_empty_state(target_window)
+    local w = target_window or win
+    if not w then return end
+    local tree = w:Find("SubtitleTree")
+    local empty = w:Find("SubtitleEmptyState")
+    if not tree or not empty then return end
+    local is_empty = (type(current_rows) ~= "table") or (#current_rows == 0)
+    pcall(function() tree.Hidden = is_empty end)
+    pcall(function() empty.Hidden = not is_empty end)
 end
 
 function rows_have_usable_subtitle_text(rows)
@@ -1028,10 +1568,6 @@ function rows_have_usable_subtitle_text(rows)
     return false
 end
 
-function update_target_track_hint()
-    return
-end
-
 function sync_target_track_control()
     local value = tostring(current_subtitle_target_track or 1)
     local itms = win and win:GetItems()
@@ -1041,13 +1577,6 @@ function sync_target_track_control()
             input.Text = value
         end)
     end
-    -- 迷你窗口的「更新到轨」与完整版共用同一状态值
-    if mini_win then
-        local mini_input = find_window_item(mini_win, "MiniTargetTrackSpin")
-        if mini_input then
-            pcall(function() mini_input.Text = value end)
-        end
-    end
 end
 
 function set_target_track_value(new_value, should_log)
@@ -1055,7 +1584,6 @@ function set_target_track_value(new_value, should_log)
     parsed = math.max(1, math.min(10, math.floor(parsed)))
     current_subtitle_target_track = parsed
     sync_target_track_control()
-    update_target_track_hint()
 
     if should_log then
         local msg = "更新时间线目标轨已设置为 " .. tostring(current_subtitle_target_track)
@@ -1063,7 +1591,7 @@ function set_target_track_value(new_value, should_log)
         LogMsg(msg)
 
         local status = win and win:Find("StatusLabel")
-        if status then status:Set("Text", msg) end
+        if status then subfix_status_set(status, msg) end
     end
 end
 
@@ -1608,13 +2136,17 @@ function read_text_file(path)
     end
 
     local file = io.open(path, "r")
-    if not file then
-        return nil
+    if file then
+        local content = file:read("*a")
+        file:close()
+        return content
     end
 
-    local content = file:read("*a")
-    file:close()
-    return content
+    -- Windows ANSI 打不开非当前代码页路径时，回退 CreateFileW 宽字符读取（内容按 UTF-8 解读）。
+    if SUBFIX_IS_WINDOWS and subfix_read_file_bytes then
+        return subfix_read_file_bytes(path)
+    end
+    return nil
 end
 
 function file_exists(path)
@@ -1623,12 +2155,21 @@ function file_exists(path)
     end
 
     local file = io.open(path, "r")
-    if not file then
-        return false
+    if file then
+        file:close()
+        return true
     end
 
-    file:close()
-    return true
+    -- Windows 宽字符判定：ANSI io.open 失败不代表文件不存在（可能只是路径含非当前代码页字符）。
+    if SUBFIX_IS_WINDOWS and SUBFIX_FFI and SUBFIX_FFI.C and SUBFIX_FFI.C.GetFileAttributesW then
+        local ok, attr = pcall(function()
+            return tonumber(subfix_wcall(SUBFIX_FFI.C.GetFileAttributesW, path))
+        end)
+        if ok and attr and attr ~= 0xFFFFFFFF then
+            return true
+        end
+    end
+    return false
 end
 
 function has_legacy_config_files()
@@ -1789,8 +2330,6 @@ BackupFileMap = {}
 BackupHistoryEntries = {}
 undo_stack = {}
 redo_stack = {}
-history_window = nil
-history_window_items = nil
 suppress_backup_restore_events = false
 backup_selector_dirty = false
 BACKUP_SELECTOR_PLACEHOLDER_TEXT = "选择历史备份..."
@@ -2536,14 +3075,9 @@ function sync_work_scope_ui(target_window)
         pcall(function() update_btn.ToolTip = tip .. "｜" .. detail end)
     end
 
-    local status_label = find_window_item(target_window, "StatusLabel", "MiniStatusLabel")
+    local status_label = find_window_item(target_window, "StatusLabel")
     if status_label then
         pcall(function() status_label.ToolTip = detail end)
-    end
-
-    local mini_load_label = find_window_item(target_window, "MiniLoadStatusLabel")
-    if mini_load_label then
-        pcall(function() mini_load_label.ToolTip = detail end)
     end
 end
 
@@ -3564,16 +4098,6 @@ report_helpers = (function()
 end)()
 
 
-function set_checkbox_checked(item, checked)
-    if not item then
-        return
-    end
-
-    local next_value = checked == true
-    pcall(function() item.Checked = next_value end)
-    pcall(function() item.CheckState = next_value and 2 or 0 end)
-end
-
 -- 切换按钮选中态：用全局变量承载（Button 无 .Checked，故不再依赖 get/set_checkbox_checked）。
 SUBFIX_SCRIPT_ASSIST_ENABLED = false
 SUBFIX_NORMALIZE_ALIGN_AUDIO_ENABLED = true
@@ -3711,50 +4235,6 @@ function set_item_hidden(item, hidden)
     end
     pcall(function() item.Hidden = hidden end)
     pcall(function() item.Enabled = not hidden end)
-end
-
-
-function set_stack_page_active(page, active)
-    if not page then
-        return
-    end
-
-    if active then
-        pcall(function() page:Show() end)
-    else
-        pcall(function() page:Hide() end)
-    end
-    if page.SetAttrs then
-        pcall(function() page:SetAttrs({Hidden = not active}) end)
-    end
-    pcall(function() page.Hidden = not active end)
-    pcall(function() page.Enabled = active end)
-end
-
-switch_stack_page_index_only = function(target_window, stack_id, active_index)
-    local stack = find_window_item(target_window, stack_id, stack_id)
-    if not stack then
-        return
-    end
-
-    local page_index = math.max(0, tonumber(active_index) or 0)
-    pcall(function() stack.CurrentIndex = page_index end)
-end
-
-switch_stack_page = function(target_window, stack_id, page_ids, active_index)
-    local stack = find_window_item(target_window, stack_id, stack_id)
-    if not stack or type(page_ids) ~= "table" or #page_ids == 0 then
-        return
-    end
-
-    local page_count = #page_ids
-    local page_index = math.max(0, math.min(page_count - 1, tonumber(active_index) or 0))
-    pcall(function() stack.CurrentIndex = page_index end)
-
-    for idx, page_id in ipairs(page_ids) do
-        local page = find_window_item(target_window, page_id, page_id)
-        set_stack_page_active(page, (idx - 1) == page_index)
-    end
 end
 
 function sync_ai_provider_ui_state(provider_id)
@@ -3897,7 +4377,7 @@ end
 -- 缓存挂在 SEARCH_VIEW 上避免增加主 chunk 的 local 数量。
 
 function sync_track_control(target_window)
-    local control = find_window_item(target_window, "TrackSpin", "MiniTrackSpin")
+    local control = find_window_item(target_window, "TrackSpin")
     if not control then return end
 
     suppress_track_change_events = true
@@ -3909,7 +4389,7 @@ end
 function sync_search_control(target_window)
     -- 批量查找仅借用预览区，不把查找词回写到普通搜索框。
     if SEARCH_VIEW.input_id == "FindInput" then return end
-    local box = find_window_item(target_window, "SearchBox", "MiniSearchBox")
+    local box = find_window_item(target_window, "SearchBox")
     if not box then return end
 
     suppress_search_change_events = true
@@ -3922,7 +4402,7 @@ function update_search_query_from_window(target_window)
     if SEARCH_VIEW.input_id == "FindInput" and SEARCH_VIEW.input_window == target_window then
         box = find_window_item(target_window, "FindInput")
     else
-        box = find_window_item(target_window, "SearchBox", "MiniSearchBox")
+        box = find_window_item(target_window, "SearchBox")
     end
     if box then
         current_search_query = trim(box.Text or "")
@@ -4099,23 +4579,25 @@ end
 function get_selected_tree_node(tree)
     if not tree then return nil end
 
+    -- Resolve 20.3 实测：CurrentItem()/SelectedNode 恒为 nil；
+    -- 选中状态真实保存在各节点的 Selected 属性上，tree:SelectedItems() 可直接取集合。
     local selected = nil
-    do
-        local ok_m, ret = pcall(function() return tree:CurrentItem() end)
-        if ok_m and ret then selected = ret end
-    end
-    if not selected then
-        local ok_p, ret = pcall(function() return tree.CurrentItem end)
-        if ok_p and ret then selected = ret end
-    end
-    if not selected then
-        local ok_sel, ret = pcall(function() return tree.SelectedNode end)
-        if ok_sel and ret then selected = ret end
+    local ok_items, items = pcall(function() return tree:SelectedItems() end)
+    if ok_items and type(items) == "table" then
+        selected = items[1] or items[0]
     end
     if not selected then
         local ok_ch, children = pcall(function() return tree.Children end)
-        if ok_ch and children and #children > 0 then
-            selected = children[1]
+        if ok_ch and type(children) == "table" then
+            for _, child in ipairs(children) do
+                local is_sel = false
+                pcall(function() is_sel = (child.Selected == true) end)
+                if is_sel then selected = child; break end
+            end
+            -- 兜底：完全没有选中行时返回第一行（保持旧行为）
+            if not selected and #children > 0 then
+                selected = children[1]
+            end
         end
     end
 
@@ -4142,22 +4624,27 @@ function set_tree_current_item(tree, item)
         return false
     end
 
-    local setters = {
-        function() tree:SetCurrentItem(item) end,
-        function() tree.CurrentItem = item end,
-        function() tree:SetSelectedNode(item) end,
-        function() tree.SelectedNode = item end,
-        function() item.Selected = true end,
-    }
-
-    for _, setter in ipairs(setters) do
-        local ok = pcall(setter)
-        if ok then
-            return true
+    -- Resolve 20.3 的 UITree 没有 SetSelectedNode / SetCurrentItem 方法（探针实测均为 nil），
+    -- 给 tree.CurrentItem / tree.SelectedNode 赋值也静默无效。唯一生效的是节点属性：
+    --   item.Selected = true（回读为 true），item:SetAttrs({Selected=true}) 同理。
+    -- 字幕树是扁平结构（全部 AddTopLevelItem），先把同层其它行取消选中，保证单选高亮唯一。
+    pcall(function()
+        local children = tree.Children
+        if type(children) == "table" then
+            for _, sib in ipairs(children) do
+                if sib ~= item then
+                    pcall(function() sib.Selected = false end)
+                end
+            end
         end
-    end
+    end)
 
-    return false
+    local ok = pcall(function() item.Selected = true end)
+    pcall(function() item:SetAttrs({ Selected = true }) end)
+
+    local verified = false
+    pcall(function() verified = (item.Selected == true) end)
+    return ok and verified
 end
 
 function find_row_by_id(row_id)
@@ -4541,21 +5028,24 @@ end
 function apply_preview_tree_layout(tree, target_window)
     if not tree then return end
     -- 文字列宽跟随窗口宽度，避免固定 900 导致窗口内被裁断 + 出现横向滚动条。
-    -- 标记列需容得下 "  ✎"，否则会被省略成 "…"。
-    local window_width = is_mini_window(target_window) and SUBFIX_WINDOW_SIZE.mini.width or SUBFIX_WINDOW_SIZE.full.width
-    local text_width = math.max(360, window_width - 80)
+    -- 列 0 是 Quiet Pro 窄装订槽（18px）：常态为空，仅在 AI 待确认流程显示 ● 标记。
+    -- 三步工作台已移除右侧固定面板，字幕树整行占满，仅扣除窗口边距/滚动条约 32px。
+    local window_width = math.max(360, SUBFIX_WINDOW_SIZE.full.width - 32)
+    local text_width = math.max(360, window_width - 56)
     pcall(function() tree.ColumnCount = 2 end)
     pcall(function() tree.RootIsDecorated = false end)
     pcall(function() tree.ItemsExpandable = false end)
     pcall(function() tree.Indentation = 0 end)
-    pcall(function() tree.ColumnWidth[0] = 40 end)
+    pcall(function() tree.ColumnWidth[0] = 18 end)
     pcall(function() tree.ColumnWidth[1] = text_width end)
 end
 
 function set_preview_tree_node_display_text(node, display_text)
     if not node then return false end
     local safe_display_text = tostring(display_text or "")
-    set_tree_item_text(node, 0, "  ✎")
+    -- 列 0 常态留空（Quiet Pro：去掉每行铅笔图标，消除 55 行重复噪音）；
+    -- AI 待确认流程会自行写入 ● 标记。
+    set_tree_item_text(node, 0, "")
     set_tree_item_text(node, 1, safe_display_text)
     return true
 end
@@ -4614,18 +5104,6 @@ function refresh_pending_tree_item(item, pending_change)
     pcall(function() item.TextColor[3] = ui_color(170, 170, 170) end)
     pcall(function() item.TextColor[4] = ui_color(70, 120, 170) end)
 end
-
-function set_pending_report_detail_text(text, html)
-    if not pending_report_detail_view then
-        return
-    end
-    report_helpers.set_textedit_rich_content(
-        pending_report_detail_view,
-        tostring(text or "请选择一条待审核建议查看完整内容。"),
-        html
-    )
-end
-
 
 function show_pending_detail_window_for_item(item)
     local pending_change = select(1, get_pending_change_for_item(item))
@@ -4848,29 +5326,6 @@ function log_pending_review_event(msg)
     end
 end
 
-refresh_preview_windows = function()
-    local context = SEARCH_VIEW.build_current_view_context()
-
-    local function refresh_window_tree(target_window)
-        if not target_window or not render_rows_to_window then
-            return
-        end
-        pcall(function()
-            render_rows_to_window(target_window, context.visible_rows)
-            if context.status_text and context.status_text ~= "" then
-                update_shared_status(target_window, context.status_text)
-            end
-        end)
-    end
-
-    if win then
-        refresh_window_tree(win)
-    end
-    if mini_win then
-        refresh_window_tree(mini_win)
-    end
-end
-
 function mark_dirty_row(dirty_row_ids, row)
     if type(dirty_row_ids) ~= "table" or type(row) ~= "table" then
         return
@@ -4891,7 +5346,7 @@ function sync_current_preview_tree(target_window, dirty_row_ids)
         return 0
     end
 
-    local tree = find_window_item(window, "SubtitleTree", "MiniSubtitleTree")
+    local tree = find_window_item(window, "SubtitleTree")
     local data_map = get_subtitle_data_map_for_window(window)
     local row_id_node_map = get_subtitle_row_id_node_map_for_window(window)
     if not tree or type(data_map) ~= "table" then
@@ -4953,10 +5408,6 @@ function save_preview_edit_dialog_changes(target_window, row_id, new_text)
         sync_current_preview_tree(window, dirty_row_ids)
     end
 
-    if is_mini_window(window) then
-        full_window_tree_dirty = true
-    end
-
     current_selected_row_id = trim_text(row.id)
     update_shared_status(window, "已保存预览编辑 #" .. tostring(row.index or "?") .. "，未写回时间线")
     return true
@@ -4964,7 +5415,7 @@ end
 
 function handle_preview_tree_item_clicked(target_window, ev)
     local window = resolve_window(target_window)
-    local tree = find_window_item(window, "SubtitleTree", "MiniSubtitleTree")
+    local tree = find_window_item(window, "SubtitleTree")
     local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem", "node", "Node"})
     local data_map = get_subtitle_data_map_for_window(window)
     local row_id_node_map = get_subtitle_row_id_node_map_for_window(window)
@@ -5081,11 +5532,24 @@ end
 function load_selected_subtitle_into_edit_box(target_window, row)
     local window = resolve_window(target_window)
     if not window then return end
-    local label = find_window_item(window, "EditSubtitleLabel", "MiniEditSubtitleLabel")
-    local editor = find_window_item(window, "EditSubtitleText", "MiniEditSubtitleText")
+    local label = find_window_item(window, "EditSubtitleLabel")
+    local editor = find_window_item(window, "EditSubtitleText")
     if not label or not editor then return end
+
+    -- 切换到另一行前，把编辑框里尚未到去抖周期的输入先落盘到旧行，避免丢稿。
+    -- 同一行重载（如拆分/还原）不走这里：拆分行会先改 current_selected_row_id，还原是有意丢弃。
+    if row and row.id and row.id ~= current_selected_row_id then
+        if edit_text_autosave_timer then pcall(function() edit_text_autosave_timer:Stop() end) end
+        local ok_draft, draft = pcall(get_textedit_content, editor)
+        if ok_draft and current_selected_row_id and trim_text(current_selected_row_id) ~= "" then
+            pcall(save_preview_edit_dialog_changes, window, current_selected_row_id, draft)
+        end
+    end
+
     if not row or not row.id then
+        suppress_edit_text_autosave = true
         set_textedit_content(editor, "")
+        suppress_edit_text_autosave = false
         pcall(function() editor.Enabled = false end)
         label:Set("Text", "请选择一条字幕进行编辑")
         return
@@ -5096,7 +5560,10 @@ function load_selected_subtitle_into_edit_box(target_window, row)
         time_text = string.format("   (%s → %s)", tostring(tc_start), tostring(tc_end))
     end
     label:Set("Text", string.format("编辑字幕 #%s%s", tostring(row.index or "?"), time_text))
+    -- 程序化装内容会触发 TextChanged：抑制即时调度，迟到事件再由“文本相同 no-op”兜底。
+    suppress_edit_text_autosave = true
     set_textedit_content(editor, tostring(row.text or ""))
+    suppress_edit_text_autosave = false
     pcall(function() editor.Enabled = true end)
 end
 
@@ -5111,9 +5578,534 @@ function save_subtitle_edit_box(target_window)
         if window then update_shared_status(window, "请先选中一条字幕") end
         return
     end
-    local editor = find_window_item(window, "EditSubtitleText", "MiniEditSubtitleText")
+    local editor = find_window_item(window, "EditSubtitleText")
     if not editor then return end
     save_preview_edit_dialog_changes(window, row_id, get_textedit_content(editor))
+end
+
+-- 编辑框内容变化后去抖自动落盘到当前行（纯内存，写时间线仍需点“更新时间线”）。
+function schedule_edit_text_autosave()
+    if suppress_edit_text_autosave then return end
+    if edit_text_autosave_timer then
+        restart_ui_timer(edit_text_autosave_timer)
+    end
+end
+
+function flush_edit_text_autosave(target_window)
+    local window = resolve_window(target_window)
+    if suppress_edit_text_autosave then return end
+    local row_id = current_selected_row_id
+    if not window or not row_id or trim_text(row_id) == "" then return end
+    local editor = find_window_item(window, "EditSubtitleText")
+    if not editor then return end
+    -- save_preview_edit_dialog_changes 内部对“文本未变化”直接 no-op，
+    -- 因此程序化 set_textedit_content 触发的迟到事件不会产生空快照。
+    save_preview_edit_dialog_changes(window, row_id, get_textedit_content(editor))
+end
+
+-- 读取播放头帧位置，返回两个坐标（消除 Resolve 各版本 item:GetStart 坐标系差异）：
+--   abs_frame = 与字幕 item:GetStart()“绝对帧”同系（含 timeline start frame）
+--   rel_frame = 相对时间线起点的帧序号（从 0 起）
+-- 另有第三返回值 diag，为原始诊断表，供状态栏/日志排障。
+-- go_to_subtitle 是“行帧 → 时间码”的正向换算，本函数是其逆运算，供拆分取点/播放跟随复用。
+function get_playhead_frame_info()
+    local resolve = get_resolve()
+    if not resolve then return nil, nil, {error = "resolve 未注入"} end
+    local pm = resolve:GetProjectManager()
+    if not pm then return nil, nil, {error = "ProjectManager 不可用"} end
+    local project = pm:GetCurrentProject()
+    local timeline = project and project:GetCurrentTimeline()
+    if not timeline then return nil, nil, {error = "没有当前时间线"} end
+    local tc
+    local ok_tc = pcall(function() tc = timeline:GetCurrentTimecode() end)
+    if not ok_tc or not tc then return nil, nil, {error = "GetCurrentTimecode 失败"} end
+    local fps = tonumber(current_fps) or 24
+    local ok_fps, timeline_fps = pcall(function() return tonumber(timeline:GetSetting("timelineFrameRate")) end)
+    if ok_fps and timeline_fps then fps = timeline_fps end
+    local now_count = timecode_to_frame_count(tostring(tc), fps)
+    if not now_count then return nil, nil, {error = "当前时间码无法解析: " .. tostring(tc)} end
+    local tl_start_frame = tonumber(current_tl_start_frame) or 0
+    local ok_start, start_frame = pcall(function() return tonumber(timeline:GetStartFrame()) end)
+    if ok_start and start_frame then tl_start_frame = start_frame end
+    local start_tc
+    pcall(function() start_tc = timeline:GetStartTimecode() end)
+    local start_count = start_tc and timecode_to_frame_count(tostring(start_tc), fps) or nil
+    local rel_frame = now_count - (start_count or 0)
+    local abs_frame = math.floor(tl_start_frame + rel_frame + 0.5)
+    rel_frame = math.floor(rel_frame + 0.5)
+    return abs_frame, rel_frame, {
+        tc = tostring(tc), start_tc = tostring(start_tc or ""),
+        tl_start_frame = tl_start_frame, fps = fps,
+        now_count = now_count, start_count = start_count
+    }
+end
+
+-- 读取 LineEdit 光标位置（Qt QLineEdit 语义：光标前的 UTF-16 码元数）。
+-- Fusion UI Manager 各版本暴露方式不一，多通道探测；读不到返回 nil。
+function get_lineedit_cursor_position(editor)
+    if not editor then return nil end
+    local probes = {
+        function() return editor:GetCursorPosition() end,
+        function() return editor:cursorPosition() end,
+        function() return editor.CursorPosition end,
+        function() return editor.cursorPosition end,
+        function() return editor:Get("CursorPosition") end,
+        function() return editor:Get("cursorPosition") end
+    }
+    for _, probe in ipairs(probes) do
+        local ok, result = pcall(probe)
+        if ok then
+            local number = tonumber(result)
+            if number then return math.floor(number + 0.5) end
+        end
+    end
+    return nil
+end
+
+-- 把“光标前的 UTF-16 码元数”换算成“光标前的 UTF-8 字符数”；
+-- 光标落在增补平面字符的代理对中间时吸附到该字符之后。
+function utf16_cursor_to_char_index(chars, cursor16)
+    if not cursor16 or cursor16 <= 0 then return 0 end
+    local cum = 0
+    for i = 1, #chars do
+        local units = (#chars[i] >= 4) and 2 or 1
+        if cursor16 <= cum then return i - 1 end
+        if cursor16 <= cum + units then return i end
+        cum = cum + units
+    end
+    return #chars
+end
+
+-- 把一条字幕拆成两条（纯内存操作，写轨仍走“更新时间线”）。
+-- 拆分位置完全由用户决定：在编辑框文本里点击（光标在哪），点“拆分”即从光标处切开；
+-- 不弹二级窗口、不自动选点。拆分帧按字符位置等比折算到行时间范围内。
+function split_current_subtitle_row(target_window)
+    local window = resolve_window(target_window)
+    local row = current_selected_row_id and find_row_by_id(current_selected_row_id) or nil
+    if not row or not row.id then
+        if window then update_shared_status(window, "请先选中一条字幕，在文本中点击拆分位置后再点拆分") end
+        return false
+    end
+
+    local sf = tonumber(row.start_frame)
+    local ef = tonumber(row.end_frame)
+    if not sf or not ef or ef - sf < 2 then
+        if window then update_shared_status(window, "该字幕时长不足 2 帧，无法拆分") end
+        return false
+    end
+
+    local editor = find_window_item(window, "EditSubtitleText")
+    if not editor then return false end
+    local source_text = tostring(row.text or "")
+    local ok_draft, draft = pcall(get_textedit_content, editor)
+    if ok_draft and trim_text(tostring(draft)) ~= "" then
+        source_text = tostring(draft)
+    end
+
+    -- UTF-8 安全字符数组
+    local chars = {}
+    for ch in source_text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        chars[#chars + 1] = ch
+    end
+    local char_count = #chars
+    if char_count < 2 then
+        if window then update_shared_status(window, "字幕文字太少，无法拆分") end
+        return false
+    end
+
+    local cursor16 = get_lineedit_cursor_position(editor)
+    if cursor16 == nil then
+        if window then update_shared_status(window, "当前达芬奇版本不支持读取编辑框光标位置，无法按光标拆分") end
+        return false
+    end
+    local split_char_pos = utf16_cursor_to_char_index(chars, cursor16)
+    if split_char_pos <= 0 or split_char_pos >= char_count then
+        if window then update_shared_status(window, "请先在字幕文本中点击要拆开的位置（不要在整句最前/最后），再点拆分") end
+        return false
+    end
+
+    local function join_range(a, b)
+        local parts = {}
+        for i = a, b do parts[#parts + 1] = chars[i] end
+        return trim(table.concat(parts))
+    end
+    local left_text = join_range(1, split_char_pos)
+    local right_text = join_range(split_char_pos + 1, char_count)
+    if left_text == "" or right_text == "" then
+        if window then update_shared_status(window, "拆分点两侧文字不能为空，请重新点击拆分位置") end
+        return false
+    end
+
+    -- 拆分时间点按字符位置等比折算，两侧各保证至少 1 帧
+    local split_frame = sf + math.floor((ef - sf) * (split_char_pos / char_count) + 0.5)
+    split_frame = math.max(sf + 1, math.min(ef - 1, split_frame))
+
+    local insert_index
+    for i, candidate in ipairs(current_rows) do
+        if candidate.id == row.id then insert_index = i break end
+    end
+    if not insert_index then
+        if window then update_shared_status(window, "拆分失败：字幕行定位丢失，请刷新后重试") end
+        return false
+    end
+
+    local old_index = row.index
+    local mutation_snapshot = prepare_mutation_snapshot("拆分字幕 #" .. tostring(old_index or "?"))
+    local new_row = clone_table(row)
+    new_row.start_frame = split_frame
+    new_row.end_frame = ef
+    new_row.text = right_text
+    row.text = left_text
+    row.end_frame = split_frame
+    table.insert(current_rows, insert_index + 1, new_row)
+    if mutation_snapshot then
+        commit_mutation_snapshot(mutation_snapshot)
+    end
+
+    rebuild_tree_from_rows(current_rows, window)
+
+    -- rebuild 后 id 已重算：按“拆帧起点 + 后半句文本”找回新行并选中装入编辑框。
+    local target_row
+    for _, candidate in ipairs(current_rows) do
+        if tonumber(candidate.start_frame) == split_frame and tostring(candidate.text) == right_text then
+            target_row = candidate
+            break
+        end
+    end
+    if target_row then
+        current_selected_row_id = target_row.id
+        -- 复用“重建节点时首次选中”的已验证路径，确保橙色高亮落到新拆出的后半句
+        rerender_tree_with_selected_row(window, target_row.id)
+        load_selected_subtitle_into_edit_box(window, target_row)
+        update_shared_status(window,
+            "已在光标处拆分为 #" .. tostring(old_index) .. " 与 #" .. tostring(target_row.index) .. "，点“更新时间线”写回轨道")
+    end
+    return true
+end
+
+-- ========== 播放跟随：时间线播放时字幕树自动定位当前行 ==========
+-- 更新时间线（整轨清空重导入+播放头恢复）等动作期间短暂挂起跟随，
+-- 避免导入过程中播放头跳变被误判成“播放”而乱选行。
+function suspend_playhead_follow(seconds)
+    playhead_follow_suspend_until = os.time() + math.max(1, tonumber(seconds) or 2)
+end
+
+-- P3：二分查找工具。在有序数值数组中返回第一个 a[i] >= value 的下标（#a+1 表示 value 大于全部）。
+function subfix_lower_bound(sorted_values, value)
+    local lo, hi = 1, #sorted_values + 1
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        local mid_value = tonumber(sorted_values[mid])
+        if mid_value == nil then return nil end
+        if mid_value < value then
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+    return lo
+end
+
+-- P3：行数组按 start_frame 二分，返回最后一个 start_frame <= frame 的下标（0 表示没有）。
+local function subfix_bisect_last_row_starting_before(rows, frame)
+    local lo, hi = 1, #rows
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        local sf = tonumber(rows[mid].start_frame)
+        if sf == nil then return nil end
+        if sf <= frame then
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    return hi
+end
+
+-- P3：校验行数组按 start_frame 单调非降且区间互不重叠（字幕行正常状态）。
+-- 结果按表引用缓存（字幕重建会整体换新表），避免每次跟随 tick 都做 O(n) 检查。
+local function subfix_rows_are_ordered_disjoint(rows)
+    local cache = rawget(_G, "SUBFIX_ROWS_ORDER_CACHE")
+    if not cache then
+        cache = setmetatable({}, {__mode = "k"})
+        rawset(_G, "SUBFIX_ROWS_ORDER_CACHE", cache)
+    end
+    local hit = cache[rows]
+    if hit and hit.n == #rows then
+        return hit.ok
+    end
+    local ok = true
+    for i = 2, #rows do
+        local cur_start = tonumber(rows[i].start_frame)
+        local prev_start = tonumber(rows[i - 1].start_frame)
+        local prev_end = tonumber(rows[i - 1].end_frame)
+        local cur_end = tonumber(rows[i].end_frame)
+        if not cur_start or not prev_start or not prev_end or not cur_end
+            or cur_start < prev_start or prev_end > cur_start then
+            ok = false
+            break
+        end
+    end
+    cache[rows] = {n = #rows, ok = ok}
+    return ok
+end
+
+-- 在 current_rows 中找覆盖播放头的行；abs/rel 双坐标任一命中即可（兼容 Resolve 版本差异）。
+function find_row_at_playhead(abs_frame, rel_frame)
+    if type(current_rows) ~= "table" then return nil end
+
+    -- P3：行有序且互不重叠时用二分定位（O(log n)）；异常数据结构自动回退原线性扫描，
+    -- 返回"数组顺序中第一条命中行"的语义保持不变。
+    if subfix_rows_are_ordered_disjoint(current_rows) then
+        local function bisect_hit(frame)
+            local f = tonumber(frame)
+            if not f then return nil end
+            local idx = subfix_bisect_last_row_starting_before(current_rows, f)
+            if idx and idx >= 1 then
+                local candidate = current_rows[idx]
+                local sf = tonumber(candidate.start_frame)
+                local ef = tonumber(candidate.end_frame)
+                if sf and ef and f >= sf and f < ef then
+                    return candidate
+                end
+            end
+            return nil
+        end
+        return bisect_hit(abs_frame) or bisect_hit(rel_frame)
+    end
+
+    for _, candidate in ipairs(current_rows) do
+        local sf = tonumber(candidate.start_frame)
+        local ef = tonumber(candidate.end_frame)
+        if sf and ef then
+            if abs_frame and abs_frame >= sf and abs_frame < ef then return candidate end
+            if rel_frame and rel_frame >= sf and rel_frame < ef then return candidate end
+        end
+    end
+    return nil
+end
+
+-- LineEdit 是否正持有键盘焦点（用户在编辑框里操作时不打断光标/输入）。
+function lineedit_has_focus(editor)
+    if not editor then return false end
+    local focused
+    pcall(function() focused = editor:HasFocus() end)
+    if type(focused) ~= "boolean" then
+        local ok2, v2 = pcall(function() return editor:hasFocus() end)
+        if ok2 then focused = v2 end
+    end
+    return focused == true
+end
+
+-- ========== 外部 Python 播放头轮询器（[已停用] 旧实时跟随方案）==========
+-- 新方案为 Lua 750ms 低频时间码变化检测，不再启动 Python 轮询器/键盘钩子。
+-- 仅保留 stop：关闭跟随或强制退出时，向旧版本可能残留的轮询进程写 .stop 清理信号。
+-- quick=true 时只写 stop 信号，不重置状态。
+function stop_playhead_poller(quick)
+    if playhead_poller_stop_file then
+        local handle = io.open(playhead_poller_stop_file, "w")
+        if handle then handle:close() end
+    end
+    if playhead_follow_alive_file then
+        os.remove(playhead_follow_alive_file)
+    end
+    if quick then return end
+    playhead_poller_started = false
+end
+
+-- 把树的橙色高亮移动到指定行：Clear→重建节点→批次内对新节点置 Selected=true
+-- （render_rows_to_window 按 current_selected_row_id 在批次内选中目标节点），
+-- 重建后再滚动到可见、走标准 setter 补一次选中并重绘。
+function rerender_tree_with_selected_row(window, row_id)
+    if not window or not row_id or type(current_rows) ~= "table" or #current_rows == 0 then
+        return false
+    end
+    local tree = find_window_item(window, "SubtitleTree")
+    if not tree then return false end
+
+    local ok = pcall(render_rows_to_window, window, current_rows)
+    if not ok then return false end
+    local node = get_subtitle_row_id_node_map_for_window(window)[row_id]
+    if node then
+        pcall(function() tree:ScrollToItem(node) end)
+        local sel_ok = set_tree_current_item(tree, node)
+        pcall(function() tree:Repaint() end)
+        playhead_follow_pending_row_id = row_id
+        if playhead_follow_select_timer then
+            pcall(function() playhead_follow_select_timer:Start() end)
+        end
+        return sel_ok
+    end
+    return false
+end
+
+-- 跟随时把树定位到目标行，并同步编辑框（编辑框正持有焦点/有未落盘改动时不动，避免打断用户）。
+function apply_follow_row_selection(target)
+    if not target or not target.id or not win then return false end
+
+    local preserve_editor = false
+    local editor = find_window_item(win, "EditSubtitleText")
+    if lineedit_has_focus(editor) then
+        preserve_editor = true
+    elseif editor then
+        local ok_cur, cur_text = pcall(get_textedit_content, editor)
+        local cur_row = find_row_by_id(current_selected_row_id)
+        if ok_cur and cur_row and trim_text(tostring(cur_text)) ~= trim_text(tostring(cur_row.text or "")) then
+            preserve_editor = true
+        end
+    end
+
+    -- 渲染按 current_selected_row_id 决定高亮行：先临时切到目标行再重建树；
+    -- 若用户正在编辑则渲染后恢复原选中 id，编辑框内容完全不动。
+    local prev_selected = current_selected_row_id
+    current_selected_row_id = target.id
+    local node_ok = rerender_tree_with_selected_row(win, target.id)
+    if preserve_editor then
+        current_selected_row_id = prev_selected
+    else
+        load_selected_subtitle_into_edit_box(win, target)
+    end
+
+    if not node_ok then
+        local now_sec = os.time()
+        if not playhead_follow_last_select_warn_at or now_sec - playhead_follow_last_select_warn_at >= 3 then
+            playhead_follow_last_select_warn_at = now_sec
+            print("[SubFix] follow select skip: 树重建/节点定位失败 row=#" .. tostring(target.index or "?"))
+        end
+    end
+    return node_ok
+end
+
+function playhead_follow_tick(force)
+    if not playhead_follow_enabled then return end
+
+    -- 诊断心跳：不经过任何 gate。播放期间只要 ui:Timer 还在回调，文件 mtime 就会涨
+    -- （真机验收用：心跳停涨=定时器被 Resolve 饿死；在涨而不跳=匹配逻辑问题）。
+    if playhead_follow_alive_file then
+        playhead_follow_tick_count = (playhead_follow_tick_count or 0) + 1
+        local beat = io.open(playhead_follow_alive_file, "w")
+        if beat then
+            beat:write("tick=" .. tostring(playhead_follow_tick_count)
+                .. " t=" .. tostring(os.time())
+                .. " frame=" .. tostring(playhead_follow_last_seen_frame or "-") .. "\n")
+            beat:close()
+        end
+    end
+
+    -- 弹窗 / AI 跑批时不抢焦点
+    local gate_suspended = os.time() < (tonumber(playhead_follow_suspend_until) or 0)
+    local gate_blocked = AI_RUNNING or ai_config_popup_visible or preview_edit_window
+    if not win or type(current_rows) ~= "table" or #current_rows == 0 then gate_blocked = true end
+    -- 搜索/过滤视图下树里只有部分行，节点不全，不跟随
+    if trim_text(current_search_query or "") ~= "" then gate_blocked = true end
+    local wrap = find_window_item(win, "SubtitleTreeWrap")
+    if wrap then
+        local hidden = nil
+        pcall(function() hidden = wrap.Hidden end)
+        if hidden then gate_blocked = true end
+    end
+    if gate_suspended or gate_blocked then return end
+
+    local now_sec = os.time()
+    local in_diag_window = now_sec <= (tonumber(playhead_follow_diag_until) or 0)
+
+    -- 唯一数据源：时间线当前时间码（启动时已预载 current_rows，无需遍历 GetItems）。
+    -- 真机事实：进程内调用在播放中不阻塞，快速返回冻结的陈旧时间码；暂停/拖动后刷新。
+    local abs_frame, rel_frame, diag = get_playhead_frame_info()
+    if not abs_frame or (diag and diag.error) then
+        if not playhead_follow_last_error_at or now_sec - playhead_follow_last_error_at >= 5 then
+            playhead_follow_last_error_at = now_sec
+            print("[SubFix] 自动跟随采样失败: " .. tostring(diag and diag.error or "未知错误"))
+        end
+        return
+    end
+
+    -- 唯一触发条件：时间码（帧）返回值发生变化。
+    -- 播放中它一直冻结 → 永远不成立 → 不跳 UI、不重建树；暂停/拖动后变化 → 匹配一次。
+    -- 注意：绝不能用“连续几次相同”来判暂停——播放中返回值也一直相同。
+    if not force and playhead_follow_last_seen_frame ~= nil
+        and abs_frame == playhead_follow_last_seen_frame then
+        return
+    end
+    local prev_seen = playhead_follow_last_seen_frame
+    playhead_follow_last_seen_frame = abs_frame
+
+    -- 在预载字幕数组中找 In <= 当前帧 < Out 的行（abs/rel 双坐标兼容）。
+    local target = find_row_at_playhead(abs_frame, rel_frame)
+
+    if in_diag_window and now_sec ~= playhead_follow_diag_last_log then
+        playhead_follow_diag_last_log = now_sec
+        print(string.format("[SubFix] follow tick #%d 帧变化 %s->%d tc=%s row=#%s",
+            playhead_follow_tick_count,
+            prev_seen == nil and "-" or tostring(prev_seen), abs_frame,
+            tostring(diag and diag.tc or ""),
+            target and tostring(target.index) or "-"))
+    end
+
+    -- 不在任何字幕区间（两条字幕之间的空隙）：保持原状，不取消、不跳动。
+    if not target or not target.id or target.id == playhead_follow_last_row_id then return end
+    playhead_follow_last_row_id = target.id
+
+    -- 防递归：程序化选中节点期间屏蔽树点击事件。
+    playhead_follow_suppress_tree_events = true
+    local ok_sel, node_ok = pcall(apply_follow_row_selection, target)
+    playhead_follow_suppress_tree_events = false
+    node_ok = ok_sel and node_ok == true
+    if in_diag_window then
+        print(string.format("[SubFix] follow -> 选中 #%s sel=%s",
+            tostring(target.index or "?"), node_ok and "verified" or "UNVERIFIED"))
+    end
+    update_shared_status(win, "▶ 自动跟随：当前字幕 #" .. tostring(target.index or "?"))
+end
+
+-- 自动跟随默认常驻开启（无开关按钮）：字幕加载完成后由启动定时器自动调用。
+function set_playhead_follow_enabled(enabled)
+    playhead_follow_enabled = enabled and true or false
+    if playhead_follow_enabled then
+        playhead_follow_last_row_id = nil
+        playhead_follow_last_seen_frame = nil
+        playhead_follow_tick_count = 0
+        playhead_follow_last_error_at = nil
+        playhead_follow_last_select_warn_at = nil
+        playhead_follow_diag_last_log = 0
+        playhead_follow_diag_until = os.time() + 60
+        playhead_follow_suppress_tree_events = false
+        -- 诊断心跳文件（仅写本地 TEMP，无端口、无外部进程）
+        playhead_follow_alive_file = subfix_pjoin(subfix_temp_dir(), "subfix_playhead.txt.alive")
+        local beat0 = io.open(playhead_follow_alive_file, "w")
+        if beat0 then beat0:write("tick=0 t=" .. tostring(os.time()) .. "\n"); beat0:close() end
+        if playhead_follow_timer then pcall(function() playhead_follow_timer:Start() end) end
+
+        -- 开启瞬间立即采样一次：定位当前行并初始化变化基线
+        local abs_frame, rel_frame, diag = get_playhead_frame_info()
+        local first = type(current_rows) == "table" and current_rows[1] or nil
+        local last = type(current_rows) == "table" and current_rows[#current_rows] or nil
+        local range_text = "无字幕"
+        if first and last then
+            range_text = string.format("字幕范围 %d~%d", tonumber(first.start_frame) or -1, tonumber(last.end_frame) or -1)
+        end
+        if not abs_frame or (diag and diag.error) then
+            update_shared_status(win, "自动跟随已开启，但播放头读取失败：" .. tostring(diag and diag.error or "未知错误"))
+            print("[SubFix] 自动跟随开启失败: " .. tostring(diag and diag.error or "未知错误"))
+        else
+            print(string.format("[SubFix] 自动跟随已开启: tc=%s frame=%d fps=%s %s（750ms 检测时间码变化；播放中不跳，暂停/拖动后 1 秒内自动定位）",
+                tostring(diag.tc), abs_frame, tostring(diag.fps), range_text))
+            playhead_follow_tick(true)
+            if not playhead_follow_last_row_id then
+                update_shared_status(win,
+                    string.format("自动跟随已开：播放头帧 %d，%s（未落在字幕行内时保持原状，暂停/拖动后自动定位）",
+                        abs_frame, range_text))
+            end
+        end
+    else
+        if playhead_follow_timer then pcall(function() playhead_follow_timer:Stop() end) end
+        if playhead_follow_alive_file then os.remove(playhead_follow_alive_file) end
+        -- 兼容清理：给旧版本可能残留的 Python 轮询器进程发停止信号（新方案本身不启动它）
+        stop_playhead_poller()
+        playhead_follow_diag_until = 0
+        playhead_follow_suppress_tree_events = false
+        if win then update_shared_status(win, "自动跟随已关闭") end
+    end
 end
 
 function push_stack_snapshot(target_stack, snapshot)
@@ -5228,13 +6220,13 @@ end
 function restore_history_entry(entry)
     local status = win and win:Find("StatusLabel")
     if type(entry) ~= "table" or tostring(entry.full_path or "") == "" then
-        if status then status:Set("Text", "未找到可恢复的历史版本") end
+        if status then subfix_status_set(status, "未找到可恢复的历史版本") end
         return false
     end
 
     local restored_rows, err = restore_rows_from_backup_file(entry.full_path)
     if not restored_rows then
-        if status then status:Set("Text", "恢复失败: " .. tostring(err)) end
+        if status then subfix_status_set(status, "恢复失败: " .. tostring(err)) end
         return false
     end
 
@@ -5248,7 +6240,7 @@ function restore_history_entry(entry)
     update_undo_redo_button_states()
 
     local message = "已恢复历史版本：" .. tostring(entry.action_label or "") .. "，未写回时间线，需手动点更新时间线"
-    if status then status:Set("Text", message) end
+    if status then subfix_status_set(status, message) end
     print("[Hooper AI 2.0] " .. message)
     return true
 end
@@ -5258,14 +6250,14 @@ function perform_undo()
     local snapshot = table.remove(undo_stack)
     if not snapshot then
         update_undo_redo_button_states()
-        if status then status:Set("Text", "没有可撤回的操作") end
+        if status then subfix_status_set(status, "没有可撤回的操作") end
         return
     end
 
     push_stack_snapshot(redo_stack, build_snapshot_record(snapshot.action_label))
     restore_rows_from_snapshot(snapshot)
     local message = "已撤回：" .. tostring(snapshot.action_label or "上一步") .. "，未写回时间线，需手动点更新时间线"
-    if status then status:Set("Text", message) end
+    if status then subfix_status_set(status, message) end
 end
 
 
@@ -5689,7 +6681,7 @@ function show_revert_applied_dialog(report_entries)
             SEARCH_VIEW.render_current_view(active_window or win)
             local status_label = (active_window or win) and (active_window or win):Find("StatusLabel")
             if status_label then
-                status_label:Set("Text", string.format("已取消 %d 条自动应用，已恢复原文", reverted_count))
+                subfix_status_set(status_label, string.format("已取消 %d 条自动应用，已恢复原文", reverted_count))
             end
         end
     end
@@ -5885,7 +6877,7 @@ function show_batch_review_dialog(task_name, report_entries)
             end
             local status_label = win and win:Find("StatusLabel")
             if status_label then
-                status_label:Set("Text", string.format("已取消 %d 条「%s」修改", reverted, tostring(task_name or "批量")))
+                subfix_status_set(status_label, string.format("已取消 %d 条「%s」修改", reverted, tostring(task_name or "批量")))
             end
         end
     end
@@ -6246,7 +7238,7 @@ function apply_approved_pending_changes_to_rows(rows)
 end
 
 function get_row_from_tree_selection(target_window)
-    local tree = find_window_item(target_window, "SubtitleTree", "MiniSubtitleTree")
+    local tree = find_window_item(target_window, "SubtitleTree")
     if not tree then return nil, nil end
 
     local selected = get_selected_tree_node(tree)
@@ -6278,7 +7270,7 @@ end
 
 render_rows_to_window = function(target_window, rows_override)
     local window = resolve_window(target_window)
-    local tree = find_window_item(window, "SubtitleTree", "MiniSubtitleTree")
+    local tree = find_window_item(window, "SubtitleTree")
     local rows = type(rows_override) == "table" and rows_override or {}
     local count = 0
     local next_map = {}
@@ -6314,7 +7306,9 @@ render_rows_to_window = function(target_window, rows_override)
         end
 
         if selected_node then
-            pcall(function() tree:SetSelectedNode(selected_node) end)
+            -- Resolve 20.3：树没有 SetSelectedNode，唯一生效的是节点 Selected 属性
+            pcall(function() selected_node.Selected = true end)
+            pcall(function() selected_node:SetAttrs({ Selected = true }) end)
         end
     end
 
@@ -6396,7 +7390,7 @@ function apply_visibility_filter_to_window(window, visible_set, selected_row_id)
     if not window or window ~= active_window then return false end
     local row_id_node_map = get_subtitle_row_id_node_map_for_window(window)
     if type(row_id_node_map) ~= "table" then return false end
-    local tree = find_window_item(window, "SubtitleTree", "MiniSubtitleTree")
+    local tree = find_window_item(window, "SubtitleTree")
     if not tree then return false end
 
     local first_visible_node = nil
@@ -6409,7 +7403,9 @@ function apply_visibility_filter_to_window(window, visible_set, selected_row_id)
             end
         end
         if selected_row_id and row_id_node_map[selected_row_id] and visible_set[selected_row_id] then
-            pcall(function() tree:SetSelectedNode(row_id_node_map[selected_row_id]) end)
+            local sel_node = row_id_node_map[selected_row_id]
+            pcall(function() sel_node.Selected = true end)
+            pcall(function() sel_node:SetAttrs({ Selected = true }) end)
         end
     end)
     return ok == true
@@ -6552,7 +7548,7 @@ end
 
 function clear_tree_for_window(target_window)
     local window = resolve_window(target_window)
-    local tree = find_window_item(window, "SubtitleTree", "MiniSubtitleTree")
+    local tree = find_window_item(window, "SubtitleTree")
     if tree then
         pcall(function() tree:Clear() end)
     end
@@ -6575,9 +7571,7 @@ function apply_lightweight_shared_state_to_window(target_window)
     sync_track_control(window)
     sync_search_control(window)
 
-    if not is_mini_window(window) then
-        sync_target_track_control()
-    end
+    sync_target_track_control()
     sync_work_scope_ui(window)
 
     set_subtitle_loaded_state(is_subtitle_loaded, nil, window)
@@ -6596,6 +7590,20 @@ function register_ui_timer(timer, handler)
 
     ui_timer_handlers[timer_id] = handler
     return true
+end
+
+-- 注销 timer 路由：embedded core 取消/收尾时必须调用，否则全局 ui_timer_handlers
+-- 会堆积一次性死闭包（core 内部所有 timer 都走宿主路由）。
+function unregister_ui_timer(timer_or_id)
+    local timer_id = nil
+    if type(timer_or_id) == "string" then
+        timer_id = timer_or_id
+    elseif type(timer_or_id) == "table" then
+        timer_id = tostring(timer_or_id.ID or "")
+    end
+    if timer_id and timer_id ~= "" then
+        ui_timer_handlers[timer_id] = nil
+    end
 end
 
 function restart_ui_timer(timer)
@@ -6656,10 +7664,12 @@ function long_task_progress_elapsed_text(started_at)
 end
 
 function long_task_progress_bar_text(progress_state, payload)
+    -- 定宽字符条：仅用 █/░ 两种等宽阴影块（Courier New 下 advance 稳定），
+    -- 不再用 □/ᗧ/⚑ 这类依赖字体回退、跨平台会错位的字形。百分比由旁边的 MetaLabel 承载。
+    local width = LONG_TASK_PROGRESS_BAR_WIDTH
     if payload and payload.indeterminate == true then
-        local width = LONG_TASK_PROGRESS_BAR_WIDTH
         local position = math.max(0, os.time() - progress_state.started_at) % width
-        return string.rep("□", position) .. "ᗧ" .. string.rep("□", width - position - 1) .. "⚑", nil
+        return string.rep("░", position) .. "█" .. string.rep("░", width - position - 1), nil
     end
     local total = tonumber(payload and payload.progress_total)
     local index = tonumber(payload and payload.progress_index)
@@ -6679,25 +7689,10 @@ function long_task_progress_bar_text(progress_state, payload)
     end
 
     progress_state.progress_fraction = math.max(tonumber(progress_state.progress_fraction) or 0, fraction)
-    local width = LONG_TASK_PROGRESS_BAR_WIDTH
     local percent = math.floor(progress_state.progress_fraction * 100 + 0.5)
-    if progress_state.progress_fraction >= 0.995 then
-        return string.rep("■", width) .. "⚑", percent
-    end
-
-    local marker_pos = math.floor(progress_state.progress_fraction * width + 0.5)
-    marker_pos = math.max(1, math.min(width, marker_pos))
-    local cells = {}
-    for cell_index = 1, width do
-        if cell_index < marker_pos then
-            cells[#cells + 1] = "■"
-        elseif cell_index == marker_pos then
-            cells[#cells + 1] = "ᗧ"
-        else
-            cells[#cells + 1] = "□"
-        end
-    end
-    return table.concat(cells) .. "⚑", percent
+    local filled = math.floor(progress_state.progress_fraction * width + 0.5)
+    filled = math.max(0, math.min(width, filled))
+    return string.rep("█", filled) .. string.rep("░", width - filled), percent
 end
 
 function show_long_task_progress_window(options)
@@ -6725,7 +7720,7 @@ function show_long_task_progress_window(options)
         ui:HGroup{
             Weight = 0,
             ui:HGap(0, 1),
-            ui:Label{ID = "LongTaskProgressBarLabel", Text = "ᗧ" .. string.rep("□", LONG_TASK_PROGRESS_BAR_WIDTH - 1) .. "⚑", Weight = 0, MinimumSize = {0, 20}},
+            ui:Label{ID = "LongTaskProgressBarLabel", Text = string.rep("░", LONG_TASK_PROGRESS_BAR_WIDTH), Font = ui:Font{PixelSize = 14, Family = "Courier New"}, Weight = 0, MinimumSize = {0, 20}},
             ui:HGap(0, 1)
         },
         ui:Label{ID = "LongTaskProgressMetaLabel", Text = "进度 0%  ·  用时 0s", Weight = 0, MinimumSize = {0, 18}},
@@ -7198,6 +8193,22 @@ function get_resolve()
     return resolve
 end
 
+-- 统一「resolve → ProjectManager → Project → 当前 Timeline」获取链。
+-- 错误文案与各历史调用点逐字一致；timeline_override 非空时原样透传。
+-- 与旧代码一样不对中间调用加 pcall：异常按原路径向上抛。
+function subfix_get_active_timeline(timeline_override)
+    if timeline_override then return timeline_override end
+    local resolve_obj = get_resolve()
+    if not resolve_obj then return nil, "无法获取 Resolve" end
+    local pm = resolve_obj:GetProjectManager()
+    if not pm then return nil, "无法获取 ProjectManager" end
+    local project = pm:GetCurrentProject()
+    if not project then return nil, "没有打开的项目" end
+    local timeline = project:GetCurrentTimeline()
+    if not timeline then return nil, "没有时间线" end
+    return timeline
+end
+
 function get_subtitle_track_type_and_count(timeline)
     if not timeline then
         return "subtitle", 0
@@ -7219,20 +8230,8 @@ function get_subtitle_track_items(track_index, timeline_override)
         return nil, "字幕轨索引无效"
     end
 
-    local timeline = timeline_override
-    if not timeline then
-        local resolve = get_resolve()
-        if not resolve then return nil, "无法获取 Resolve" end
-
-        local pm = resolve:GetProjectManager()
-        if not pm then return nil, "无法获取 ProjectManager" end
-
-        local project = pm:GetCurrentProject()
-        if not project then return nil, "没有打开的项目" end
-
-        timeline = project:GetCurrentTimeline()
-        if not timeline then return nil, "没有时间线" end
-    end
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return nil, active_tl_err end
 
     local track_type, track_count = get_subtitle_track_type_and_count(timeline)
     if track_index > track_count then
@@ -7279,20 +8278,8 @@ function ensure_subtitle_track_exists(track_index, timeline_override)
         return nil, "字幕轨索引无效"
     end
 
-    local timeline = timeline_override
-    if not timeline then
-        local resolve = get_resolve()
-        if not resolve then return nil, "无法获取 Resolve" end
-
-        local pm = resolve:GetProjectManager()
-        if not pm then return nil, "无法获取 ProjectManager" end
-
-        local project = pm:GetCurrentProject()
-        if not project then return nil, "没有打开的项目" end
-
-        timeline = project:GetCurrentTimeline()
-        if not timeline then return nil, "没有时间线" end
-    end
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return nil, active_tl_err end
 
     local _, track_count = get_subtitle_track_type_and_count(timeline)
     while track_count < track_index do
@@ -7311,20 +8298,8 @@ function ensure_subtitle_track_exists(track_index, timeline_override)
 end
 
 function get_subtitle_track_state_snapshot(timeline_override)
-    local timeline = timeline_override
-    if not timeline then
-        local resolve = get_resolve()
-        if not resolve then return nil, "无法获取 Resolve" end
-
-        local pm = resolve:GetProjectManager()
-        if not pm then return nil, "无法获取 ProjectManager" end
-
-        local project = pm:GetCurrentProject()
-        if not project then return nil, "没有打开的项目" end
-
-        timeline = project:GetCurrentTimeline()
-        if not timeline then return nil, "没有时间线" end
-    end
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return nil, active_tl_err end
 
     local track_type, track_count = get_subtitle_track_type_and_count(timeline)
     local snapshot = {
@@ -7357,20 +8332,8 @@ end
 
 
 function unlock_all_subtitle_tracks(timeline_override)
-    local timeline = timeline_override
-    if not timeline then
-        local resolve = get_resolve()
-        if not resolve then return false, "无法获取 Resolve" end
-
-        local pm = resolve:GetProjectManager()
-        if not pm then return false, "无法获取 ProjectManager" end
-
-        local project = pm:GetCurrentProject()
-        if not project then return false, "没有打开的项目" end
-
-        timeline = project:GetCurrentTimeline()
-        if not timeline then return false, "没有时间线" end
-    end
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return false, active_tl_err end
 
     local track_type, track_count = get_subtitle_track_type_and_count(timeline)
     for i = 1, track_count do
@@ -7396,20 +8359,8 @@ function get_enabled_subtitle_tracks(snapshot)
 end
 
 function lock_non_target_subtitle_tracks(track_index, timeline_override)
-    local timeline = timeline_override
-    if not timeline then
-        local resolve = get_resolve()
-        if not resolve then return false, "无法获取 Resolve" end
-
-        local pm = resolve:GetProjectManager()
-        if not pm then return false, "无法获取 ProjectManager" end
-
-        local project = pm:GetCurrentProject()
-        if not project then return false, "没有打开的项目" end
-
-        timeline = project:GetCurrentTimeline()
-        if not timeline then return false, "没有时间线" end
-    end
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return false, active_tl_err end
 
     local track_type, track_count = get_subtitle_track_type_and_count(timeline)
     local failures = {}
@@ -7434,20 +8385,8 @@ function isolate_subtitle_target_track(track_index, timeline_override)
         return false, "字幕目标轨无效"
     end
 
-    local timeline = timeline_override
-    if not timeline then
-        local resolve = get_resolve()
-        if not resolve then return false, "无法获取 Resolve" end
-
-        local pm = resolve:GetProjectManager()
-        if not pm then return false, "无法获取 ProjectManager" end
-
-        local project = pm:GetCurrentProject()
-        if not project then return false, "没有打开的项目" end
-
-        timeline = project:GetCurrentTimeline()
-        if not timeline then return false, "没有时间线" end
-    end
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return false, active_tl_err end
 
     local track_type, track_count = get_subtitle_track_type_and_count(timeline)
     if track_index > track_count then
@@ -7482,21 +8421,42 @@ function isolate_subtitle_target_track(track_index, timeline_override)
     return true, "目标轨已启用，并进入锁轨兜底；当前状态: " .. locked_summary, true
 end
 
-function clear_subtitle_track_clips(track_index, timeline_override)
-    local timeline = timeline_override
-    if not timeline then
-        local resolve = get_resolve()
-        if not resolve then return false, 0, 0, "无法获取 Resolve" end
-
-        local pm = resolve:GetProjectManager()
-        if not pm then return false, 0, 0, "无法获取 ProjectManager" end
-
-        local project = pm:GetCurrentProject()
-        if not project then return false, 0, 0, "没有打开的项目" end
-
-        timeline = project:GetCurrentTimeline()
-        if not timeline then return false, 0, 0, "没有时间线" end
+-- 按 isolate 前的快照恢复字幕轨启用状态（SetTrackEnable 不会随写回自动复原）。
+-- keep_track_index 非 nil 时该轨保持当前状态——刚写回的目标轨必须保持可见；
+-- 快照之后新增的轨道（如 Resolve 自行落轨产生的新字幕轨）快照无记录，保持启用不动。
+function restore_subtitle_track_enabled_states(snapshot, keep_track_index, timeline_override)
+    if not snapshot or not snapshot.track_count then
+        return true
     end
+
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return false, active_tl_err end
+
+    local _, track_count = get_subtitle_track_type_and_count(timeline)
+    local failures = {}
+    for i = 1, track_count do
+        if i ~= keep_track_index then
+            local original_enabled = snapshot.enabled and snapshot.enabled[i]
+            if original_enabled ~= nil then
+                local ok, ret = pcall(function()
+                    return timeline:SetTrackEnable(snapshot.track_type, i, original_enabled)
+                end)
+                if not ok or ret == false then
+                    table.insert(failures, tostring(i))
+                end
+            end
+        end
+    end
+
+    if #failures > 0 then
+        return false, "恢复字幕轨启用状态失败（轨道 " .. table.concat(failures, ", ") .. "）"
+    end
+    return true
+end
+
+function clear_subtitle_track_clips(track_index, timeline_override)
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return false, 0, 0, active_tl_err end
 
     local items, err = get_subtitle_track_items(track_index, timeline)
     if not items then
@@ -7550,20 +8510,8 @@ function clear_subtitle_track_clips(track_index, timeline_override)
 end
 
 function snapshot_subtitle_tracks(timeline_override)
-    local timeline = timeline_override
-    if not timeline then
-        local resolve = get_resolve()
-        if not resolve then return nil, "无法获取 Resolve" end
-
-        local pm = resolve:GetProjectManager()
-        if not pm then return nil, "无法获取 ProjectManager" end
-
-        local project = pm:GetCurrentProject()
-        if not project then return nil, "没有打开的项目" end
-
-        timeline = project:GetCurrentTimeline()
-        if not timeline then return nil, "没有时间线" end
-    end
+    local timeline, active_tl_err = subfix_get_active_timeline(timeline_override)
+    if not timeline then return nil, active_tl_err end
 
     local _, track_count = get_subtitle_track_type_and_count(timeline)
     local snapshot = {
@@ -7626,38 +8574,6 @@ function detect_subtitle_track_delta(before_snapshot, after_snapshot)
 
     return result
 end
-
-function get_subtitle_track_label_candidates(track_index, timeline)
-    local labels = {}
-    local seen = {}
-
-    local function add_label(label)
-        local value = trim(label or "")
-        if value == "" then return end
-        if not seen[value] then
-            seen[value] = true
-            table.insert(labels, value)
-        end
-    end
-
-    add_label("ST" .. tostring(track_index))
-    add_label("字幕" .. tostring(track_index))
-    add_label("字幕 " .. tostring(track_index))
-    add_label("Subtitle " .. tostring(track_index))
-    add_label("Subtitle" .. tostring(track_index))
-
-    if timeline then
-        local ok_name, track_name = pcall(function() return timeline:GetTrackName("subtitle", track_index) end)
-        if ok_name and track_name then
-            local resolved_name = trim(track_name)
-            add_label(resolved_name)
-            add_label(resolved_name:gsub("%s+", ""))
-        end
-    end
-
-    return labels
-end
-
 
 function sort_rows_by_timing(rows)
     table.sort(rows, function(a, b)
@@ -7766,14 +8682,6 @@ function SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(value)
     return parsed
 end
 
-function SUBFIX_AUDIO_ALIGN.parse_normalize_length_bias_input(value)
-    local text = trim_text(tostring(value or ""))
-    if text == "" or text == "自动" or text:lower() == "auto" then
-        return "auto", SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(SUBFIX_AUDIO_ALIGN.normalize_length_start_bias_frames)
-    end
-    return "manual", SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(text)
-end
-
 function SUBFIX_AUDIO_ALIGN.resolve_normalize_length_auto_bias(results)
     local min_confidence = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_auto_bias_min_confidence) or 0.65
     local max_abs_frames = math.max(0, tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_auto_bias_max_abs_frames) or 6)
@@ -7804,434 +8712,6 @@ function SUBFIX_AUDIO_ALIGN.resolve_normalize_length_auto_bias(results)
         median = math.floor(((samples[mid] + samples[mid + 1]) / 2) + 0.5)
     end
     return SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(median), #samples, false
-end
-
-function SUBFIX_AUDIO_ALIGN.normalize_text(text)
-    local value = tostring(text or ""):lower()
-    value = value:gsub("[%s%p%c]+", "")
-    -- 注意：Lua 字符类 [] 按字节匹配，多字节标点写进 [] 会误伤字节集相同的汉字（如“冀”含 0x80）。
-    -- 改为逐个“字面量”串删除，字面量非魔法字符，按整字节序列精确匹配。
-    for _, punct in ipairs({ "，", "。", "！", "？", "、", "；", "：", "“", "”", "‘", "’", "（", "）", "《", "》", "【", "】", "…", "—" }) do
-        value = value:gsub(punct, "")
-    end
-    value = value:gsub("[,.!?;:\"'`~@#$%%^&*_+=/\\|<>%[%]{}]+", "")
-    local variants = {
-        ["對"] = "对", ["廣"] = "广", ["剛"] = "刚", ["貓"] = "猫", ["還"] = "还",
-        ["額"] = "额", ["碼"] = "码", ["國"] = "国", ["補"] = "补", ["疊"] = "叠",
-        ["優"] = "优", ["萬"] = "万", ["來"] = "来", ["準"] = "准", ["門"] = "门",
-        ["檻"] = "槛", ["幫"] = "帮", ["輕"] = "轻", ["開"] = "开", ["啟"] = "启",
-        ["愛"] = "爱", ["這"] = "这", ["麼"] = "么", ["麽"] = "么", ["們"] = "们",
-        ["見"] = "见", ["薦"] = "荐", ["課"] = "课", ["會"] = "会", ["體"] = "体",
-        ["後"] = "后", ["鋪"] = "铺", ["覆"] = "覆", ["節"] = "节", ["裡"] = "里",
-        ["結"] = "结", ["專"] = "专", ["項"] = "项", ["與"] = "与", ["學"] = "学",
-        ["蟄"] = "蛰", ["螫"] = "蛰"
-    }
-    for traditional, simplified in pairs(variants) do
-        value = value:gsub(traditional, simplified)
-    end
-    return value
-end
-
-function SUBFIX_AUDIO_ALIGN.levenshtein_ratio(a, b)
-    a = tostring(a or "")
-    b = tostring(b or "")
-    if a == b then return 1 end
-
-    local len_a = #a
-    local len_b = #b
-    if len_a == 0 or len_b == 0 then return 0 end
-    if len_a > 180 or len_b > 180 then
-        local shorter = len_a < len_b and a or b
-        local longer = len_a < len_b and b or a
-        if longer:find(shorter, 1, true) then
-            return #shorter / math.max(1, #longer)
-        end
-    end
-
-    local previous = {}
-    local current = {}
-    for j = 0, len_b do
-        previous[j] = j
-    end
-
-    for i = 1, len_a do
-        current[0] = i
-        local ca = a:sub(i, i)
-        for j = 1, len_b do
-            local cost = ca == b:sub(j, j) and 0 or 1
-            local deletion = previous[j] + 1
-            local insertion = current[j - 1] + 1
-            local substitution = previous[j - 1] + cost
-            current[j] = math.min(deletion, insertion, substitution)
-        end
-        previous, current = current, previous
-    end
-
-    local distance = previous[len_b] or math.max(len_a, len_b)
-    return 1 - (distance / math.max(len_a, len_b))
-end
-
-function SUBFIX_AUDIO_ALIGN.text_score(source_text, reference_text)
-    local source = SUBFIX_AUDIO_ALIGN.normalize_text(source_text)
-    local reference = SUBFIX_AUDIO_ALIGN.normalize_text(reference_text)
-    if source == "" or reference == "" then return 0 end
-    if source == reference then return 1 end
-
-    local shorter = #source < #reference and source or reference
-    local longer = #source < #reference and reference or source
-    if longer:find(shorter, 1, true) then
-        return math.min(0.96, 0.70 + (#shorter / math.max(1, #longer)) * 0.26)
-    end
-
-    return SUBFIX_AUDIO_ALIGN.levenshtein_ratio(source, reference)
-end
-
-function SUBFIX_AUDIO_ALIGN.local_text_score(source_text, reference_text)
-    local source = SUBFIX_AUDIO_ALIGN.normalize_text(source_text)
-    local reference = SUBFIX_AUDIO_ALIGN.normalize_text(reference_text)
-    if source == "" or reference == "" then return 0 end
-    if source == reference then return 1 end
-
-    local shorter = #source < #reference and source or reference
-    local longer = #source < #reference and reference or source
-    if longer:find(shorter, 1, true) then
-        return 1
-    end
-
-    local shorter_len = #shorter
-    local longer_len = #longer
-    if longer_len <= shorter_len then
-        return SUBFIX_AUDIO_ALIGN.text_score(source_text, reference_text)
-    end
-
-    local best_score = 0
-    local max_extra = math.min(18, math.max(0, longer_len - shorter_len))
-    for start_index = 1, longer_len do
-        for extra = 0, max_extra do
-            local end_index = start_index + shorter_len + extra - 1
-            if end_index <= longer_len then
-                local window = longer:sub(start_index, end_index)
-                local score = SUBFIX_AUDIO_ALIGN.levenshtein_ratio(shorter, window)
-                if score > best_score then
-                    best_score = score
-                end
-            end
-        end
-    end
-
-    return math.max(SUBFIX_AUDIO_ALIGN.text_score(source_text, reference_text), best_score)
-end
-
-function SUBFIX_AUDIO_ALIGN.build_reference_rows(items, fps)
-    local rows = {}
-    for i, item in ipairs(items or {}) do
-        local ok_name, name = pcall(function() return item:GetName() end)
-        local ok_start, start_frame = pcall(function() return item:GetStart() end)
-        local ok_end, end_frame = pcall(function() return item:GetEnd() end)
-        if ok_start and ok_end and start_frame ~= nil and end_frame ~= nil then
-            rows[#rows + 1] = {
-                index = i,
-                start_frame = tonumber(start_frame) or 0,
-                end_frame = tonumber(end_frame) or 0,
-                text = ok_name and tostring(name or "") or "",
-                fps = fps
-            }
-        end
-    end
-    sort_rows_by_timing(rows)
-    return rows
-end
-
-function SUBFIX_AUDIO_ALIGN.match_rows(source_rows, reference_rows, options)
-    options = type(options) == "table" and options or {}
-    local bias_frames = SUBFIX_AUDIO_ALIGN.clamp_bias_frames(options.bias_frames)
-    local min_score = tonumber(options.min_match_score) or SUBFIX_AUDIO_ALIGN.min_match_score
-    local lookahead = tonumber(options.max_reference_lookahead) or SUBFIX_AUDIO_ALIGN.max_reference_lookahead
-    local results = {}
-    local reference_cursor = 1
-
-    for source_index, source_row in ipairs(source_rows or {}) do
-        local best_reference = nil
-        local best_reference_index = nil
-        local best_score = -1
-        local search_end = math.min(#(reference_rows or {}), reference_cursor + lookahead)
-
-        for reference_index = reference_cursor, search_end do
-            local reference_row = reference_rows[reference_index]
-            local score = SUBFIX_AUDIO_ALIGN.text_score(source_row and source_row.text, reference_row and reference_row.text)
-            if score > best_score then
-                best_score = score
-                best_reference = reference_row
-                best_reference_index = reference_index
-            end
-        end
-
-        if best_reference and best_score >= min_score then
-            local original_duration = math.max(1, (tonumber(source_row.end_frame) or 0) - (tonumber(source_row.start_frame) or 0))
-            local start_frame = math.max(0, (tonumber(best_reference.start_frame) or 0) + bias_frames)
-            local end_frame = start_frame + original_duration
-
-            results[#results + 1] = {
-                source_index = source_index,
-                reference_index = best_reference_index,
-                matched = true,
-                score = best_score,
-                row = source_row,
-                reference = best_reference,
-                old_start_frame = tonumber(source_row.start_frame) or 0,
-                old_end_frame = tonumber(source_row.end_frame) or 0,
-                new_start_frame = start_frame,
-                new_end_frame = end_frame
-            }
-            reference_cursor = best_reference_index + 1
-        else
-            results[#results + 1] = {
-                source_index = source_index,
-                matched = false,
-                score = best_score > 0 and best_score or 0,
-                row = source_row
-            }
-        end
-    end
-
-    return results
-end
-
-function SUBFIX_AUDIO_ALIGN.make_auto_caption_settings(resolve_obj)
-    local settings = {}
-    if resolve_obj and resolve_obj.SUBTITLE_LANGUAGE and resolve_obj.AUTO_CAPTION_AUTO then
-        settings[resolve_obj.SUBTITLE_LANGUAGE] = resolve_obj.AUTO_CAPTION_AUTO
-    end
-    if resolve_obj and resolve_obj.SUBTITLE_CAPTION_PRESET and resolve_obj.AUTO_CAPTION_SUBTITLE_DEFAULT then
-        settings[resolve_obj.SUBTITLE_CAPTION_PRESET] = resolve_obj.AUTO_CAPTION_SUBTITLE_DEFAULT
-    end
-    if resolve_obj and resolve_obj.SUBTITLE_CHARS_PER_LINE then
-        settings[resolve_obj.SUBTITLE_CHARS_PER_LINE] = 42
-    end
-    if resolve_obj and resolve_obj.SUBTITLE_LINE_BREAK and resolve_obj.AUTO_CAPTION_LINE_SINGLE then
-        settings[resolve_obj.SUBTITLE_LINE_BREAK] = resolve_obj.AUTO_CAPTION_LINE_SINGLE
-    end
-    if resolve_obj and resolve_obj.SUBTITLE_GAP then
-        settings[resolve_obj.SUBTITLE_GAP] = 0
-    end
-    return settings
-end
-
-function SUBFIX_AUDIO_ALIGN.detect_reference_track(before_snapshot, after_snapshot)
-    local delta = detect_subtitle_track_delta(before_snapshot, after_snapshot)
-    if delta and delta.detected_track then
-        return delta.detected_track, delta
-    end
-
-    local best_track = nil
-    local best_delta = 0
-    for track_index, count_after in pairs((after_snapshot and after_snapshot.tracks) or {}) do
-        local count_before = ((before_snapshot and before_snapshot.tracks) or {})[track_index] or 0
-        local diff = (tonumber(count_after) or 0) - (tonumber(count_before) or 0)
-        if diff > best_delta then
-            best_delta = diff
-            best_track = track_index
-        end
-    end
-
-    return best_track, delta
-end
-
-function SUBFIX_AUDIO_ALIGN.item_key(item)
-    local ok_name, name = pcall(function() return item:GetName() end)
-    local ok_start, start_frame = pcall(function() return item:GetStart() end)
-    local ok_end, end_frame = pcall(function() return item:GetEnd() end)
-    return table.concat({
-        tostring(ok_start and start_frame or ""),
-        tostring(ok_end and end_frame or ""),
-        tostring(ok_name and name or "")
-    }, "|")
-end
-
-function SUBFIX_AUDIO_ALIGN.snapshot_track_item_keys(timeline)
-    -- Resolve may reuse an existing subtitle track, so cleanup must delete only newly generated reference clips.
-    local snapshot = {tracks = {}}
-    local _, track_count = get_subtitle_track_type_and_count(timeline)
-    for track_index = 1, track_count do
-        snapshot.tracks[track_index] = {}
-        local items = select(1, get_subtitle_track_items(track_index, timeline)) or {}
-        for _, item in ipairs(items) do
-            local key = SUBFIX_AUDIO_ALIGN.item_key(item)
-            snapshot.tracks[track_index][key] = (snapshot.tracks[track_index][key] or 0) + 1
-        end
-    end
-    return snapshot
-end
-
-function SUBFIX_AUDIO_ALIGN.filter_new_items(items, item_key_snapshot, track_index)
-    local new_items = {}
-    local known_counts = clone_table(((item_key_snapshot or {}).tracks or {})[track_index] or {})
-
-    for _, item in ipairs(items or {}) do
-        local key = SUBFIX_AUDIO_ALIGN.item_key(item)
-        if (known_counts[key] or 0) > 0 then
-            known_counts[key] = known_counts[key] - 1
-        else
-            new_items[#new_items + 1] = item
-        end
-    end
-
-    return new_items
-end
-
-function SUBFIX_AUDIO_ALIGN.delete_reference_items(timeline, items)
-    if not timeline or not items or #items == 0 then
-        return true, 0, 0, nil
-    end
-
-    local ok_delete, ret_delete = pcall(function() return timeline:DeleteClips(items, false) end)
-    if not ok_delete or ret_delete == false then
-        ok_delete, ret_delete = pcall(function() return timeline:DeleteClips(items) end)
-    end
-
-    if not ok_delete or ret_delete == false then
-        return false, 0, #items, "删除参考字幕片段失败"
-    end
-
-    return true, #items, 0, nil
-end
-
-function SUBFIX_AUDIO_ALIGN.cleanup_reference_track(timeline, track_index, before_snapshot, reference_items)
-    if not timeline or not track_index then
-        return false, "缺少参考字幕轨"
-    end
-
-    local is_new_track = before_snapshot and tonumber(track_index) and tonumber(track_index) > (tonumber(before_snapshot.track_count) or 0)
-    local clear_ok, deleted_count, remaining_count, clear_err
-    local deleted_track = false
-    local delete_track_err = nil
-
-    if is_new_track then
-        clear_ok, deleted_count, remaining_count, clear_err = clear_subtitle_track_clips(track_index, timeline)
-        local track_type = select(1, get_subtitle_track_type_and_count(timeline)) or "subtitle"
-        local ok_delete, ret_delete = pcall(function() return timeline:DeleteTrack(track_type, track_index) end)
-        if ok_delete and ret_delete ~= false then
-            deleted_track = true
-            clear_ok = true
-            remaining_count = 0
-            clear_err = nil
-        else
-            delete_track_err = tostring(ret_delete or "DeleteTrack 返回失败")
-        end
-    else
-        clear_ok, deleted_count, remaining_count, clear_err = SUBFIX_AUDIO_ALIGN.delete_reference_items(timeline, reference_items or {})
-    end
-
-    if not clear_ok then
-        return false, tostring(clear_err or "清理参考字幕失败"), deleted_count, remaining_count, deleted_track
-    end
-    if delete_track_err then
-        return false, delete_track_err, deleted_count, remaining_count, deleted_track
-    end
-    return true, nil, deleted_count, remaining_count, deleted_track
-end
-
-function SUBFIX_AUDIO_ALIGN.find_reference_items(timeline, before_item_key_snapshot)
-    local best_track = nil
-    local best_items = {}
-    local _, track_count = get_subtitle_track_type_and_count(timeline)
-
-    for track_index = 1, track_count do
-        local items = select(1, get_subtitle_track_items(track_index, timeline)) or {}
-        local new_items = SUBFIX_AUDIO_ALIGN.filter_new_items(items, before_item_key_snapshot, track_index)
-        if #new_items > #best_items then
-            best_track = track_index
-            best_items = new_items
-        end
-    end
-
-    return best_track, best_items
-end
-
-function SUBFIX_AUDIO_ALIGN.delete_temp_timeline(media_pool, temp_timeline)
-    if not media_pool or not temp_timeline then
-        return false, "缺少临时时间线"
-    end
-
-    local ok_delete, ret_delete = pcall(function() return media_pool:DeleteTimelines({temp_timeline}) end)
-    if ok_delete and ret_delete ~= false then
-        return true
-    end
-
-    return false, tostring(ret_delete or "DeleteTimelines 返回失败")
-end
-
-function SUBFIX_AUDIO_ALIGN.restore_original_timeline(project, original_timeline)
-    if not project or not original_timeline then
-        return false, "缺少原时间线"
-    end
-
-    local ok_restore, ret_restore = pcall(function() return project:SetCurrentTimeline(original_timeline) end)
-    if ok_restore and ret_restore ~= false then
-        return true
-    end
-
-    return false, tostring(ret_restore or "SetCurrentTimeline 返回失败")
-end
-
-function SUBFIX_AUDIO_ALIGN.generate_reference_rows(original_timeline, resolve_obj)
-    if not original_timeline then
-        return nil, "缺少原时间线"
-    end
-
-    local pm = resolve_obj and resolve_obj:GetProjectManager()
-    local project = pm and pm:GetCurrentProject()
-    local media_pool = project and project:GetMediaPool()
-    if not project or not media_pool then
-        return nil, "无法获取项目或媒体池"
-    end
-
-    local temp_name = "SubFix_AudioAlign_Reference_" .. tostring(os.time()) .. "_" .. tostring(math.floor(os.clock() * 1000))
-    local ok_duplicate, temp_timeline = pcall(function() return original_timeline:DuplicateTimeline(temp_name) end)
-    if not ok_duplicate or not temp_timeline then
-        return nil, "复制临时时间线失败"
-    end
-
-    local ok_set_temp, set_temp_ret = pcall(function() return project:SetCurrentTimeline(temp_timeline) end)
-    if not ok_set_temp or set_temp_ret == false then
-        SUBFIX_AUDIO_ALIGN.delete_temp_timeline(media_pool, temp_timeline)
-        return nil, "切换到临时参考时间线失败"
-    end
-
-    local before_item_key_snapshot = SUBFIX_AUDIO_ALIGN.snapshot_track_item_keys(temp_timeline)
-    local settings = SUBFIX_AUDIO_ALIGN.make_auto_caption_settings(resolve_obj)
-    local ok_create, create_ret = pcall(function() return temp_timeline:CreateSubtitlesFromAudio(settings) end)
-    if not ok_create or create_ret == false then
-        SUBFIX_AUDIO_ALIGN.restore_original_timeline(project, original_timeline)
-        SUBFIX_AUDIO_ALIGN.delete_temp_timeline(media_pool, temp_timeline)
-        return nil, "Resolve 自动字幕生成失败"
-    end
-
-    local reference_track, reference_items = SUBFIX_AUDIO_ALIGN.find_reference_items(temp_timeline, before_item_key_snapshot)
-    if not reference_track or not reference_items or #reference_items == 0 then
-        SUBFIX_AUDIO_ALIGN.restore_original_timeline(project, original_timeline)
-        SUBFIX_AUDIO_ALIGN.delete_temp_timeline(media_pool, temp_timeline)
-        return nil, "未检测到临时时间线中新生成的参考字幕"
-    end
-
-    local reference_rows = SUBFIX_AUDIO_ALIGN.build_reference_rows(reference_items, current_fps)
-    local restore_ok, restore_err = SUBFIX_AUDIO_ALIGN.restore_original_timeline(project, original_timeline)
-    local cleanup_ok, cleanup_err = SUBFIX_AUDIO_ALIGN.delete_temp_timeline(media_pool, temp_timeline)
-
-    if not restore_ok then
-        return nil, "参考字幕已生成，但切回原时间线失败: " .. tostring(restore_err)
-    end
-
-    if not cleanup_ok then
-        LogMsg("临时参考时间线删除警告: " .. tostring(cleanup_err))
-    end
-
-    return {
-        rows = reference_rows,
-        reference_track = reference_track,
-        cleanup_ok = cleanup_ok,
-        cleanup_err = cleanup_err
-    }
 end
 
 function SUBFIX_AUDIO_ALIGN.frame_overlap(a_start, a_end, b_start, b_end)
@@ -8367,89 +8847,6 @@ function SUBFIX_AUDIO_ALIGN.parse_source_audio_channel_mapping(item, media_item,
     result.source_start_seconds = source_start_seconds
     result.audio_channel_index = linked_channels > 1 and math.max(1, tonumber(linked_local_channel_index) or 1) or nil
     return result
-end
-
-function SUBFIX_AUDIO_ALIGN.find_best_audio_source(timeline, rows, fps)
-    if not timeline then
-        return nil, "缺少时间线"
-    end
-
-    local range_start, range_end = SUBFIX_AUDIO_ALIGN.get_rows_frame_range(rows)
-    if not range_start or not range_end or range_end <= range_start then
-        return nil, "缺少有效字幕时间范围"
-    end
-
-    local ok_track_count, track_count = pcall(function() return timeline:GetTrackCount("audio") end)
-    track_count = ok_track_count and tonumber(track_count) or 0
-    if track_count <= 0 then
-        return nil, "时间线没有音频轨"
-    end
-
-    local best = nil
-    for track_index = 1, track_count do
-        local ok_items, items = pcall(function() return timeline:GetItemListInTrack("audio", track_index) end)
-        items = ok_items and items or {}
-        for item_index, item in ipairs(items or {}) do
-            local ok_start, item_start = pcall(function() return item:GetStart() end)
-            local ok_end, item_end = pcall(function() return item:GetEnd() end)
-            item_start = ok_start and tonumber(item_start) or nil
-            item_end = ok_end and tonumber(item_end) or nil
-            if item_start and item_end and item_end > item_start then
-                local overlap = SUBFIX_AUDIO_ALIGN.frame_overlap(range_start, range_end, item_start, item_end)
-                if overlap > 0 then
-                    local ok_media, media_item = pcall(function() return item:GetMediaPoolItem() end)
-                    local file_path = nil
-                    if ok_media and media_item then
-                        local ok_path, raw_path = pcall(function() return media_item:GetClipProperty("File Path") end)
-                        if ok_path and raw_path and tostring(raw_path) ~= "" then
-                            file_path = tostring(raw_path)
-                        end
-                    end
-
-                    if file_path and SUBFIX_AUDIO_ALIGN.file_exists(file_path) then
-                        local effective_fps = math.max(1, tonumber(fps) or current_fps or 24)
-                        local ok_left_offset, left_offset_frames = pcall(function() return item:GetLeftOffset(false) end)
-                        if not ok_left_offset then
-                            ok_left_offset, left_offset_frames = pcall(function() return item:GetLeftOffset() end)
-                        end
-                        local ok_source_start, source_start_time = pcall(function() return item:GetSourceStartTime() end)
-                        local ok_source_end, source_end_time = pcall(function() return item:GetSourceEndTime() end)
-                        local source_offset_frames = ok_left_offset and tonumber(left_offset_frames) or 0
-                        if source_offset_frames < 0 then source_offset_frames = 0 end
-                        local source_start_seconds = source_offset_frames / effective_fps
-                        local item_duration_seconds = (item_end - item_start) / effective_fps
-                        local source_end_seconds = source_start_seconds + item_duration_seconds
-
-                        local candidate = {
-                            file_path = file_path,
-                            file_name = SUBFIX_AUDIO_ALIGN.basename(file_path),
-                            track_index = track_index,
-                            item_index = item_index,
-                            start_frame = item_start,
-                            end_frame = item_end,
-                            source_offset_frames = source_offset_frames,
-                            source_start_seconds = source_start_seconds,
-                            source_end_seconds = source_end_seconds,
-                            source_timecode_start_seconds = ok_source_start and tonumber(source_start_time) or nil,
-                            source_timecode_end_seconds = ok_source_end and tonumber(source_end_time) or nil,
-                            overlap_frames = overlap
-                        }
-
-                        if not best
-                            or candidate.overlap_frames > best.overlap_frames
-                            or (candidate.overlap_frames == best.overlap_frames and (candidate.end_frame - candidate.start_frame) > (best.end_frame - best.start_frame)) then
-                            best = candidate
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    if not best then
-        return nil, "未找到与当前字幕范围重叠的本地音频文件"
-    end
-    return best
 end
 
 function SUBFIX_AUDIO_ALIGN.audio_source_from_item(item, track_index, item_index, fps, overlap)
@@ -8818,84 +9215,6 @@ function SUBFIX_AUDIO_ALIGN.split_alignment_batch_plan_for_accuracy(batch_plan, 
     return batch_plan
 end
 
-function SUBFIX_AUDIO_ALIGN.parse_ffmpeg_duration(output)
-    local h, m, s = tostring(output or ""):match("Duration:%s*(%d+):(%d+):(%d+%.?%d*)")
-    if not h then return nil end
-    return (tonumber(h) or 0) * 3600 + (tonumber(m) or 0) * 60 + (tonumber(s) or 0)
-end
-
-function SUBFIX_AUDIO_ALIGN.parse_silence_intervals(output, duration_seconds)
-    local intervals = {}
-    local pending_start = nil
-    for line in tostring(output or ""):gmatch("[^\r\n]+") do
-        local silence_start = line:match("silence_start:%s*([%d%.]+)")
-        if silence_start then
-            pending_start = tonumber(silence_start)
-        end
-
-        local silence_end = line:match("silence_end:%s*([%d%.]+)")
-        if silence_end and pending_start then
-            local end_seconds = tonumber(silence_end)
-            if end_seconds and end_seconds > pending_start then
-                intervals[#intervals + 1] = {start_seconds = pending_start, end_seconds = end_seconds}
-            end
-            pending_start = nil
-        end
-    end
-
-    if pending_start and duration_seconds and duration_seconds > pending_start then
-        intervals[#intervals + 1] = {start_seconds = pending_start, end_seconds = duration_seconds}
-    end
-
-    table.sort(intervals, function(a, b)
-        return (a.start_seconds or 0) < (b.start_seconds or 0)
-    end)
-    return intervals
-end
-
-function SUBFIX_AUDIO_ALIGN.speech_from_silence_intervals(intervals, duration_seconds)
-    local speech_segments = {}
-    local cursor = 0
-    duration_seconds = tonumber(duration_seconds) or 0
-    for _, interval in ipairs(intervals or {}) do
-        local silence_start = math.max(0, tonumber(interval.start_seconds) or 0)
-        local silence_end = math.max(silence_start, tonumber(interval.end_seconds) or silence_start)
-        if silence_start > cursor then
-            speech_segments[#speech_segments + 1] = {start_seconds = cursor, end_seconds = math.min(silence_start, duration_seconds)}
-        end
-        cursor = math.max(cursor, silence_end)
-    end
-    if duration_seconds > cursor then
-        speech_segments[#speech_segments + 1] = {start_seconds = cursor, end_seconds = duration_seconds}
-    end
-    return speech_segments
-end
-
-function SUBFIX_AUDIO_ALIGN.merge_speech_segments(segments, merge_gap_seconds, min_speech_seconds)
-    local merged = {}
-    merge_gap_seconds = tonumber(merge_gap_seconds) or SUBFIX_AUDIO_ALIGN.merge_gap_seconds
-    min_speech_seconds = tonumber(min_speech_seconds) or SUBFIX_AUDIO_ALIGN.min_speech_seconds
-
-    table.sort(segments or {}, function(a, b)
-        return (a.start_seconds or 0) < (b.start_seconds or 0)
-    end)
-
-    for _, segment in ipairs(segments or {}) do
-        local start_seconds = tonumber(segment.start_seconds) or 0
-        local end_seconds = tonumber(segment.end_seconds) or start_seconds
-        if end_seconds - start_seconds >= min_speech_seconds then
-            local last = merged[#merged]
-            if last and start_seconds - last.end_seconds <= merge_gap_seconds then
-                last.end_seconds = math.max(last.end_seconds, end_seconds)
-            else
-                merged[#merged + 1] = {start_seconds = start_seconds, end_seconds = end_seconds}
-            end
-        end
-    end
-
-    return merged
-end
-
 function SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
     local support_root = SUBFIX_AUDIO_ALIGN.resolve_support_root()
     local bundled = subfix_pjoin(support_root, ".subfix_support/bin/ffmpeg")
@@ -8925,488 +9244,6 @@ end
 
 function SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message(action)
     return "未找到内置 ffmpeg 或系统 ffmpeg；请重新安装/更新 SubFix 后重试，无法" .. tostring(action or "处理音频")
-end
-
-function SUBFIX_AUDIO_ALIGN.timeline_audio_mix_temp_dir()
-    local base_dir = current_backup_path ~= "" and current_backup_path or subfix_temp_dir()
-    ensure_backup_directory()
-    local dir_path = join_path(base_dir, "SubFix_TimelineAudio")
-    subfix_create_directory(dir_path)
-    return dir_path
-end
-
-function SUBFIX_AUDIO_ALIGN.find_rendered_timeline_audio_file(target_dir, custom_name)
-    local dir = tostring(target_dir or "")
-    local name = tostring(custom_name or "")
-    if dir == "" or name == "" then return nil end
-    local found = nil
-    if SUBFIX_IS_WINDOWS then
-        local cmd = string.format('dir /b /a-d %s 2>nul', shell_quote(subfix_pjoin(dir, name .. "*")))
-        local ok, output = run_shell_capture(cmd)
-        if ok then
-            for line in tostring(output or ""):gmatch("[^\r\n]+") do
-                local candidate = subfix_pjoin(dir, trim_text(line))
-                if SUBFIX_AUDIO_ALIGN.file_exists(candidate) then
-                    found = candidate
-                    break
-                end
-            end
-        end
-    else
-        local cmd = string.format(
-            "find %s -maxdepth 1 -type f -name %s -print 2>/dev/null | head -1",
-            shell_quote(dir),
-            shell_quote(name .. "*"))
-        local ok, output = run_shell_capture(cmd)
-        if ok then
-            local p = trim_text(output or "")
-            if p ~= "" and SUBFIX_AUDIO_ALIGN.file_exists(p) then
-                found = p
-            end
-        end
-    end
-    if found and SUBFIX_AUDIO_ALIGN.file_exists(found) then
-        return found
-    end
-    return nil
-end
-
-function SUBFIX_AUDIO_ALIGN.wait_for_timeline_render_job(project, job_id, options)
-    options = type(options) == "table" and options or {}
-    if not project or not job_id then
-        return false, "缺少渲染任务"
-    end
-
-    local start_ok, start_ret = pcall(function() return project:StartRendering({job_id}, false) end)
-    if not start_ok or start_ret == false then
-        start_ok, start_ret = pcall(function() return project:StartRendering({job_id}) end)
-    end
-    if not start_ok or start_ret == false then
-        return false, "无法启动时间线音频渲染: " .. tostring(start_ret)
-    end
-
-    local cancelled = false
-    local timer_id = "SubFixTimelineAudioRenderPoll_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
-    local poll_timer = ui and ui:Timer({
-        ID = timer_id,
-        Interval = tonumber(options.interval_ms) or 250,
-        SingleShot = false
-    }) or nil
-    local status_window = options.status_window
-    local started_at = tonumber(options.status_started_at) or os.time()
-    local last_status_second = -1
-
-    local function elapsed_text()
-        local elapsed = math.max(0, os.time() - started_at)
-        if elapsed >= 60 then
-            return string.format("%dm%02ds", math.floor(elapsed / 60), math.floor(elapsed % 60))
-        end
-        return string.format("%ds", math.floor(elapsed + 0.5))
-    end
-
-    local function is_rendering()
-        local ok_rendering, rendering = pcall(function() return project:IsRenderingInProgress() end)
-        return ok_rendering and rendering == true
-    end
-
-    local function stop_timer_and_loop()
-        if poll_timer then pcall(function() poll_timer:Stop() end) end
-        if ui_timer_handlers then ui_timer_handlers[timer_id] = nil end
-        if dispatcher and dispatcher.ExitLoop then
-            pcall(function() dispatcher:ExitLoop() end)
-        end
-    end
-
-    if poll_timer and dispatcher and dispatcher.RunLoop then
-        register_ui_timer(poll_timer, function()
-            local elapsed = math.max(0, os.time() - started_at)
-            if math.floor(elapsed) ~= last_status_second then
-                last_status_second = math.floor(elapsed)
-                update_shared_status(status_window, "口播一致性｜导出时间线音频｜用时 " .. elapsed_text())
-            end
-            if NORMALIZE_CANCEL_REQUESTED == true or is_normalize_progress_cancelled() then
-                cancelled = true
-                pcall(function() project:StopRendering() end)
-                stop_timer_and_loop()
-                return
-            end
-            if not is_rendering() then
-                stop_timer_and_loop()
-            end
-        end)
-        pcall(function() poll_timer:Start() end)
-        pcall(function() dispatcher:RunLoop() end)
-        stop_timer_and_loop()
-    else
-        while is_rendering() do
-            if NORMALIZE_CANCEL_REQUESTED == true or is_normalize_progress_cancelled() then
-                cancelled = true
-                pcall(function() project:StopRendering() end)
-                break
-            end
-            subfix_sleep(0.25)
-        end
-    end
-
-    if cancelled then
-        return false, "已取消", "cancelled"
-    end
-    return true
-end
-
-function SUBFIX_AUDIO_ALIGN.convert_rendered_audio_to_mono_wav(rendered_path, wav_path, options)
-    options = type(options) == "table" and options or {}
-    if not rendered_path or not SUBFIX_AUDIO_ALIGN.file_exists(rendered_path) then
-        return false, "时间线音频渲染文件不存在"
-    end
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return false, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("提取时间线混音")
-    end
-    local cmd = table.concat({
-        shell_quote(ffmpeg_path),
-        "-y", "-hide_banner", "-nostdin",
-        "-i", shell_quote(rendered_path),
-        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
-        shell_quote(wav_path)
-    }, " ")
-    local ok, output, status = run_subfix_background_command(cmd, {
-        status_window = options.status_window,
-        status_prefix = "口播一致性｜提取时间线混音",
-        status_started_at = options.status_started_at
-    })
-    if status == "cancelled" then
-        return false, "已取消", "cancelled"
-    end
-    if not ok or not SUBFIX_AUDIO_ALIGN.file_exists(wav_path) then
-        return false, "提取时间线混音失败: " .. tostring(output or "")
-    end
-    return true
-end
-
-function SUBFIX_AUDIO_ALIGN.render_timeline_audio_mix_for_speech_check(timeline, rows, fps, options)
-    options = type(options) == "table" and options or {}
-    if not timeline then return nil, "缺少时间线" end
-    local range_start, range_end = SUBFIX_AUDIO_ALIGN.get_rows_frame_range(rows)
-    if not range_start or not range_end or range_end <= range_start then
-        return nil, "缺少有效字幕时间范围"
-    end
-
-    local project = resolve and resolve:GetProjectManager() and resolve:GetProjectManager():GetCurrentProject()
-    if not project then
-        return nil, "无法获取当前 Resolve 项目"
-    end
-
-    local rate = math.max(1, tonumber(fps) or tonumber(current_fps) or 24)
-    local padding_seconds
-    if options.padding_seconds ~= nil then
-        padding_seconds = math.max(0, tonumber(options.padding_seconds) or 0)
-    else
-        padding_seconds = math.max(1, tonumber(PRE_DELIVERY_SPEECH_TIMELINE_EXPORT_PADDING_SECONDS) or 1.0)
-    end
-    local padding_frames = math.floor(padding_seconds * rate + 0.5)
-    local render_start = math.max(0, math.floor(range_start - padding_frames))
-    local render_end = math.floor(range_end + padding_frames)
-    local ok_tl_start, tl_start = pcall(function() return timeline:GetStartFrame() end)
-    if ok_tl_start and tonumber(tl_start) then
-        render_start = math.max(math.floor(tonumber(tl_start)), render_start)
-    end
-    if render_end <= render_start then
-        render_end = render_start + math.max(1, math.floor(rate + 0.5))
-    end
-
-    local target_dir = SUBFIX_AUDIO_ALIGN.timeline_audio_mix_temp_dir()
-    local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
-    local base_name = "SubFix_TimelineMix_" .. uid
-    local output_wav = join_path(target_dir, base_name .. "_mono.wav")
-    local mark_out = math.max(render_start, render_end - 1)
-
-    local attempts = {
-        {
-            suffix = "_wav",
-            settings = {
-                TargetDir = target_dir,
-                CustomName = base_name .. "_wav",
-                SelectAllFrames = false,
-                MarkIn = render_start,
-                MarkOut = mark_out,
-                IsExportVideo = false,
-                IsExportAudio = true,
-                Format = "wav",
-                VideoFormat = "wav",
-                AudioCodec = "Linear PCM",
-                AudioSampleRate = 48000,
-                AudioBitDepth = 24,
-                RenderMode = "Single clip"
-            }
-        },
-        {
-            suffix = "_qt",
-            settings = {
-                TargetDir = target_dir,
-                CustomName = base_name .. "_qt",
-                SelectAllFrames = false,
-                MarkIn = render_start,
-                MarkOut = mark_out,
-                IsExportVideo = true,
-                IsExportAudio = true,
-                VideoFormat = "QuickTime",
-                Format = "QuickTime",
-                VideoCodec = "H.264",
-                AudioCodec = "aac",
-                AudioSampleRate = 48000,
-                AudioBitDepth = 24,
-                FormatWidth = 640,
-                FormatHeight = 360,
-                RenderMode = "Single clip"
-            }
-        }
-    }
-
-    update_shared_status(options.status_window, "口播一致性｜导出时间线音频...")
-    local errors = {}
-    for _, attempt in ipairs(attempts) do
-        local custom_name = tostring(attempt.settings.CustomName or base_name)
-        local ok_settings, settings_ret = pcall(function() return project:SetRenderSettings(attempt.settings) end)
-        if not ok_settings or settings_ret == false then
-            errors[#errors + 1] = "SetRenderSettings(" .. custom_name .. ")=" .. tostring(settings_ret)
-        else
-            local ok_job, job_id = pcall(function() return project:AddRenderJob() end)
-            if not ok_job or not job_id or tostring(job_id) == "" then
-                errors[#errors + 1] = "AddRenderJob(" .. custom_name .. ")=" .. tostring(job_id)
-            else
-                LogMsg(string.format(
-                    "最终交付检查导出时间线混音: job=%s range=%s-%s target=%s custom=%s",
-                    tostring(job_id), tostring(render_start), tostring(mark_out), tostring(target_dir), custom_name
-                ))
-                local render_ok, render_err, render_status = SUBFIX_AUDIO_ALIGN.wait_for_timeline_render_job(project, job_id, {
-                    status_window = options.status_window,
-                    status_started_at = options.status_started_at
-                })
-                pcall(function() project:DeleteRenderJob(job_id) end)
-                if render_status == "cancelled" then
-                    return nil, "已取消", "cancelled"
-                end
-                if not render_ok then
-                    errors[#errors + 1] = tostring(render_err or "渲染失败")
-                else
-                    local rendered_path = SUBFIX_AUDIO_ALIGN.find_rendered_timeline_audio_file(target_dir, custom_name)
-                    if not rendered_path then
-                        errors[#errors + 1] = "未找到渲染输出: " .. custom_name
-                    else
-                        local convert_ok, convert_err, convert_status = SUBFIX_AUDIO_ALIGN.convert_rendered_audio_to_mono_wav(rendered_path, output_wav, {
-                            status_window = options.status_window,
-                            status_started_at = options.status_started_at
-                        })
-                        if convert_status == "cancelled" then
-                            return nil, "已取消", "cancelled"
-                        end
-                        if convert_ok then
-                            if os.getenv("SUBFIX_KEEP_TIMELINE_AUDIO") ~= "1" and rendered_path ~= output_wav then
-                                pcall(function() os.remove(rendered_path) end)
-                            end
-                            return {
-                                file_path = output_wav,
-                                file_name = SUBFIX_AUDIO_ALIGN.basename(output_wav),
-                                track_index = "mix",
-                                item_index = 1,
-                                start_frame = render_start,
-                                end_frame = render_end,
-                                source_offset_frames = 0,
-                                source_start_seconds = 0,
-                                source_end_seconds = (render_end - render_start) / rate,
-                                overlap_frames = render_end - render_start,
-                                timeline_audio_mix = true,
-                                rendered_path = rendered_path,
-                                render_start_frame = render_start,
-                                render_end_frame = render_end
-                            }
-                        end
-                        errors[#errors + 1] = tostring(convert_err or "提取混音失败")
-                    end
-                end
-            end
-        end
-    end
-
-    return nil, "无法导出时间线音频: " .. table.concat(errors, "；")
-end
-
-function SUBFIX_AUDIO_ALIGN.map_speech_segments_to_timeline(segments, audio_source, fps)
-    local mapped = {}
-    fps = tonumber(fps) or current_fps or 24
-    local source_start = tonumber(audio_source and audio_source.source_start_seconds) or 0
-    local source_end = tonumber(audio_source and audio_source.source_end_seconds) or source_start
-    local timeline_start = tonumber(audio_source and audio_source.start_frame) or 0
-    local timeline_end = tonumber(audio_source and audio_source.end_frame) or timeline_start
-
-    for _, segment in ipairs(segments or {}) do
-        local segment_start = math.max(tonumber(segment.start_seconds) or 0, source_start)
-        local segment_end = math.min(tonumber(segment.end_seconds) or segment_start, source_end)
-        if segment_end > segment_start then
-            local start_frame = timeline_start + math.floor(((segment_start - source_start) * fps) + 0.5)
-            local end_frame = timeline_start + math.floor(((segment_end - source_start) * fps) + 0.5)
-            start_frame = math.max(timeline_start, math.min(start_frame, timeline_end))
-            end_frame = math.max(start_frame + 1, math.min(end_frame, timeline_end))
-            mapped[#mapped + 1] = {
-                start_frame = start_frame,
-                end_frame = end_frame,
-                start_seconds = segment_start,
-                end_seconds = segment_end
-            }
-        end
-    end
-
-    table.sort(mapped, function(a, b)
-        return (a.start_frame or 0) < (b.start_frame or 0)
-    end)
-    return mapped
-end
-
-function SUBFIX_AUDIO_ALIGN.map_speech_segments_to_timeline_fallback(segments, audio_source, fps)
-    local mapped = {}
-    fps = tonumber(fps) or current_fps or 24
-    local timeline_start = tonumber(audio_source and audio_source.start_frame) or 0
-    local timeline_end = tonumber(audio_source and audio_source.end_frame) or timeline_start
-
-    for _, segment in ipairs(segments or {}) do
-        local segment_start_seconds = math.max(0, tonumber(segment.start_seconds) or 0)
-        local segment_end_seconds = math.max(segment_start_seconds, tonumber(segment.end_seconds) or segment_start_seconds)
-        local start_frame = timeline_start + math.floor(segment_start_seconds * fps + 0.5)
-        local end_frame = timeline_start + math.floor(segment_end_seconds * fps + 0.5)
-        if start_frame < timeline_end and end_frame > timeline_start then
-            start_frame = math.max(timeline_start, math.min(start_frame, timeline_end))
-            end_frame = math.max(start_frame + 1, math.min(end_frame, timeline_end))
-            mapped[#mapped + 1] = {
-                start_frame = start_frame,
-                end_frame = end_frame,
-                start_seconds = segment_start_seconds,
-                end_seconds = segment_end_seconds,
-                fallback = true
-            }
-        end
-    end
-
-    table.sort(mapped, function(a, b)
-        return (a.start_frame or 0) < (b.start_frame or 0)
-    end)
-    return mapped
-end
-
-function SUBFIX_AUDIO_ALIGN.format_detection_diagnostic(audio_source, duration_seconds, silence_count, raw_count, merged_count, mapped_count, mapping_mode)
-    return string.format(
-        "audio=%s A%d item=%d timeline=%s-%s source=%.3f-%.3f duration=%.3f silence=%d raw=%d merged=%d mapped=%d mode=%s",
-        tostring(audio_source and audio_source.file_name or ""),
-        tonumber(audio_source and audio_source.track_index) or 0,
-        tonumber(audio_source and audio_source.item_index) or 0,
-        tostring(audio_source and audio_source.start_frame or ""),
-        tostring(audio_source and audio_source.end_frame or ""),
-        tonumber(audio_source and audio_source.source_start_seconds) or 0,
-        tonumber(audio_source and audio_source.source_end_seconds) or 0,
-        tonumber(duration_seconds) or 0,
-        tonumber(silence_count) or 0,
-        tonumber(raw_count) or 0,
-        tonumber(merged_count) or 0,
-        tonumber(mapped_count) or 0,
-        tostring(mapping_mode or "")
-    )
-end
-
-function SUBFIX_AUDIO_ALIGN.detect_speech_segments(audio_source, fps)
-    if not audio_source or not audio_source.file_path then
-        return nil, "缺少音频源"
-    end
-
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return nil, "未找到 ffmpeg，无法分析音频"
-    end
-
-    local function run_silence_detect(filter_value)
-        local cmd = table.concat({
-            shell_quote(ffmpeg_path),
-            "-hide_banner -nostdin -i",
-            shell_quote(audio_source.file_path),
-            "-af",
-            shell_quote(filter_value),
-            "-f null -"
-        }, " ")
-        return run_shell_capture(cmd)
-    end
-
-    local filter = SUBFIX_AUDIO_ALIGN.silence_filter or "silencedetect=noise=-35dB:d=0.08"
-    local ok, output = run_silence_detect(filter)
-    if not ok then
-        return nil, "ffmpeg 分析失败: " .. tostring(output or "")
-    end
-
-    local duration_seconds = SUBFIX_AUDIO_ALIGN.parse_ffmpeg_duration(output)
-    if not duration_seconds or duration_seconds <= 0 then
-        return nil, "无法读取音频时长"
-    end
-
-    local silence_intervals = SUBFIX_AUDIO_ALIGN.parse_silence_intervals(output, duration_seconds)
-    local raw_segments = SUBFIX_AUDIO_ALIGN.speech_from_silence_intervals(silence_intervals, duration_seconds)
-    local merged_segments = SUBFIX_AUDIO_ALIGN.merge_speech_segments(
-        raw_segments,
-        SUBFIX_AUDIO_ALIGN.merge_gap_seconds,
-        SUBFIX_AUDIO_ALIGN.min_speech_seconds
-    )
-    local filter_used = filter
-    if #merged_segments == 0 and SUBFIX_AUDIO_ALIGN.silence_filter_retry then
-        local retry_filter = SUBFIX_AUDIO_ALIGN.silence_filter_retry
-        local retry_ok, retry_output = run_silence_detect(retry_filter)
-        local retry_duration = retry_ok and SUBFIX_AUDIO_ALIGN.parse_ffmpeg_duration(retry_output) or nil
-        if retry_ok and retry_duration and retry_duration > 0 then
-            local retry_silence_intervals = SUBFIX_AUDIO_ALIGN.parse_silence_intervals(retry_output, retry_duration)
-            local retry_raw_segments = SUBFIX_AUDIO_ALIGN.speech_from_silence_intervals(retry_silence_intervals, retry_duration)
-            local retry_merged_segments = SUBFIX_AUDIO_ALIGN.merge_speech_segments(
-                retry_raw_segments,
-                SUBFIX_AUDIO_ALIGN.merge_gap_seconds,
-                SUBFIX_AUDIO_ALIGN.min_speech_seconds
-            )
-            if #retry_merged_segments > 0 then
-                duration_seconds = retry_duration
-                silence_intervals = retry_silence_intervals
-                raw_segments = retry_raw_segments
-                merged_segments = retry_merged_segments
-                filter_used = retry_filter
-            end
-        end
-    end
-    local timeline_segments = SUBFIX_AUDIO_ALIGN.map_speech_segments_to_timeline(merged_segments, audio_source, fps)
-    local mapping_mode = "source_time"
-    if #timeline_segments == 0 then
-        timeline_segments = SUBFIX_AUDIO_ALIGN.map_speech_segments_to_timeline_fallback(merged_segments, audio_source, fps)
-        mapping_mode = "item_start_fallback"
-    end
-    local diagnostic = SUBFIX_AUDIO_ALIGN.format_detection_diagnostic(
-        audio_source,
-        duration_seconds,
-        #silence_intervals,
-        #raw_segments,
-        #merged_segments,
-        #timeline_segments,
-        mapping_mode .. " filter=" .. tostring(filter_used)
-    )
-    LogMsg("自动对齐音频检测诊断: " .. diagnostic)
-    if #timeline_segments == 0 then
-        return nil, "未检测到可用发声段；" .. diagnostic
-    end
-
-    return {
-        rows = timeline_segments,
-        audio_source = audio_source,
-        ffmpeg_path = ffmpeg_path,
-        duration_seconds = duration_seconds,
-        silence_count = #silence_intervals,
-        raw_speech_count = #raw_segments,
-        merged_speech_count = #merged_segments,
-        speech_segment_count = #timeline_segments,
-        mapping_mode = mapping_mode,
-        filter_used = filter_used,
-        diagnostic = diagnostic
-    }
 end
 
 function SUBFIX_AUDIO_ALIGN.get_script_dir()
@@ -9541,379 +9378,10 @@ function SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
     return base_dir .. "/SubFix_ASR_" .. uid .. ".json"
 end
 
-function SUBFIX_AUDIO_ALIGN.run_asr_alignment(audio_source, fps, options)
-    options = type(options) == "table" and options or {}
-    if not audio_source or not audio_source.file_path then
-        return nil, "缺少音频源"
-    end
-
-    local paths = SUBFIX_AUDIO_ALIGN.get_asr_paths()
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.helper) then
-        return nil, "缺少 ASR helper: " .. tostring(paths.helper)
-    end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "ASR 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
-    end
-
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return nil, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频")
-    end
-
-    ensure_backup_directory()
-    local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local progress_path = output_path .. ".progress.json"
-    LogMsg("ASR helper ffmpeg: " .. tostring(ffmpeg_path))
-    local cmd_parts = {
-        shell_quote(paths.python),
-        shell_quote(paths.helper),
-        "--mode", "transcribe",
-        "--backend", shell_quote(SUBFIX_AUDIO_ALIGN.default_transcribe_backend),
-        "--audio", shell_quote(audio_source.file_path),
-        "--output", shell_quote(output_path),
-        "--model", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_model),
-        "--language", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_language),
-        "--ffmpeg", shell_quote(ffmpeg_path),
-        "--progress-json", shell_quote(progress_path),
-        "--source-start", shell_quote(string.format("%.3f", tonumber(audio_source.source_start_seconds) or 0))
-    }
-	    if tonumber(audio_source.source_end_seconds) and tonumber(audio_source.source_end_seconds) > (tonumber(audio_source.source_start_seconds) or 0) then
-	        cmd_parts[#cmd_parts + 1] = "--source-end"
-	        cmd_parts[#cmd_parts + 1] = shell_quote(string.format("%.3f", tonumber(audio_source.source_end_seconds)))
-	    end
-	    SUBFIX_AUDIO_ALIGN.append_audio_channel_arg(cmd_parts, audio_source)
-
-	    local ok, output, status = run_subfix_background_command(table.concat(cmd_parts, " "), {
-        progress = true,
-        progress_path = progress_path,
-        label = tostring(options.progress_label or "终检口播一致性"),
-        batch_index = tonumber(options.batch_index) or 0,
-        total_batches = tonumber(options.total_batches) or 0,
-        status_window = options.status_window,
-        status_prefix = options.status_prefix,
-        status_started_at = options.status_started_at
-    })
-    if status == "cancelled" then
-        return nil, "已取消", "cancelled"
-    end
-    local payload_text = read_text_file(output_path)
-    local payload, decode_err = decode_json_text(payload_text or "")
-    if not payload then
-        return nil, "ASR 输出解析失败: " .. tostring(decode_err or output)
-    end
-    LogMsg("ASR helper version: " .. tostring(payload.helper_version or "unknown"))
-    if payload.ok == false then
-        local payload_error = tostring(payload.error or output or "ASR 执行失败")
-        if payload_error:find("No such file or directory", 1, true) and payload_error:find("ffmpeg", 1, true) then
-            payload_error = payload_error .. "；当前仍像是在运行旧 ASR helper 或旧 SubFix 脚本，请重启 Resolve 或重新加载脚本。"
-        end
-        return nil, payload_error
-    end
-    if not ok then
-        return nil, "ASR 执行失败: " .. tostring(output or "")
-    end
-
-    local rows = {}
-    local speech_backend = tostring(payload.backend or (payload.diagnostic and payload.diagnostic.backend) or SUBFIX_AUDIO_ALIGN.default_transcribe_backend)
-    local speech_model = tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_asr_model)
-    LogMsg("ASR backend: " .. speech_backend .. " model=" .. speech_model)
-    for index, segment in ipairs(payload.segments or {}) do
-        local start_seconds = tonumber(segment.start) or 0
-        local end_seconds = tonumber(segment["end"]) or start_seconds
-        if end_seconds > start_seconds then
-            local words = {}
-            for _, word in ipairs(segment.words or {}) do
-                local word_start_seconds = tonumber(word.start) or start_seconds
-                local word_end_seconds = tonumber(word["end"]) or word_start_seconds
-                if word_end_seconds > word_start_seconds then
-                    words[#words + 1] = {
-                        text = tostring(word.word or word.text or ""),
-                        start_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(word_start_seconds * (tonumber(fps) or current_fps or 24) + 0.5),
-                        end_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(word_end_seconds * (tonumber(fps) or current_fps or 24) + 0.5)
-                    }
-                end
-            end
-            rows[#rows + 1] = {
-                index = index,
-                start_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(start_seconds * (tonumber(fps) or current_fps or 24) + 0.5),
-                end_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(end_seconds * (tonumber(fps) or current_fps or 24) + 0.5),
-                text = tostring(segment.text or ""),
-                words = words,
-                fps = fps
-            }
-        end
-    end
-
-    local payload_text_only = trim_text(payload.text or "")
-    if #rows == 0 and payload_text_only ~= "" then
-        local audio_start_frame = tonumber(audio_source.start_frame) or 0
-        local audio_end_frame = tonumber(audio_source.end_frame) or audio_start_frame + math.max(1, math.floor(((tonumber(audio_source.source_end_seconds) or 0) - (tonumber(audio_source.source_start_seconds) or 0)) * (tonumber(fps) or current_fps or 24) + 0.5))
-        if audio_end_frame <= audio_start_frame then
-            audio_end_frame = audio_start_frame + 1
-        end
-        rows[#rows + 1] = {
-            index = 1,
-            start_frame = audio_start_frame,
-            end_frame = audio_end_frame,
-            text = payload_text_only,
-            words = {},
-            fps = fps
-        }
-    end
-
-    local speech_onsets = {}
-    for _, onset_seconds in ipairs(payload.speech_onsets or {}) do
-        local seconds = tonumber(onset_seconds)
-        if seconds then
-            speech_onsets[#speech_onsets + 1] = (tonumber(audio_source.start_frame) or 0) + math.floor(seconds * (tonumber(fps) or current_fps or 24) + 0.5)
-        end
-    end
-    table.sort(speech_onsets)
-
-    local speech_regions = {}
-    for _, region in ipairs(payload.speech_regions or {}) do
-        local start_seconds = tonumber(region.start)
-        local end_seconds = tonumber(region["end"])
-        if start_seconds and end_seconds and end_seconds > start_seconds then
-            speech_regions[#speech_regions + 1] = {
-                start_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(start_seconds * (tonumber(fps) or current_fps or 24) + 0.5),
-                end_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(end_seconds * (tonumber(fps) or current_fps or 24) + 0.5)
-            }
-        end
-    end
-    sort_rows_by_timing(speech_regions)
-
-    sort_rows_by_timing(rows)
-    local empty_reason = nil
-    if #rows == 0 and #speech_onsets == 0 then
-        local helper_diag = payload.diagnostic or {}
-        local diagnostic = string.format(
-            "helper=%s mode=%s ffmpeg=%s source=%.3f-%.3f bytes=%s raw=%s normalized=%s text_len=%s",
-            tostring(payload.helper_version or "unknown"),
-            tostring(helper_diag.mode or ""),
-            tostring(helper_diag.ffmpeg or helper_diag.requested_ffmpeg or ""),
-            tonumber(helper_diag.source_start) or 0,
-            tonumber(helper_diag.source_end) or 0,
-            tostring(helper_diag.cut_audio_bytes or ""),
-            tostring(helper_diag.raw_segment_count or ""),
-            tostring(helper_diag.segment_count or ""),
-            tostring(helper_diag.text_length or "")
-        )
-        LogMsg("ASR 未返回可用时间戳且未检测到本地音频起点；诊断: " .. tostring(diagnostic))
-        empty_reason = "empty_asr"
-    end
-
-    return {
-        rows = rows,
-        audio_source = audio_source,
-        model = speech_model,
-        backend = speech_backend,
-        speech_onsets = speech_onsets,
-        speech_regions = speech_regions,
-        speech_segment_count = #rows,
-        mapping_mode = (#rows > 0) and "local_onset_asr_assisted" or "empty_asr",
-        empty_reason = (#rows == 0 and #speech_onsets == 0) and "empty_asr" or empty_reason,
-        diagnostic = "asr_segments=" .. tostring(#rows) .. " onsets=" .. tostring(#speech_onsets) .. " speech_backend=" .. speech_backend .. " speech_model=" .. speech_model
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.asr_payload_to_review_info(payload, audio_source, fps)
-    payload = type(payload) == "table" and payload or {}
-    audio_source = type(audio_source) == "table" and audio_source or {}
-    local rate = tonumber(fps) or current_fps or 24
-    local rows = {}
-    for index, segment in ipairs(payload.segments or {}) do
-        local start_seconds = tonumber(segment.start) or 0
-        local end_seconds = tonumber(segment["end"]) or start_seconds
-        if end_seconds > start_seconds then
-            rows[#rows + 1] = {
-                index = index,
-                start_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(start_seconds * rate + 0.5),
-                end_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(end_seconds * rate + 0.5),
-                text = tostring(segment.text or ""),
-                words = {},
-                fps = fps
-            }
-        end
-    end
-
-    local payload_text_only = trim_text(payload.text or "")
-    if #rows == 0 and payload_text_only ~= "" then
-        local audio_start_frame = tonumber(audio_source.start_frame) or 0
-        local audio_end_frame = tonumber(audio_source.end_frame) or audio_start_frame + 1
-        rows[#rows + 1] = {
-            index = 1,
-            start_frame = audio_start_frame,
-            end_frame = audio_end_frame,
-            text = payload_text_only,
-            words = {},
-            fps = fps
-        }
-    end
-
-    local speech_onsets = {}
-    for _, onset_seconds in ipairs(payload.speech_onsets or {}) do
-        local seconds = tonumber(onset_seconds)
-        if seconds then
-            speech_onsets[#speech_onsets + 1] = (tonumber(audio_source.start_frame) or 0) + math.floor(seconds * rate + 0.5)
-        end
-    end
-    table.sort(speech_onsets)
-
-    local speech_regions = {}
-    for _, region in ipairs(payload.speech_regions or {}) do
-        local start_seconds = tonumber(region.start)
-        local end_seconds = tonumber(region["end"])
-        if start_seconds and end_seconds and end_seconds > start_seconds then
-            speech_regions[#speech_regions + 1] = {
-                start_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(start_seconds * rate + 0.5),
-                end_frame = (tonumber(audio_source.start_frame) or 0) + math.floor(end_seconds * rate + 0.5)
-            }
-        end
-    end
-    sort_rows_by_timing(speech_regions)
-    sort_rows_by_timing(rows)
-
-    local speech_backend = tostring(payload.backend or SUBFIX_AUDIO_ALIGN.default_transcribe_backend)
-    local speech_model = tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_asr_model)
-    return {
-        rows = rows,
-        audio_source = audio_source,
-        model = speech_model,
-        backend = speech_backend,
-        speech_onsets = speech_onsets,
-        speech_regions = speech_regions,
-        speech_segment_count = #rows,
-        mapping_mode = (#rows > 0) and "local_onset_asr_assisted" or "empty_asr",
-        empty_reason = (#rows == 0 and #speech_onsets == 0) and "empty_asr" or nil,
-        text = payload_text_only,
-        diagnostic = "asr_segments=" .. tostring(#rows) .. " onsets=" .. tostring(#speech_onsets) .. " speech_backend=" .. speech_backend .. " speech_model=" .. speech_model
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.run_asr_review_windows(review_windows, fps, options)
-    options = type(options) == "table" and options or {}
-    if type(review_windows) ~= "table" or #review_windows == 0 then
-        return {}
-    end
-    local first_audio_source = review_windows[1] and review_windows[1].audio_source or nil
-    if not first_audio_source or not first_audio_source.file_path then
-        return nil, "缺少音频源"
-    end
-
-    local paths = SUBFIX_AUDIO_ALIGN.get_asr_paths()
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.helper) then
-        return nil, "缺少 ASR helper: " .. tostring(paths.helper)
-    end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "ASR 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
-    end
-
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return nil, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频")
-    end
-
-    ensure_backup_directory()
-    local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local progress_path = output_path .. ".progress.json"
-    local windows_path = SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
-    local write_ok, write_err = SUBFIX_AUDIO_ALIGN.write_asr_review_windows_json(windows_path, review_windows)
-    if not write_ok then
-        return nil, write_err
-    end
-
-    LogMsg("ASR batch helper ffmpeg: " .. tostring(ffmpeg_path) .. " windows=" .. tostring(#review_windows))
-    local cmd_parts = {
-        shell_quote(paths.python),
-        shell_quote(paths.helper),
-        "--mode", "transcribe",
-        "--backend", shell_quote(SUBFIX_AUDIO_ALIGN.default_transcribe_backend),
-        "--audio", shell_quote(first_audio_source.file_path),
-        "--output", shell_quote(output_path),
-        "--model", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_model),
-        "--language", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_language),
-        "--ffmpeg", shell_quote(ffmpeg_path),
-        "--progress-json", shell_quote(progress_path),
-        "--windows-json", shell_quote(windows_path)
-    }
-    local ok, output, status = run_subfix_background_command(table.concat(cmd_parts, " "), {
-        progress = true,
-        progress_path = progress_path,
-        label = tostring(options.progress_label or "终检口播一致性"),
-        batch_index = tonumber(options.batch_index) or 0,
-        total_batches = tonumber(options.total_batches) or 0,
-        status_window = options.status_window,
-        status_prefix = options.status_prefix,
-        status_started_at = options.status_started_at
-    })
-    if status == "cancelled" then
-        return nil, "已取消", "cancelled"
-    end
-    local payload_text = read_text_file(output_path)
-    local payload, decode_err = decode_json_text(payload_text or "")
-    if not payload then
-        return nil, "ASR 批量输出解析失败: " .. tostring(decode_err or output)
-    end
-    if payload.ok == false then
-        return nil, tostring(payload.error or output or "ASR 批量执行失败")
-    end
-    if not ok then
-        return nil, "ASR 批量执行失败: " .. tostring(output or "")
-    end
-
-    local window_by_id = {}
-    for _, review_window in ipairs(review_windows or {}) do
-        window_by_id[tostring(review_window.window_id or "")] = review_window
-    end
-    local results = {}
-    for _, window_payload in ipairs(payload.windows or {}) do
-        local window_id = tostring(window_payload.window_id or "")
-        local review_window = window_by_id[window_id]
-        if window_payload.ok == false then
-            results[window_id] = { ok = false, error = tostring(window_payload.error or "局部 ASR 转写失败") }
-        elseif review_window then
-            results[window_id] = {
-                ok = true,
-                info = SUBFIX_AUDIO_ALIGN.asr_payload_to_review_info(window_payload, review_window.audio_source, fps)
-            }
-        end
-    end
-    return results
-end
-
 function SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
     local base_dir = current_backup_path ~= "" and current_backup_path or subfix_temp_dir()
     local uid = tostring(os.time()) .. "_" .. tostring(math.floor(os.clock() * 1000))
     return base_dir .. "/SubFix_AlignRows_" .. uid .. ".json"
-end
-
-function SUBFIX_AUDIO_ALIGN.write_alignment_rows_json(path, rows, fps)
-    local payload = { rows = {}, fps = tonumber(fps) or current_fps or 24 }
-    for index, row in ipairs(rows or {}) do
-        payload.rows[#payload.rows + 1] = {
-            index = tonumber(row.index) or index,
-            text = tostring(row.text or ""),
-            start_frame = tonumber(row.start_frame) or 0,
-            end_frame = tonumber(row.end_frame) or ((tonumber(row.start_frame) or 0) + 1)
-        }
-    end
-
-    local file = io.open(path, "w")
-    if not file then
-        return false, "无法写入 stable-ts 字幕输入: " .. tostring(path)
-    end
-    file:write(json_encode_value(payload))
-	file:close()
-	return true
-end
-
-function SUBFIX_AUDIO_ALIGN.append_audio_channel_arg(cmd_parts, audio_source)
-    local audio_channel_index = tonumber(audio_source and audio_source.audio_channel_index)
-    if audio_channel_index and audio_channel_index > 0 then
-        cmd_parts[#cmd_parts + 1] = "--audio-channel-index"
-        cmd_parts[#cmd_parts + 1] = shell_quote(tostring(math.floor(audio_channel_index)))
-    end
 end
 
 function SUBFIX_AUDIO_ALIGN.write_ctc_batch_plan_json(path, batch_plan, fps)
@@ -9950,475 +9418,6 @@ function SUBFIX_AUDIO_ALIGN.write_ctc_batch_plan_json(path, batch_plan, fps)
     file:write(json_encode_value(payload))
     file:close()
     return true
-end
-
-function SUBFIX_AUDIO_ALIGN.write_asr_review_windows_json(path, review_windows)
-    local payload = { windows = {} }
-    for index, review_window in ipairs(review_windows or {}) do
-        local audio_source = review_window and review_window.audio_source or {}
-        local window_id = tostring(review_window.window_id or index)
-        review_window.window_id = window_id
-        payload.windows[#payload.windows + 1] = {
-            window_id = window_id,
-            review_type = tostring(review_window.review_type or ""),
-            row_label = tostring(review_window.row_label or ""),
-            source_start = tonumber(audio_source.source_start_seconds) or 0,
-            source_end = tonumber(audio_source.source_end_seconds),
-            audio_channel_index = tonumber(audio_source.audio_channel_index)
-        }
-    end
-
-    local file = io.open(path, "w")
-    if not file then
-        return false, "无法写入 ASR 局部窗口输入: " .. tostring(path)
-    end
-    file:write(json_encode_value(payload))
-    file:close()
-    return true
-end
-
-function SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment(audio_source, source_rows, fps)
-    if not audio_source or not audio_source.file_path then
-        return nil, "缺少音频源"
-    end
-    if not source_rows or #source_rows == 0 then
-        return nil, "缺少字幕文本"
-    end
-
-    local paths = SUBFIX_AUDIO_ALIGN.get_asr_paths()
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.helper) then
-        return nil, "缺少 stable-ts helper: " .. tostring(paths.helper)
-    end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "stable-ts 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
-    end
-
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return nil, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频")
-    end
-
-    ensure_backup_directory()
-    local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local rows_path = SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
-    local rows_ok, rows_err = SUBFIX_AUDIO_ALIGN.write_alignment_rows_json(rows_path, source_rows, fps)
-    if not rows_ok then
-        return nil, rows_err
-    end
-
-    LogMsg("stable-ts helper ffmpeg: " .. tostring(ffmpeg_path))
-    local cmd_parts = {
-        shell_quote(paths.python),
-        shell_quote(paths.helper),
-        "--mode", "align",
-        "--audio", shell_quote(audio_source.file_path),
-        "--output", shell_quote(output_path),
-        "--model", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_model),
-        "--language", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_language),
-        "--ffmpeg", shell_quote(ffmpeg_path),
-        "--rows-json", shell_quote(rows_path),
-        "--fps", shell_quote(string.format("%.6f", tonumber(fps) or current_fps or 24)),
-        "--timeline-start-frame", shell_quote(tostring(math.floor(tonumber(audio_source.start_frame) or 0))),
-        "--source-start", shell_quote(string.format("%.3f", tonumber(audio_source.source_start_seconds) or 0))
-    }
-	    if tonumber(audio_source.source_end_seconds) and tonumber(audio_source.source_end_seconds) > (tonumber(audio_source.source_start_seconds) or 0) then
-	        cmd_parts[#cmd_parts + 1] = "--source-end"
-	        cmd_parts[#cmd_parts + 1] = shell_quote(string.format("%.3f", tonumber(audio_source.source_end_seconds)))
-	    end
-	    SUBFIX_AUDIO_ALIGN.append_audio_channel_arg(cmd_parts, audio_source)
-
-	    local ok, output = run_shell_capture(table.concat(cmd_parts, " "))
-    local payload_text = read_text_file(output_path)
-    local payload, decode_err = decode_json_text(payload_text or "")
-    if not payload then
-        return nil, "stable-ts 输出解析失败: " .. tostring(decode_err or output)
-    end
-    LogMsg("stable-ts helper version: " .. tostring(payload.helper_version or "unknown"))
-    if payload.ok == false then
-        return nil, tostring(payload.error or output or "stable-ts 对齐失败")
-    end
-    if not ok then
-        return nil, "stable-ts 执行失败: " .. tostring(output or "")
-    end
-
-    local aligned_rows = payload.aligned_rows or {}
-    if #aligned_rows ~= #source_rows then
-        return nil, string.format("stable-ts 分段数量不匹配: 字幕 %d 条，对齐结果 %d 段", #source_rows, #aligned_rows)
-    end
-
-    local previous_start = nil
-    for index, row in ipairs(aligned_rows) do
-        local start_frame = tonumber(row.start_frame)
-        local end_frame = tonumber(row.end_frame)
-        if not start_frame or not end_frame or end_frame <= start_frame then
-            return nil, "stable-ts 返回空时间段: #" .. tostring(index)
-        end
-        if previous_start and start_frame < previous_start then
-            return nil, "stable-ts 返回非单调时间: #" .. tostring(index)
-        end
-        previous_start = start_frame
-    end
-
-    local diagnostic = payload.diagnostic or {}
-    return {
-        rows = aligned_rows,
-        audio_source = audio_source,
-        model = tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_asr_model),
-        local_onset_frames = SUBFIX_AUDIO_ALIGN.map_stable_ts_onsets_to_frames(payload.speech_onsets, audio_source, fps),
-        speech_segment_count = #aligned_rows,
-        mapping_mode = "stable_ts_forced_alignment",
-        diagnostic = "stable_ts_segments=" .. tostring(#aligned_rows) ..
-            " model=" .. tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_asr_model) ..
-            " helper_mode=" .. tostring(diagnostic.mode or "")
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.run_text_alignment(audio_source, source_rows, fps)
-    if not audio_source or not audio_source.file_path then
-        return nil, "缺少音频源"
-    end
-    if not source_rows or #source_rows == 0 then
-        return nil, "缺少字幕文本"
-    end
-
-    local paths = SUBFIX_AUDIO_ALIGN.get_asr_paths()
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.helper) then
-        return nil, "缺少 stable-ts helper: " .. tostring(paths.helper)
-    end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "stable-ts 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
-    end
-
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return nil, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频")
-    end
-
-    ensure_backup_directory()
-    local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local rows_path = SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
-    local rows_ok, rows_err = SUBFIX_AUDIO_ALIGN.write_alignment_rows_json(rows_path, source_rows, fps)
-    if not rows_ok then
-        return nil, rows_err
-    end
-
-    LogMsg("stable-ts align_text helper ffmpeg: " .. tostring(ffmpeg_path))
-    local cmd_parts = {
-        shell_quote(paths.python),
-        shell_quote(paths.helper),
-        "--mode", "align_text",
-        "--audio", shell_quote(audio_source.file_path),
-        "--output", shell_quote(output_path),
-        "--model", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_model),
-        "--language", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_language),
-        "--ffmpeg", shell_quote(ffmpeg_path),
-        "--rows-json", shell_quote(rows_path),
-        "--fps", shell_quote(string.format("%.6f", tonumber(fps) or current_fps or 24)),
-        "--timeline-start-frame", shell_quote(tostring(math.floor(tonumber(audio_source.start_frame) or 0))),
-        "--source-start", shell_quote(string.format("%.3f", tonumber(audio_source.source_start_seconds) or 0))
-    }
-	    if tonumber(audio_source.source_end_seconds) and tonumber(audio_source.source_end_seconds) > (tonumber(audio_source.source_start_seconds) or 0) then
-	        cmd_parts[#cmd_parts + 1] = "--source-end"
-	        cmd_parts[#cmd_parts + 1] = shell_quote(string.format("%.3f", tonumber(audio_source.source_end_seconds)))
-	    end
-	    SUBFIX_AUDIO_ALIGN.append_audio_channel_arg(cmd_parts, audio_source)
-
-	    local ok, output = run_shell_capture(table.concat(cmd_parts, " "))
-    local payload_text = read_text_file(output_path)
-    local payload, decode_err = decode_json_text(payload_text or "")
-    if not payload then
-        return nil, "stable-ts 文本对齐输出解析失败: " .. tostring(decode_err or output)
-    end
-    LogMsg("stable-ts align_text helper version: " .. tostring(payload.helper_version or "unknown"))
-    if payload.ok == false then
-        return nil, tostring(payload.error or output or "stable-ts 文本对齐失败")
-    end
-    if not ok then
-        return nil, "stable-ts 文本对齐执行失败: " .. tostring(output or "")
-    end
-
-    local aligned_rows = payload.aligned_rows or {}
-    if #aligned_rows ~= #source_rows then
-        return nil, string.format("stable-ts 文本对齐分段数量不匹配: 字幕 %d 条，对齐结果 %d 段", #source_rows, #aligned_rows)
-    end
-
-    for index, row in ipairs(aligned_rows) do
-        local start_frame = tonumber(row.start_frame)
-        local end_frame = tonumber(row.end_frame)
-        if not start_frame or not end_frame or end_frame <= start_frame then
-            return nil, "stable-ts 文本对齐返回空时间段: #" .. tostring(index)
-        end
-    end
-
-    local diagnostic = payload.diagnostic or {}
-    return {
-        rows = aligned_rows,
-        audio_source = audio_source,
-        model = tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_asr_model),
-        local_onset_frames = SUBFIX_AUDIO_ALIGN.map_stable_ts_onsets_to_frames(payload.speech_onsets, audio_source, fps),
-        speech_segment_count = #aligned_rows,
-        mapping_mode = "stable_ts_text_alignment",
-        diagnostic = "stable_ts_text_segments=" .. tostring(#aligned_rows) ..
-            " model=" .. tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_asr_model) ..
-            " helper_mode=" .. tostring(diagnostic.mode or "")
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.run_whisperx_text_alignment(audio_source, source_rows, fps)
-    if not audio_source or not audio_source.file_path then
-        return nil, "缺少音频源"
-    end
-    if not source_rows or #source_rows == 0 then
-        return nil, "缺少字幕文本"
-    end
-
-    local paths = SUBFIX_AUDIO_ALIGN.get_asr_paths()
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.helper) then
-        return nil, "缺少 WhisperX helper: " .. tostring(paths.helper)
-    end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "WhisperX 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
-    end
-
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return nil, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频")
-    end
-
-    ensure_backup_directory()
-    local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local rows_path = SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
-    local rows_ok, rows_err = SUBFIX_AUDIO_ALIGN.write_alignment_rows_json(rows_path, source_rows, fps)
-    if not rows_ok then
-        return nil, rows_err
-    end
-
-    LogMsg("WhisperX align_text helper ffmpeg: " .. tostring(ffmpeg_path))
-    local cmd_parts = {
-        shell_quote(paths.python),
-        shell_quote(paths.helper),
-        "--mode", "whisperx_align_text",
-        "--audio", shell_quote(audio_source.file_path),
-        "--output", shell_quote(output_path),
-        "--model", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_model),
-        "--language", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_language),
-        "--ffmpeg", shell_quote(ffmpeg_path),
-        "--rows-json", shell_quote(rows_path),
-        "--fps", shell_quote(string.format("%.6f", tonumber(fps) or current_fps or 24)),
-        "--timeline-start-frame", shell_quote(tostring(math.floor(tonumber(audio_source.start_frame) or 0))),
-        "--source-start", shell_quote(string.format("%.3f", tonumber(audio_source.source_start_seconds) or 0))
-    }
-	    if tonumber(audio_source.source_end_seconds) and tonumber(audio_source.source_end_seconds) > (tonumber(audio_source.source_start_seconds) or 0) then
-	        cmd_parts[#cmd_parts + 1] = "--source-end"
-	        cmd_parts[#cmd_parts + 1] = shell_quote(string.format("%.3f", tonumber(audio_source.source_end_seconds)))
-	    end
-	    SUBFIX_AUDIO_ALIGN.append_audio_channel_arg(cmd_parts, audio_source)
-
-	    local ok, output = run_shell_capture(table.concat(cmd_parts, " "))
-    local payload_text = read_text_file(output_path)
-    local payload, decode_err = decode_json_text(payload_text or "")
-    if not payload then
-        return nil, "WhisperX 文本对齐输出解析失败: " .. tostring(decode_err or output)
-    end
-    LogMsg("WhisperX align_text helper version: " .. tostring(payload.helper_version or "unknown"))
-    if payload.ok == false then
-        return nil, tostring(payload.error or output or "WhisperX 文本对齐失败")
-    end
-    if not ok then
-        return nil, "WhisperX 文本对齐执行失败: " .. tostring(output or "")
-    end
-
-    local aligned_rows = payload.aligned_rows or {}
-    if #aligned_rows ~= #source_rows then
-        return nil, string.format("WhisperX 文本对齐分段数量不匹配: 字幕 %d 条，对齐结果 %d 段", #source_rows, #aligned_rows)
-    end
-
-    for index, row in ipairs(aligned_rows) do
-        local start_frame = tonumber(row.start_frame)
-        local end_frame = tonumber(row.end_frame)
-        if not start_frame or not end_frame or end_frame <= start_frame then
-            return nil, "WhisperX 文本对齐返回空时间段: #" .. tostring(index)
-        end
-    end
-
-    local diagnostic = payload.diagnostic or {}
-    return {
-        rows = aligned_rows,
-        audio_source = audio_source,
-        model = tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_asr_model),
-        local_onset_frames = SUBFIX_AUDIO_ALIGN.map_stable_ts_onsets_to_frames(payload.speech_onsets, audio_source, fps),
-        speech_segment_count = #aligned_rows,
-        mapping_mode = "whisperx_text_alignment",
-        diagnostic = "whisperx_text_segments=" .. tostring(#aligned_rows) ..
-            " model=" .. tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_asr_model) ..
-            " helper_mode=" .. tostring(diagnostic.mode or "")
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment(audio_source, source_rows, fps, options)
-    options = type(options) == "table" and options or {}
-    local progress = options.progress
-    if not audio_source or not audio_source.file_path then
-        return nil, "缺少音频源"
-    end
-    if not source_rows or #source_rows == 0 then
-        return nil, "缺少字幕文本"
-    end
-
-    local paths = SUBFIX_AUDIO_ALIGN.get_asr_paths()
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.helper) then
-        return nil, "缺少 CTC helper: " .. tostring(paths.helper)
-    end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "CTC 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
-    end
-
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return nil, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频")
-    end
-
-    ensure_backup_directory()
-    local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local progress_path = subfix_temp_dir() .. "subfix_ctc_progress_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
-    local rows_path = SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
-    local rows_ok, rows_err = SUBFIX_AUDIO_ALIGN.write_alignment_rows_json(rows_path, source_rows, fps)
-    if not rows_ok then
-        return nil, rows_err
-    end
-
-    LogMsg("CTC align_text helper ffmpeg: " .. tostring(ffmpeg_path))
-    if progress then
-        update_normalize_progress({
-            message = "正在启动 CTC helper...",
-            log = "启动 CTC helper: " .. tostring(audio_source.file_name or audio_source.file_path or "")
-        })
-    end
-    local cmd_parts = {
-        shell_quote(paths.python),
-        shell_quote(paths.helper),
-        "--mode", "ctc_align_text",
-        "--audio", shell_quote(audio_source.file_path),
-        "--output", shell_quote(output_path),
-        "--model", shell_quote(SUBFIX_AUDIO_ALIGN.default_ctc_model),
-        "--language", shell_quote(SUBFIX_AUDIO_ALIGN.default_asr_language),
-        "--ffmpeg", shell_quote(ffmpeg_path),
-        "--rows-json", shell_quote(rows_path),
-        "--progress-json", shell_quote(progress_path),
-        "--fps", shell_quote(string.format("%.6f", tonumber(fps) or current_fps or 24)),
-        "--timeline-start-frame", shell_quote(tostring(math.floor(tonumber(audio_source.start_frame) or 0))),
-        "--source-start", shell_quote(string.format("%.3f", tonumber(audio_source.source_start_seconds) or 0))
-    }
-	    if tonumber(audio_source.source_end_seconds) and tonumber(audio_source.source_end_seconds) > (tonumber(audio_source.source_start_seconds) or 0) then
-	        cmd_parts[#cmd_parts + 1] = "--source-end"
-	        cmd_parts[#cmd_parts + 1] = shell_quote(string.format("%.3f", tonumber(audio_source.source_end_seconds)))
-	    end
-	    SUBFIX_AUDIO_ALIGN.append_audio_channel_arg(cmd_parts, audio_source)
-
-	    local ok, output, status = run_subfix_background_command(table.concat(cmd_parts, " "), {
-        progress = progress,
-        progress_path = progress_path,
-        label = "CTC 文本对齐"
-    })
-    if status == "cancelled" then
-        return nil, "已取消"
-    end
-    local payload_text = read_text_file(output_path)
-    local payload, decode_err = decode_json_text(payload_text or "")
-    if not payload then
-        return nil, "CTC 文本对齐输出解析失败: " .. tostring(decode_err or output)
-    end
-    LogMsg("CTC align_text helper version: " .. tostring(payload.helper_version or "unknown"))
-    if payload.ok == false then
-        return nil, tostring(payload.error or output or "CTC 文本对齐失败")
-    end
-    if not ok then
-        return nil, "CTC 文本对齐执行失败: " .. tostring(output or "")
-    end
-
-    local aligned_rows = payload.aligned_rows or {}
-    if #aligned_rows ~= #source_rows then
-        return nil, string.format("CTC 文本对齐分段数量不匹配: 字幕 %d 条，对齐结果 %d 段", #source_rows, #aligned_rows)
-    end
-
-    for index, row in ipairs(aligned_rows) do
-        local start_frame = tonumber(row.start_frame)
-        local end_frame = tonumber(row.end_frame)
-        if not start_frame or not end_frame or end_frame <= start_frame then
-            return nil, "CTC 文本对齐返回空时间段: #" .. tostring(index)
-        end
-    end
-
-    local diagnostic = payload.diagnostic or {}
-    return {
-        rows = aligned_rows,
-        audio_source = audio_source,
-        model = tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_ctc_model),
-        local_onset_frames = SUBFIX_AUDIO_ALIGN.map_stable_ts_onsets_to_frames(payload.speech_onsets, audio_source, fps),
-        speech_segment_count = #aligned_rows,
-        mapping_mode = "ctc_text_alignment",
-        diagnostic = "ctc_text_segments=" .. tostring(#aligned_rows) ..
-            " model=" .. tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_ctc_model) ..
-            " helper_mode=" .. tostring(diagnostic.mode or "")
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.run_lightweight_onset_detection(audio_source, fps)
-    if not audio_source or not audio_source.file_path then
-        return nil, "缺少音频源"
-    end
-
-    local paths = SUBFIX_AUDIO_ALIGN.get_asr_paths()
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.helper) then
-        return nil, "缺少 onset helper: " .. tostring(paths.helper)
-    end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return nil, "onset 环境未安装，请先在终端运行: " .. shell_quote(paths.setup)
-    end
-
-    local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    if not ffmpeg_path then
-        return nil, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频")
-    end
-
-    ensure_backup_directory()
-    local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local cmd_parts = {
-        shell_quote(paths.python),
-        shell_quote(paths.helper),
-        "--mode", "onsets",
-        "--audio", shell_quote(audio_source.file_path),
-        "--output", shell_quote(output_path),
-        "--ffmpeg", shell_quote(ffmpeg_path),
-        "--fps", shell_quote(string.format("%.6f", tonumber(fps) or current_fps or 24)),
-        "--timeline-start-frame", shell_quote(tostring(math.floor(tonumber(audio_source.start_frame) or 0))),
-        "--source-start", shell_quote(string.format("%.3f", tonumber(audio_source.source_start_seconds) or 0))
-    }
-	    if tonumber(audio_source.source_end_seconds) and tonumber(audio_source.source_end_seconds) > (tonumber(audio_source.source_start_seconds) or 0) then
-	        cmd_parts[#cmd_parts + 1] = "--source-end"
-	        cmd_parts[#cmd_parts + 1] = shell_quote(string.format("%.3f", tonumber(audio_source.source_end_seconds)))
-	    end
-	    SUBFIX_AUDIO_ALIGN.append_audio_channel_arg(cmd_parts, audio_source)
-
-	    local ok, output = run_shell_capture(table.concat(cmd_parts, " "))
-    local payload_text = read_text_file(output_path)
-    local payload, decode_err = decode_json_text(payload_text or "")
-    if not payload then
-        return nil, "onset 输出解析失败: " .. tostring(decode_err or output)
-    end
-    if payload.ok == false then
-        return nil, tostring(payload.error or output or "onset 检测失败")
-    end
-    if not ok then
-        return nil, "onset 检测执行失败: " .. tostring(output or "")
-    end
-
-    return {
-        audio_source = audio_source,
-        local_onset_frames = SUBFIX_AUDIO_ALIGN.map_stable_ts_onsets_to_frames(payload.speech_onsets, audio_source, fps),
-        speech_region_count = #(payload.speech_regions or {}),
-        diagnostic = payload.diagnostic
-    }
 end
 
 function SUBFIX_AUDIO_ALIGN.map_stable_ts_onsets_to_frames(speech_onsets, audio_source, fps)
@@ -11076,172 +10075,6 @@ function SUBFIX_AUDIO_ALIGN.write_gap_fill_alignment_diagnostics(records, refere
     }, nil
 end
 
-function SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment_batches(batch_plan, fps, bias_frames, options)
-    options = type(options) == "table" and options or {}
-    local alignment_runner = options.alignment_runner or SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment
-    local engine_label = tostring(options.engine_label or "stable-ts")
-    local progress = options.progress
-    local results = {}
-    local batch_total = #(batch_plan and batch_plan.batches or {})
-    local summary = {
-        audio_track_index = batch_plan and batch_plan.track_index,
-        audio_source_name = "主讲轨分批",
-        processed_batch_count = batch_total,
-        successful_batch_count = 0,
-        failed_batch_count = 0,
-        unassigned_count = #(batch_plan and batch_plan.unassigned_rows or {}),
-        speech_segment_count = 0,
-        mapping_mode = "stable_ts_primary_track_batches_gapless",
-        onset_corrected_count = 0,
-        onset_pullback_total_frames = 0,
-        batch_failures = {},
-        diagnostic = ""
-    }
-    local processed_rows = 0
-
-    for _, row in ipairs(batch_plan and batch_plan.unassigned_rows or {}) do
-        local preserved = SUBFIX_AUDIO_ALIGN.unmatched_result_for_row(row, "未落在主讲轨音频片段内")
-        if preserved then results[#results + 1] = preserved end
-    end
-
-    for batch_index, batch in ipairs(batch_plan and batch_plan.batches or {}) do
-        if is_normalize_progress_cancelled() then
-            summary.cancelled = true
-            summary.diagnostic = "已取消"
-            return nil, summary
-        end
-        local audio_source = batch.audio_source or {}
-        local batch_rows = batch.rows or {}
-        local range_label = SUBFIX_AUDIO_ALIGN.format_frame_range(audio_source.start_frame, audio_source.end_frame, fps)
-        if progress then
-            update_normalize_progress({
-                stage = "CTC 对齐",
-                current_batch = batch_index,
-                total_batches = batch_total,
-                processed_rows = processed_rows,
-                audio_label = string.format("A%d #%d %s",
-                    tonumber(audio_source.track_index) or 0,
-                    tonumber(audio_source.item_index) or batch_index,
-                    tostring(range_label)),
-                message = string.format("正在处理第 %d/%d 批，字幕 %d 条", batch_index, batch_total, #batch_rows),
-                log = string.format("开始第 %d/%d 批：%s，字幕 %d 条", batch_index, batch_total, tostring(range_label), #batch_rows)
-            })
-        end
-        local reference_info, reference_err = alignment_runner(audio_source, batch_rows, fps, {
-            progress = progress,
-            batch_index = batch_index,
-            batch_count = batch_total
-        })
-        if is_normalize_progress_cancelled() or reference_err == "已取消" then
-            summary.cancelled = true
-            summary.diagnostic = "已取消"
-            return nil, summary
-        end
-        if reference_info and reference_info.rows and #reference_info.rows == #batch_rows then
-            local batch_results, match_err = SUBFIX_AUDIO_ALIGN.match_rows_to_stable_ts(batch_rows, reference_info.rows, {
-                bias_frames = bias_frames,
-                min_match_score = 0.42,
-                local_onset_frames = reference_info.local_onset_frames,
-                local_onset_pullback_frames = SUBFIX_AUDIO_ALIGN.local_onset_pullback_frames,
-                local_onset_push_frames = SUBFIX_AUDIO_ALIGN.local_onset_push_frames,
-                max_stable_ts_move_frames = options.max_stable_ts_move_frames or SUBFIX_AUDIO_ALIGN.max_stable_ts_move_frames,
-                allow_non_monotonic_candidates = options.allow_non_monotonic_candidates == true
-            })
-            if batch_results and not match_err then
-                summary.successful_batch_count = summary.successful_batch_count + 1
-                summary.speech_segment_count = summary.speech_segment_count + (tonumber(reference_info.speech_segment_count) or #reference_info.rows)
-                for _, result in ipairs(batch_results) do
-                    if result.onset_corrected then
-                        summary.onset_corrected_count = summary.onset_corrected_count + 1
-                        if (tonumber(result.local_onset_delta_frames) or 0) < 0 then
-                            summary.onset_pullback_total_frames = summary.onset_pullback_total_frames + math.abs(tonumber(result.local_onset_delta_frames) or 0)
-                        end
-                    end
-                    result.batch_index = batch_index
-                    result.audio_source = audio_source
-                    result.local_onset_frames = reference_info.local_onset_frames
-                    result.align_engine = align_engine
-                    result.qwen_item_count = tonumber(batch_payload.diagnostic and batch_payload.diagnostic.qwen_item_count)
-                    result.qwen_output_path = tostring(batch_payload.diagnostic and batch_payload.diagnostic.qwen_output_path or "")
-                    results[#results + 1] = result
-                end
-                if progress then
-                    update_normalize_progress({
-                        processed_rows = processed_rows + #batch_rows,
-                        message = string.format("第 %d/%d 批完成", batch_index, batch_total),
-                        log = string.format("完成第 %d/%d 批", batch_index, batch_total)
-                    })
-                end
-            else
-                reference_err = match_err or (engine_label .. " 匹配失败")
-            end
-        elseif not reference_err then
-            reference_err = engine_label .. " 未返回当前 batch 的完整对齐结果"
-        end
-
-        if reference_err then
-            summary.failed_batch_count = summary.failed_batch_count + 1
-            summary.batch_failures[#summary.batch_failures + 1] = string.format(
-                "A%d #%d %s: %s",
-                tonumber(audio_source.track_index) or 0,
-                tonumber(audio_source.item_index) or batch_index,
-                tostring(range_label),
-                tostring(reference_err)
-            )
-            if progress then
-                update_normalize_progress({
-                    message = string.format("第 %d/%d 批失败，继续保留原字幕", batch_index, batch_total),
-                    log = string.format("第 %d/%d 批失败: %s", batch_index, batch_total, tostring(reference_err))
-                })
-            end
-            for _, batch_row in ipairs(batch_rows) do
-                local original_row = batch_row.source_row_ref or batch_row
-                local preserved = SUBFIX_AUDIO_ALIGN.unmatched_result_for_row(original_row, reference_err)
-                if preserved then
-                    preserved.batch_index = batch_index
-                    preserved.audio_source = audio_source
-                    results[#results + 1] = preserved
-                end
-            end
-        end
-        processed_rows = processed_rows + #batch_rows
-    end
-
-    table.sort(results, function(a, b)
-        local a_start = tonumber(a and a.old_start_frame) or 0
-        local b_start = tonumber(b and b.old_start_frame) or 0
-        if a_start == b_start then
-            return (tonumber(a and a.source_index) or 0) < (tonumber(b and b.source_index) or 0)
-        end
-        return a_start < b_start
-    end)
-
-    if #summary.batch_failures > 0 then
-        summary.diagnostic = table.concat(summary.batch_failures, "\n")
-    else
-        summary.diagnostic = string.format(
-            "主讲轨 A%d，音频片段 %d 个，全部 batch 对齐成功。",
-            tonumber(summary.audio_track_index) or 0,
-            tonumber(summary.processed_batch_count) or 0
-        )
-    end
-
-    return results, summary
-end
-
-function SUBFIX_AUDIO_ALIGN.run_text_alignment_batches(batch_plan, fps, bias_frames, options)
-    options = type(options) == "table" and options or {}
-    options.alignment_runner = SUBFIX_AUDIO_ALIGN.run_text_alignment
-    return SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment_batches(batch_plan, fps, bias_frames, options)
-end
-
-function SUBFIX_AUDIO_ALIGN.run_whisperx_text_alignment_batches(batch_plan, fps, bias_frames, options)
-    options = type(options) == "table" and options or {}
-    options.alignment_runner = SUBFIX_AUDIO_ALIGN.run_whisperx_text_alignment
-    options.engine_label = "WhisperX"
-    return SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment_batches(batch_plan, fps, bias_frames, options)
-end
-
 function SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, bias_frames, options)
     options = type(options) == "table" and options or {}
     local progress = options.progress
@@ -11453,19 +10286,6 @@ function SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, b
         summary.diagnostic = string.format("主讲轨 A%d，音频片段 %d 个，%s全部成功。", tonumber(summary.audio_track_index) or 0, tonumber(summary.processed_batch_count) or 0, helper_label)
     end
     return results, summary
-end
-
-function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, fallback_reason)
-    options = type(options) == "table" and options or {}
-    if fallback_reason and fallback_reason ~= "" then
-        LogMsg("批量 CTC 降级到逐批 CTC: " .. tostring(fallback_reason))
-        if options.progress then
-            update_normalize_progress({message = "批量 CTC 失败，改用逐批对齐", log = "批量 CTC 降级: " .. tostring(fallback_reason)})
-        end
-    end
-    options.alignment_runner = SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment
-    options.engine_label = "CTC"
-    return SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment_batches(batch_plan, fps, bias_frames, options)
 end
 
 function SUBFIX_AUDIO_ALIGN.ctc_candidate_start_frame(result)
@@ -11781,401 +10601,6 @@ function SUBFIX_AUDIO_ALIGN.format_frame_range(start_frame, end_frame, fps)
     return frames_to_timecode(start_frame or 0, fps or current_fps) .. " --> " .. frames_to_timecode(end_frame or 0, fps or current_fps)
 end
 
-function SUBFIX_AUDIO_ALIGN.text_units(text)
-    local value = tostring(text or "")
-    local count = 0
-    for _ in value:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-        count = count + 1
-    end
-    return math.max(1, count)
-end
-
-function SUBFIX_AUDIO_ALIGN.total_speech_frames(speech_segments)
-    local total = 0
-    for _, segment in ipairs(speech_segments or {}) do
-        local start_frame = tonumber(segment and segment.start_frame) or 0
-        local end_frame = tonumber(segment and segment.end_frame) or start_frame
-        if end_frame > start_frame then
-            total = total + (end_frame - start_frame)
-        end
-    end
-    return total
-end
-
-function SUBFIX_AUDIO_ALIGN.speech_frame_at_active_offset(speech_segments, active_offset_frames)
-    local offset = math.max(0, tonumber(active_offset_frames) or 0)
-    local last_end = nil
-    for _, segment in ipairs(speech_segments or {}) do
-        local start_frame = tonumber(segment and segment.start_frame) or 0
-        local end_frame = tonumber(segment and segment.end_frame) or start_frame
-        if end_frame > start_frame then
-            local duration = end_frame - start_frame
-            last_end = end_frame
-            if offset <= duration then
-                return start_frame + math.floor(offset + 0.5), segment
-            end
-            offset = offset - duration
-        end
-    end
-    return last_end or 0, (speech_segments or {})[#(speech_segments or {})]
-end
-
-function SUBFIX_AUDIO_ALIGN.match_rows_to_speech_segments(source_rows, speech_segments, options)
-    options = type(options) == "table" and options or {}
-    local bias_frames = SUBFIX_AUDIO_ALIGN.clamp_bias_frames(options.bias_frames)
-    local alignment_mode = tostring(options.alignment_mode or "text_progress")
-    local max_snap_distance_frames = tonumber(options.max_snap_distance_frames) or SUBFIX_AUDIO_ALIGN.max_snap_distance_frames
-    local results = {}
-    local segment_cursor = 1
-
-    if alignment_mode == "text_progress" then
-        local total_units = 0
-        for _, source_row in ipairs(source_rows or {}) do
-            total_units = total_units + SUBFIX_AUDIO_ALIGN.text_units(source_row and source_row.text)
-        end
-
-        local total_frames = SUBFIX_AUDIO_ALIGN.total_speech_frames(speech_segments)
-        if total_units <= 0 or total_frames <= 0 then
-            return results
-        end
-
-        local prefix_units = 0
-        for source_index, source_row in ipairs(source_rows or {}) do
-            local row_start = tonumber(source_row and source_row.start_frame) or 0
-            local row_end = tonumber(source_row and source_row.end_frame) or row_start + 1
-            local original_duration = math.max(1, row_end - row_start)
-            local active_offset = (prefix_units / total_units) * total_frames
-            local mapped_frame, mapped_segment = SUBFIX_AUDIO_ALIGN.speech_frame_at_active_offset(speech_segments, active_offset)
-            local start_frame = math.max(0, mapped_frame + bias_frames)
-            local end_frame = start_frame + original_duration
-            results[#results + 1] = {
-                source_index = source_index,
-                reference_index = source_index,
-                matched = true,
-                score = 1,
-                distance_frames = math.abs(start_frame - row_start),
-                row = source_row,
-                reference = mapped_segment,
-                old_start_frame = row_start,
-                old_end_frame = row_end,
-                new_start_frame = start_frame,
-                new_end_frame = end_frame,
-                alignment_mode = alignment_mode,
-                text_units = SUBFIX_AUDIO_ALIGN.text_units(source_row and source_row.text),
-                active_offset_frames = active_offset
-            }
-            prefix_units = prefix_units + SUBFIX_AUDIO_ALIGN.text_units(source_row and source_row.text)
-        end
-
-        return results
-    end
-
-    if alignment_mode == "global_shift" then
-        local first_row = (source_rows or {})[1]
-        local first_segment = (speech_segments or {})[1]
-        if not first_row or not first_segment then
-            return results
-        end
-
-        local first_row_start = tonumber(first_row.start_frame) or 0
-        local anchor_frame = tonumber(options.anchor_frame) or tonumber(first_segment.start_frame) or first_row_start
-        local delta_frames = (anchor_frame + bias_frames) - first_row_start
-
-        for source_index, source_row in ipairs(source_rows or {}) do
-            local row_start = tonumber(source_row and source_row.start_frame) or 0
-            local row_end = tonumber(source_row and source_row.end_frame) or row_start + 1
-            local original_duration = math.max(1, row_end - row_start)
-            local start_frame = math.max(0, row_start + delta_frames)
-            local end_frame = start_frame + original_duration
-            results[#results + 1] = {
-                source_index = source_index,
-                reference_index = math.min(source_index, #(speech_segments or {})),
-                matched = true,
-                score = 1,
-                distance_frames = math.abs(delta_frames),
-                row = source_row,
-                reference = (speech_segments or {})[math.min(source_index, #(speech_segments or {}))] or first_segment,
-                old_start_frame = row_start,
-                old_end_frame = row_end,
-                new_start_frame = start_frame,
-                new_end_frame = end_frame,
-                alignment_mode = alignment_mode,
-                anchor_frame = anchor_frame,
-                delta_frames = delta_frames
-            }
-        end
-
-        return results
-    end
-
-    for source_index, source_row in ipairs(source_rows or {}) do
-        local row_start = tonumber(source_row and source_row.start_frame) or 0
-        local row_end = tonumber(source_row and source_row.end_frame) or row_start + 1
-        local original_duration = math.max(1, row_end - row_start)
-        local best_segment = nil
-        local best_segment_index = nil
-        local best_distance = nil
-
-        for segment_index = segment_cursor, #(speech_segments or {}) do
-            local segment = speech_segments[segment_index]
-            local segment_start = tonumber(segment and segment.start_frame) or 0
-            local distance = math.abs(segment_start - row_start)
-            if distance <= max_snap_distance_frames and (not best_distance or distance < best_distance) then
-                best_segment = segment
-                best_segment_index = segment_index
-                best_distance = distance
-            end
-            if segment_start > row_start + max_snap_distance_frames then
-                break
-            end
-        end
-
-        if best_segment then
-            local start_frame = math.max(0, (tonumber(best_segment.start_frame) or 0) + bias_frames)
-            local segment_end = tonumber(best_segment.end_frame) or (start_frame + original_duration)
-            local end_frame = math.max(start_frame + 1, segment_end + bias_frames)
-            results[#results + 1] = {
-                source_index = source_index,
-                reference_index = best_segment_index,
-                matched = true,
-                score = 1,
-                distance_frames = best_distance or 0,
-                row = source_row,
-                reference = best_segment,
-                old_start_frame = row_start,
-                old_end_frame = row_end,
-                new_start_frame = start_frame,
-                new_end_frame = end_frame
-            }
-            segment_cursor = best_segment_index + 1
-        else
-            results[#results + 1] = {
-                source_index = source_index,
-                matched = false,
-                score = 0,
-                row = source_row,
-                old_start_frame = row_start,
-                old_end_frame = row_end
-            }
-        end
-    end
-
-    return results
-end
-
-function SUBFIX_AUDIO_ALIGN.text_anchor_fraction(source_text, reference_text)
-    local source = SUBFIX_AUDIO_ALIGN.normalize_text(source_text)
-    local reference = SUBFIX_AUDIO_ALIGN.normalize_text(reference_text)
-    if source == "" or reference == "" then return nil end
-
-    local start_pos = reference:find(source, 1, true)
-    if not start_pos then
-        return nil
-    end
-    return math.max(0, math.min(1, (start_pos - 1) / math.max(1, #reference)))
-end
-
-function SUBFIX_AUDIO_ALIGN.word_range_for_text(source_text, reference)
-    if not reference or not reference.words or #reference.words == 0 then
-        return nil
-    end
-
-    local source = SUBFIX_AUDIO_ALIGN.normalize_text(source_text)
-    local reference_text = SUBFIX_AUDIO_ALIGN.normalize_text(reference.text)
-    if source == "" or reference_text == "" then
-        return nil
-    end
-
-    local start_pos, end_pos = reference_text:find(source, 1, true)
-    if not start_pos or not end_pos then
-        return nil
-    end
-
-    local cursor = 1
-    local first_word = nil
-    local last_word = nil
-    for _, word in ipairs(reference.words or {}) do
-        local word_text = SUBFIX_AUDIO_ALIGN.normalize_text(word.text or word.word)
-        local word_start = cursor
-        local word_end = cursor + #word_text - 1
-        if word_text ~= "" and word_end >= start_pos and word_start <= end_pos then
-            first_word = first_word or word
-            last_word = word
-        end
-        cursor = word_end + 1
-    end
-
-    if first_word and last_word then
-        local start_frame = tonumber(first_word.start_frame)
-        local end_frame = tonumber(last_word.end_frame)
-        if start_frame and end_frame and end_frame > start_frame then
-            return start_frame, end_frame
-        end
-    end
-    return nil
-end
-
-function SUBFIX_AUDIO_ALIGN.reuse_previous_reference_segment(source_row, previous_result, bias_frames)
-    local reference = previous_result and previous_result.reference
-    if not reference then
-        return nil
-    end
-
-    local row_start = tonumber(source_row and source_row.start_frame) or 0
-    local row_end = tonumber(source_row and source_row.end_frame) or row_start + 1
-    local original_duration = math.max(1, row_end - row_start)
-    local start_frame, end_frame = SUBFIX_AUDIO_ALIGN.word_range_for_text(source_row and source_row.text, reference)
-
-    if not start_frame then
-        local fraction = SUBFIX_AUDIO_ALIGN.text_anchor_fraction(source_row and source_row.text, reference.text)
-        if not fraction then
-            return nil
-        end
-        local reference_start = tonumber(reference.start_frame) or row_start
-        local reference_end = tonumber(reference.end_frame) or (reference_start + original_duration)
-        local reference_duration = math.max(1, reference_end - reference_start)
-        start_frame = reference_start + math.floor(reference_duration * fraction + 0.5)
-        end_frame = reference_end
-    end
-
-    start_frame = math.max(0, start_frame + (tonumber(bias_frames) or 0))
-    end_frame = math.max(start_frame + 1, (tonumber(end_frame) or (start_frame + original_duration)) + (tonumber(bias_frames) or 0))
-
-    return {
-        reference = reference,
-        reference_index = previous_result.reference_index,
-        start_frame = start_frame,
-        end_frame = end_frame
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.protect_against_early_asr_start(row_start, row_end, start_frame, end_frame)
-    row_start = tonumber(row_start) or 0
-    row_end = tonumber(row_end) or row_start + 1
-    start_frame = tonumber(start_frame) or row_start
-    end_frame = tonumber(end_frame) or start_frame + math.max(1, row_end - row_start)
-    local max_advance = tonumber(SUBFIX_AUDIO_ALIGN.max_auto_advance_frames) or 6
-
-    if start_frame < row_start - max_advance then
-        local original_duration = math.max(1, row_end - row_start)
-        return row_start, row_start + original_duration, true
-    end
-
-    return start_frame, end_frame, false
-end
-
-function SUBFIX_AUDIO_ALIGN.local_onset_for_row(row_start, speech_onsets)
-    row_start = tonumber(row_start) or 0
-    local min_frame = row_start - (tonumber(SUBFIX_AUDIO_ALIGN.max_auto_advance_frames) or 3)
-    local max_frame = row_start + (tonumber(SUBFIX_AUDIO_ALIGN.max_auto_delay_frames) or 18)
-    local best_onset = nil
-    local best_distance = nil
-
-    for _, onset_frame in ipairs(speech_onsets or {}) do
-        local onset = tonumber(onset_frame)
-        if onset and onset >= min_frame and onset <= max_frame then
-            local distance = math.abs(onset - row_start)
-            if not best_distance or distance < best_distance or (distance == best_distance and onset >= row_start and (not best_onset or best_onset < row_start)) then
-                best_onset = onset
-                best_distance = distance
-            end
-        end
-    end
-
-    return best_onset, best_distance
-end
-
-function SUBFIX_AUDIO_ALIGN.match_rows_to_asr_segments(source_rows, asr_segments, options)
-    options = type(options) == "table" and options or {}
-    local bias_frames = SUBFIX_AUDIO_ALIGN.clamp_bias_frames(options.bias_frames)
-    local min_score = tonumber(options.min_match_score) or 0.42
-    local lookahead = tonumber(options.max_reference_lookahead) or 3
-    local speech_onsets = options.speech_onsets or {}
-    local results = {}
-    local segment_cursor = 1
-
-    for source_index, source_row in ipairs(source_rows or {}) do
-        local row_start = tonumber(source_row and source_row.start_frame) or 0
-        local row_end = tonumber(source_row and source_row.end_frame) or row_start + 1
-        local original_duration = math.max(1, row_end - row_start)
-        local local_onset, local_onset_distance = SUBFIX_AUDIO_ALIGN.local_onset_for_row(row_start, speech_onsets)
-        local best_segment = nil
-        local best_segment_index = nil
-        local best_score = -1
-        local previous_reuse = SUBFIX_AUDIO_ALIGN.reuse_previous_reference_segment(source_row, results[#results], bias_frames)
-        local search_end = math.min(#(asr_segments or {}), segment_cursor + lookahead)
-
-        if not previous_reuse then
-            for segment_index = segment_cursor, search_end do
-                local asr_segment = asr_segments[segment_index]
-                local score = SUBFIX_AUDIO_ALIGN.text_score(source_row and source_row.text, asr_segment and asr_segment.text)
-                if score > best_score then
-                    best_score = score
-                    best_segment = asr_segment
-                    best_segment_index = segment_index
-                end
-            end
-
-            -- sequential fallback: ASR text can differ from edited subtitles, but timestamps remain ordered.
-            if not best_segment or best_score < min_score then
-                best_segment = (asr_segments or {})[segment_cursor]
-                best_segment_index = segment_cursor
-                best_score = 0
-            end
-        end
-
-        local reused_reference = previous_reuse
-        if not best_segment then
-            reused_reference = SUBFIX_AUDIO_ALIGN.reuse_previous_reference_segment(source_row, results[#results], bias_frames)
-        end
-
-        local asr_word_start = nil
-        local asr_word_end = nil
-        if reused_reference then
-            best_segment = reused_reference.reference
-            best_segment_index = reused_reference.reference_index
-        elseif best_segment then
-            -- ASR text/word timing is retained as diagnostic context only; final start is guarded by local audio onset.
-            asr_word_start, asr_word_end = SUBFIX_AUDIO_ALIGN.word_range_for_text(source_row and source_row.text, best_segment)
-        end
-
-        local start_frame = row_start
-        local end_frame = row_end
-        local local_onset_preserved = false
-        if local_onset then
-            start_frame = math.max(0, local_onset + bias_frames)
-            end_frame = start_frame + original_duration
-        else
-            local_onset_preserved = true
-        end
-
-        results[#results + 1] = {
-            source_index = source_index,
-            reference_index = best_segment_index,
-            matched = true,
-            score = best_segment and best_score or 0,
-            distance_frames = math.abs(start_frame - row_start),
-            row = source_row,
-            reference = best_segment,
-            old_start_frame = row_start,
-            old_end_frame = row_end,
-            new_start_frame = start_frame,
-            new_end_frame = end_frame,
-            alignment_mode = local_onset and "local_onset" or "original_preserved",
-            reused_reference_segment = reused_reference ~= nil,
-            local_onset_distance = local_onset_distance,
-            local_onset_preserved = local_onset_preserved,
-            asr_word_start_frame = asr_word_start,
-            asr_word_end_frame = asr_word_end
-        }
-        if best_segment_index and not reused_reference then
-            segment_cursor = best_segment_index + 1
-        end
-    end
-
-    return results
-end
-
 function SUBFIX_AUDIO_ALIGN.match_rows_to_stable_ts(source_rows, aligned_rows, options)
     options = type(options) == "table" and options or {}
     local bias_frames = SUBFIX_AUDIO_ALIGN.clamp_bias_frames(options.bias_frames)
@@ -12285,105 +10710,6 @@ function SUBFIX_AUDIO_ALIGN.match_rows_to_stable_ts(source_rows, aligned_rows, o
     end
 
     return results
-end
-
-function SUBFIX_AUDIO_ALIGN.show_report(task_name, results, summary)
-    local lines = {}
-    lines[#lines + 1] = string.format(
-        "stable-ts 对齐完成：更新 %d 条，未处理 %d 条，移动 %d 条，平均移动 %.1f 帧，偏移 %+d 帧。",
-        tonumber(summary and summary.matched_count) or 0,
-        tonumber(summary and summary.unmatched_count) or 0,
-        tonumber(summary and summary.moved_count) or 0,
-        tonumber(summary and summary.avg_move_frames) or 0,
-        tonumber(summary and summary.bias_frames) or 0
-    )
-    if summary and summary.audio_source_name then
-        lines[#lines + 1] = string.format(
-            "音频源：A%d  %s；stable-ts 片段 %d 个；映射模式：%s。",
-            tonumber(summary.audio_track_index) or 0,
-            tostring(summary.audio_source_name or ""),
-            tonumber(summary.speech_segment_count) or 0,
-            tostring(summary.mapping_mode or "")
-        )
-    end
-    if summary and summary.processed_batch_count then
-        lines[#lines + 1] = string.format(
-            "批处理：音频片段 %d 个，成功 %d 个，失败 %d 个，未分配字幕 %d 条。",
-            tonumber(summary.processed_batch_count) or 0,
-            tonumber(summary.successful_batch_count) or 0,
-            tonumber(summary.failed_batch_count) or 0,
-            tonumber(summary.unassigned_count) or 0
-        )
-    end
-    if summary and summary.onset_corrected_count then
-        lines[#lines + 1] = string.format(
-            "局部起点校正：%d 条，平均回拉 %.1f 帧。",
-            tonumber(summary.onset_corrected_count) or 0,
-            tonumber(summary.avg_onset_pullback_frames) or 0
-        )
-    end
-    if summary and summary.diagnostic then
-        lines[#lines + 1] = "诊断：" .. tostring(summary.diagnostic)
-    end
-    if summary and summary.cleanup_ok == false then
-        lines[#lines + 1] = "参考字幕清理警告：" .. tostring(summary.cleanup_err or "未知错误")
-    end
-    lines[#lines + 1] = ""
-
-    for _, result in ipairs(results or {}) do
-        local row = result.row or {}
-        if result.moved then
-            local correction_note = ""
-            if result.onset_corrected then
-                correction_note = string.format("  [起点校正 %+d 帧]", tonumber(result.local_onset_delta_frames) or 0)
-            end
-            if result.stable_ts_large_move_preserved then
-                correction_note = correction_note .. string.format("  [模型偏移 %+d 帧，已保留原位]", tonumber(result.stable_ts_move_frames) or 0)
-            end
-            lines[#lines + 1] = string.format(
-                "#%d  移动 %d 帧%s  %s  =>  %s  | %s",
-                tonumber(row.index) or tonumber(result.source_index) or 0,
-                tonumber(result.delta_frames) or tonumber(result.distance_frames) or 0,
-                correction_note,
-                SUBFIX_AUDIO_ALIGN.format_frame_range(result.old_start_frame, result.old_end_frame, row.fps),
-                SUBFIX_AUDIO_ALIGN.format_frame_range(result.new_start_frame, result.new_end_frame, row.fps),
-                tostring(row.text or "")
-            )
-        elseif not result.matched then
-            lines[#lines + 1] = string.format(
-                "#%d  未处理，开始时间保持（%s） | %s",
-                tonumber(row.index) or tonumber(result.source_index) or 0,
-                tostring(result.reason or "原因未知"),
-                tostring(row.text or "")
-            )
-        end
-    end
-
-    local report_text = table.concat(lines, "\n")
-    local uid = tostring(os.time()) .. tostring(math.random(1000, 9999))
-    local report_win = dispatcher:AddWindow({
-        ID = "AudioAlignReportWindow_" .. uid,
-        WindowTitle = tostring(task_name or "自动对齐声音") .. "报告",
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({420, 180, 720, 460}),
-    },
-    ui:VGroup{
-        Spacing = 8,
-        ContentsMargins = 10,
-        ui:TextEdit{ ID = "AudioAlignReportText_" .. uid, Text = report_text, ReadOnly = true, Weight = 1 },
-        ui:HGroup{
-            Weight = 0,
-            ui:HGap(0, 1),
-            ui:Button{ ID = "CloseAudioAlignReportBtn_" .. uid, Text = "确认", Weight = 0, MinimumSize = {88, 30} }
-        }
-    })
-
-    report_win.On["AudioAlignReportWindow_" .. uid].Close = function(ev)
-        report_win:Hide()
-    end
-    report_win.On["CloseAudioAlignReportBtn_" .. uid].Clicked = function(ev)
-        report_win:Hide()
-    end
-    report_win:Show()
 end
 
 function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, fps, options)
@@ -12788,221 +11114,40 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
     return aligned_count, true, nil, decision_counts
 end
 
-function SUBFIX_AUDIO_ALIGN.apply_lightweight_audio_alignment_for_gap_fill(rows, fps)
-    if not rows or #rows == 0 then
-        return 0, "没有字幕数据"
-    end
-
-    local resolve_obj = get_resolve()
-    local pm = resolve_obj and resolve_obj:GetProjectManager()
-    local project = pm and pm:GetCurrentProject()
-    local timeline = project and project:GetCurrentTimeline()
-    if not timeline then
-        LogMsg("轻量音频对齐失败，继续执行纯消除空隙: 没有时间线")
-        return 0, "没有时间线"
-    end
-
-    local batch_plan, batch_plan_err = SUBFIX_AUDIO_ALIGN.find_primary_audio_track_batches(timeline, rows, fps)
-    if not batch_plan then
-        LogMsg("轻量音频对齐失败，继续执行纯消除空隙: " .. tostring(batch_plan_err or "没有可用音频源"))
-        return 0, batch_plan_err
-    end
-
-    sort_rows_by_timing(rows)
-    local row_position = {}
-    for index, row in ipairs(rows or {}) do
-        row_position[row] = index
-    end
-
-    local aligned_count = 0
-    local window_frames = tonumber(SUBFIX_AUDIO_ALIGN.lightweight_onset_window_frames) or 6
-    for _, batch in ipairs(batch_plan.batches or {}) do
-        local detection, detection_err = SUBFIX_AUDIO_ALIGN.run_lightweight_onset_detection(batch.audio_source, fps)
-        if detection and detection.local_onset_frames and #detection.local_onset_frames > 0 then
-            for _, batch_row in ipairs(batch.rows or {}) do
-                local row = batch_row.source_row_ref or batch_row
-                local row_index = row_position[row]
-                local row_start = tonumber(row.start_frame) or 0
-                local row_end = tonumber(row.end_frame) or (row_start + 1)
-                local duration = math.max(1, row_end - row_start)
-                local corrected_start, corrected = SUBFIX_AUDIO_ALIGN.correct_start_with_local_onset(row_start, detection.local_onset_frames, {
-                    local_onset_pullback_frames = window_frames,
-                    local_onset_push_frames = window_frames
-                })
-                if corrected and corrected_start ~= row_start then
-                    local prev_row = row_index and rows[row_index - 1] or nil
-                    local next_row = row_index and rows[row_index + 1] or nil
-                    local prev_end = prev_row and tonumber(prev_row.end_frame) or nil
-                    local next_start = next_row and tonumber(next_row.start_frame) or nil
-                    local new_end = corrected_start + duration
-                    local can_move = corrected_start > 0
-                        and (not prev_end or corrected_start >= prev_end)
-                        and (not next_start or corrected_start < next_start)
-                    if can_move then
-                        if next_start and new_end > next_start then
-                            new_end = next_start
-                        end
-                        row.start_frame = corrected_start
-                        row.end_frame = math.max(corrected_start + 1, new_end)
-                        row.target_abs_frame = math.floor((row.start_frame + row.end_frame) / 2)
-                        aligned_count = aligned_count + 1
-                    end
-                end
-            end
-        elseif detection_err then
-            LogMsg("轻量音频对齐失败，继续执行纯消除空隙: " .. tostring(detection_err))
-        end
-    end
-
-    return aligned_count, nil
-end
-
-function SUBFIX_AUDIO_ALIGN.fill_gaps_after_match(rows, results)
-    local result_by_row = {}
-    for _, result in ipairs(results or {}) do
-        if result.row then
-            result_by_row[result.row] = result
-        end
-    end
-
-    local fps = tonumber(current_fps) or 24.0
-    local gap_threshold = math.max(1, math.floor(fps * 2 + 0.5))
-    sort_rows_by_timing(rows)
-    for index, row in ipairs(rows or {}) do
-        local next_row = rows[index + 1]
-        local row_start = tonumber(row.start_frame) or 0
-        local current_end = tonumber(row.end_frame)
-        local result = result_by_row[row]
-        local original_duration = math.max(1, (tonumber(result and result.old_end_frame) or current_end or row_start + 1) - (tonumber(result and result.old_start_frame) or row_start))
-        if result and result.matched == false then
-            row.end_frame = tonumber(result.old_end_frame) or (row_start + original_duration)
-        elseif next_row and tonumber(next_row.start_frame) and current_end and current_end > row_start then
-            local next_start = tonumber(next_row.start_frame)
-            local gap = next_start - current_end
-            if gap > 0 and gap <= gap_threshold then
-                row.end_frame = next_start
-            else
-                row.end_frame = current_end
-            end
-        elseif result and result.matched and result.reference and tonumber(result.reference.end_frame) and tonumber(result.reference.end_frame) > row_start then
-            row.end_frame = tonumber(result.reference.end_frame)
-        else
-            row.end_frame = row_start + original_duration
-        end
-        row.target_abs_frame = math.floor((row_start + (tonumber(row.end_frame) or row_start + 1)) / 2)
-    end
-end
-
-function SUBFIX_AUDIO_ALIGN.apply_matches(results, bias_frames, reference_info)
-    local mutation_snapshot = prepare_mutation_snapshot("自动对齐声音")
-    local moved_count = 0
-    local matched_count = 0
-    local unmatched_count = 0
-    local original_ranges = {}
-
-    local total_move_frames = 0
-
-    for _, result in ipairs(results or {}) do
-        if result.row then
-            original_ranges[result.row] = {
-                start_frame = tonumber(result.row.start_frame) or 0,
-                end_frame = tonumber(result.row.end_frame) or 0
-            }
-        end
-        if result.matched and result.row then
-            matched_count = matched_count + 1
-            local row = result.row
-            row.start_frame = result.new_start_frame
-            row.end_frame = result.new_end_frame
-            row.target_abs_frame = math.floor((result.new_start_frame + result.new_end_frame) / 2)
-        else
-            unmatched_count = unmatched_count + 1
-        end
-    end
-
-    if matched_count == 0 then
-        return {
-            moved_count = 0,
-            matched_count = 0,
-            unmatched_count = unmatched_count,
-            avg_move_frames = 0,
-            bias_frames = bias_frames,
-            audio_source_name = (reference_info and reference_info.audio_source and reference_info.audio_source.file_name) or (reference_info and reference_info.audio_source_name),
-            audio_track_index = (reference_info and reference_info.audio_source and reference_info.audio_source.track_index) or (reference_info and reference_info.audio_track_index),
-            processed_batch_count = reference_info and reference_info.processed_batch_count,
-            successful_batch_count = reference_info and reference_info.successful_batch_count,
-            failed_batch_count = reference_info and reference_info.failed_batch_count,
-            unassigned_count = reference_info and reference_info.unassigned_count,
-            onset_corrected_count = reference_info and reference_info.onset_corrected_count,
-            avg_onset_pullback_frames = reference_info and reference_info.onset_corrected_count and reference_info.onset_corrected_count > 0 and ((tonumber(reference_info.onset_pullback_total_frames) or 0) / reference_info.onset_corrected_count) or 0,
-            speech_segment_count = reference_info and reference_info.speech_segment_count,
-            mapping_mode = reference_info and reference_info.mapping_mode,
-            diagnostic = reference_info and reference_info.diagnostic
-        }
-    end
-
-    SUBFIX_AUDIO_ALIGN.fill_gaps_after_match(current_rows, results)
-
-    for _, result in ipairs(results or {}) do
-        local original = result.row and original_ranges[result.row] or nil
-        if result.matched and result.row and original then
-            local row_start = tonumber(result.row.start_frame) or 0
-            local row_end = tonumber(result.row.end_frame) or 0
-            result.new_start_frame = row_start
-            result.new_end_frame = row_end
-            if original.start_frame ~= row_start or original.end_frame ~= row_end then
-                result.moved = true
-                moved_count = moved_count + 1
-                total_move_frames = total_move_frames + math.abs(row_start - original.start_frame)
-            end
-        end
-    end
-
-    if moved_count > 0 then
-        commit_mutation_snapshot(mutation_snapshot)
-        rebuild_tree_from_rows(current_rows, active_window or win)
-    end
-
-    return {
-        moved_count = moved_count,
-        matched_count = matched_count,
-        unmatched_count = unmatched_count,
-        avg_move_frames = matched_count > 0 and (total_move_frames / matched_count) or 0,
-        bias_frames = bias_frames,
-        audio_source_name = (reference_info and reference_info.audio_source and reference_info.audio_source.file_name) or (reference_info and reference_info.audio_source_name),
-        audio_track_index = (reference_info and reference_info.audio_source and reference_info.audio_source.track_index) or (reference_info and reference_info.audio_track_index),
-        processed_batch_count = reference_info and reference_info.processed_batch_count,
-        successful_batch_count = reference_info and reference_info.successful_batch_count,
-        failed_batch_count = reference_info and reference_info.failed_batch_count,
-        unassigned_count = reference_info and reference_info.unassigned_count,
-        onset_corrected_count = reference_info and reference_info.onset_corrected_count,
-        avg_onset_pullback_frames = reference_info and reference_info.onset_corrected_count and reference_info.onset_corrected_count > 0 and ((tonumber(reference_info.onset_pullback_total_frames) or 0) / reference_info.onset_corrected_count) or 0,
-        speech_segment_count = reference_info and reference_info.speech_segment_count,
-        mapping_mode = reference_info and reference_info.mapping_mode,
-        diagnostic = reference_info and reference_info.diagnostic,
-        cleanup_ok = reference_info and reference_info.cleanup_ok,
-        cleanup_err = reference_info and reference_info.cleanup_err
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.run(target_window)
-    local window = resolve_window(target_window)
-    local status = window and window:Find("StatusLabel") or (win and win:Find("StatusLabel"))
-    if status then status:Set("Text", "自动对齐声音已移除，请使用规整字幕长度") end
-    return false
-end
-
 -- ========== 刷新字幕列表 ==========
+-- P9：字幕树内容指纹（按窗口弱键缓存）。重新从时间线读取后，若指纹与上次成功
+-- 渲染完全一致，跳过整棵树的 Clear/Add 重建，避免闪烁、滚动位置与选中项丢失。
+-- 指纹来自「刚读出的最新数据」，一致即代表树上现有内容与时间线逐行相同，不存在 stale。
+_G.SUBFIX_REFRESH_TREE_FP = _G.SUBFIX_REFRESH_TREE_FP or setmetatable({}, {__mode = "k"})
+
+function compute_subtitles_tree_fingerprint(rows, window)
+    local scope = current_work_scope
+    local parts = {
+        "w=" .. tostring(window),
+        "track=" .. tostring(current_track),
+        "fps=" .. tostring(current_fps),
+        "scope=" .. tostring(scope and scope.mode or "")
+            .. ":" .. tostring(scope and scope.start_frame or "")
+            .. ":" .. tostring(scope and scope.end_frame or ""),
+        "q=" .. tostring(current_search_query or ""),
+        "n=" .. tostring(rows and #rows or 0),
+    }
+    for _, row in ipairs(rows or {}) do
+        parts[#parts + 1] = tostring(row.index) .. "|"
+            .. tostring(row.start_frame) .. "|"
+            .. tostring(row.end_frame) .. "|"
+            .. tostring(row.text or "")
+    end
+    return table.concat(parts, "\n")
+end
+
 function refresh_subtitles(target_window, options)
     local window = resolve_window(target_window)
     options = options or {}
     print("[Hooper AI 2.0] 开始刷新字幕列表...")
     local refresh_total_started_at = os.clock()
 
-    local function fail_refresh(message, fail_options)
-        fail_options = fail_options or {}
-        local show_generate_cta = fail_options.show_generate_cta == true
-        local placeholder_message = show_generate_cta and "时间线上还没有字幕哦" or message
+    local function fail_refresh(message)
         invalidate_search_cache("refresh_failed")
         if message and message ~= "" then
             update_shared_status(window, message)
@@ -13012,6 +11157,10 @@ function refresh_subtitles(target_window, options)
         current_selected_row_id = nil
         undo_stack = {}
         redo_stack = {}
+        -- 无数据即无可丢失修改：清空时间线基线，退出不再提醒。
+        subfix_timeline_baseline_sig = nil
+        subfix_timeline_baseline_pending_count = 0
+        subfix_timeline_baseline_approved_count = 0
         if type(reset_pending_review_session) == "function" then
             reset_pending_review_session()
         end
@@ -13019,39 +11168,22 @@ function refresh_subtitles(target_window, options)
         set_subtitle_loaded_state(false, nil, window)
         sync_work_scope_ui(window)
         clear_tree_for_window(window)
+        -- P9：树已清空，指纹缓存必须失效，避免下次刷新误判跳过重建
+        if _G.SUBFIX_REFRESH_TREE_FP then
+            _G.SUBFIX_REFRESH_TREE_FP[window] = nil
+        end
         set_current_preview_source(PREVIEW_SOURCE_TIMELINE)
         reset_backup_selector_to_placeholder()
         reset_subtitle_edit_box(window)
-        if options.show_loading_placeholder or show_generate_cta then
-            set_mini_subtitle_area_state(window, false, placeholder_message or "字幕加载失败，请稍后重试", show_generate_cta)
-        end
         return false
     end
 
     update_search_query_from_window(window)
 
-    local resolve = get_resolve()
-    if not resolve then
-        print("[Hooper AI 2.0] 无法获取 Resolve")
-        return fail_refresh("无法获取 Resolve")
-    end
-
-    local pm = resolve:GetProjectManager()
-    if not pm then
-        print("[Hooper AI 2.0] 无法获取 ProjectManager")
-        return fail_refresh("无法获取 ProjectManager")
-    end
-
-    local project = pm:GetCurrentProject()
-    if not project then
-        print("[Hooper AI 2.0] 没有打开的项目")
-        return fail_refresh("没有打开的项目")
-    end
-
-    local timeline = project:GetCurrentTimeline()
+    local timeline, active_tl_err = subfix_get_active_timeline()
     if not timeline then
-        print("[Hooper AI 2.0] 没有时间线")
-        return fail_refresh("没有时间线")
+        print("[Hooper AI 2.0] " .. tostring(active_tl_err))
+        return fail_refresh(active_tl_err)
     end
 
     -- 获取帧率
@@ -13079,7 +11211,7 @@ function refresh_subtitles(target_window, options)
 
     if track_count == 0 then
         print("[Hooper AI 2.0] 没有字幕轨道")
-        return fail_refresh("没有字幕轨道", {show_generate_cta = true})
+        return fail_refresh("没有字幕轨道")
     end
 
     if current_track > track_count then
@@ -13098,7 +11230,7 @@ function refresh_subtitles(target_window, options)
         if current_work_scope.mode == WORK_SCOPE_MODE_SELECTION then
             items = {}
         else
-            return fail_refresh("轨道 " .. tostring(current_track) .. " 上没有字幕", {show_generate_cta = true})
+            return fail_refresh("轨道 " .. tostring(current_track) .. " 上没有字幕")
         end
     end
 
@@ -13108,36 +11240,49 @@ function refresh_subtitles(target_window, options)
     local rows = {}
     local normalize_started_at = os.clock()
 
-    -- 遍历字幕
+    -- 遍历字幕：单条 item 的 Resolve API 读取异常时只跳过该条并记录，
+    -- 避免一条坏片段导致整份字幕列表加载中断。
+    local skipped_item_count = 0
     for i, item in ipairs(items) do
-        local start_frame = item:GetStart() or 0
-        local end_frame = item:GetEnd() or 0
+        local ok_start, raw_start = pcall(function() return item:GetStart() end)
+        local ok_end, raw_end = pcall(function() return item:GetEnd() end)
+        if not ok_start or not ok_end or raw_start == nil or raw_end == nil then
+            skipped_item_count = skipped_item_count + 1
+        else
+            local start_frame = tonumber(raw_start) or 0
+            local end_frame = tonumber(raw_end) or 0
 
-        if current_work_scope.mode ~= WORK_SCOPE_MODE_SELECTION or range_intersects_selection(start_frame, end_frame, current_work_scope) then
-            local name = item:GetName() or ""
+            if current_work_scope.mode ~= WORK_SCOPE_MODE_SELECTION or range_intersects_selection(start_frame, end_frame, current_work_scope) then
+                local ok_name, raw_name = pcall(function() return item:GetName() end)
+                local name = ok_name and tostring(raw_name or "") or ""
 
-            -- 计算绝对帧（中心帧）
-            -- 这里的 start_frame/end_frame 视为"绝对帧"，不要再叠加 tl_start_frame
-            local target_abs_frame = math.floor(((tonumber(start_frame) or 0) + (tonumber(end_frame) or 0)) / 2)
+                -- 计算绝对帧（中心帧）
+                -- 这里的 start_frame/end_frame 视为"绝对帧"，不要再叠加 tl_start_frame
+                local target_abs_frame = math.floor((start_frame + end_frame) / 2)
 
-            -- 计算时间码字符串
-            local tc_start = frames_to_timecode(start_frame, current_fps)
-            local tc_end = frames_to_timecode(end_frame, current_fps)
+                -- 计算时间码字符串
+                local tc_start = frames_to_timecode(start_frame, current_fps)
+                local tc_end = frames_to_timecode(end_frame, current_fps)
 
-            -- 存储数据
-            local row_data = {
-                id = build_row_id(current_track, i, start_frame, end_frame),
-                index = i,
-                target_abs_frame = target_abs_frame,
-                fps = current_fps,
-                start_frame = start_frame,
-                end_frame = end_frame,
-                text = name,
-                timecode = tc_start .. " --> " .. tc_end  -- 存储原始时间码字符串
-            }
-            row_data.display_text = build_tree_display_text(i, tostring(tc_start), tostring(tc_end), name)
-            table.insert(rows, row_data)
+                -- 存储数据
+                local row_data = {
+                    id = build_row_id(current_track, i, start_frame, end_frame),
+                    index = i,
+                    target_abs_frame = target_abs_frame,
+                    fps = current_fps,
+                    start_frame = start_frame,
+                    end_frame = end_frame,
+                    text = name,
+                    timecode = tc_start .. " --> " .. tc_end  -- 存储原始时间码字符串
+                }
+                row_data.display_text = build_tree_display_text(i, tostring(tc_start), tostring(tc_end), name)
+                table.insert(rows, row_data)
+            end
         end
+    end
+    if skipped_item_count > 0 then
+        print("[Hooper AI 2.0] 有 " .. tostring(skipped_item_count) .. " 条字幕读取失败，已跳过")
+        LogMsg("刷新字幕：" .. tostring(skipped_item_count) .. " 条 item:GetStart/GetEnd 读取失败，已跳过")
     end
 
     sort_rows_by_timing(rows)
@@ -13145,24 +11290,42 @@ function refresh_subtitles(target_window, options)
 
     if #rows == 0 then
         print("[Hooper AI 2.0] 当前范围内没有字幕")
-        return fail_refresh("当前范围内没有字幕", {show_generate_cta = true})
+        return fail_refresh("当前范围内没有字幕")
     end
     if not rows_have_usable_subtitle_text(rows) then
         print("[Hooper AI 2.0] 当前范围内只有空字幕")
-        return fail_refresh("当前范围内只有空字幕", {show_generate_cta = true})
+        return fail_refresh("当前范围内只有空字幕")
     end
+
+    -- P9：指纹一致且当前处于时间线预览时，跳过整棵树重建。
+    -- 以下情形一律强制重建（保守，杜绝 stale）：
+    --   - 调用方显式 options.force_tree_rebuild
+    --   - 加载占位/首屏/空态重试（show_loading_placeholder、skip_backup）
+    --   - 生成完成后的回读刷新
+    --   - 当前正查看备份/历史预览（必须把树切回时间线行）
+    --   - 此前没有成功渲染过指纹（冷启动/树被清空过）
+    local next_tree_fp = compute_subtitles_tree_fingerprint(rows, window)
+    local can_skip_tree_rebuild = (
+        options.force_tree_rebuild ~= true
+        and options.show_loading_placeholder ~= true
+        and options.skip_backup ~= true
+        and current_preview_source == PREVIEW_SOURCE_TIMELINE
+        and type(current_rows) == "table"
+        and #current_rows > 0
+        and _G.SUBFIX_REFRESH_TREE_FP[window] ~= nil
+        and _G.SUBFIX_REFRESH_TREE_FP[window] == next_tree_fp
+    )
 
     local render_started_at = os.clock()
-    rebuild_tree_from_rows(rows, window, {skip_sort = true})
-    print(string.format("[Hooper AI 2.0] 字幕树渲染耗时: %d ms", math.floor(((os.clock() - render_started_at) * 1000) + 0.5)))
-
-    -- 不在这里预渲染另一个窗口（曾经做过双窗口预填充以避免切换卡顿，
-    -- 但实测会在初次刷新时多花一倍渲染时间，让用户感觉"刷新很慢"）。
-    -- rebuild_tree_from_rows 已经把 full_window_tree_dirty 置为 true，
-    -- 真正切换到完整窗口时会按需渲染（见 toggle/switch 时的 dirty 检查）。
-    if is_mini_window(window) then
-        full_window_tree_dirty = true
+    if can_skip_tree_rebuild then
+        -- 树与逐行数据均未变化：保留现有树节点（选中/滚动不丢、无闪烁）。
+        -- current_rows 与新读出行逐字段同值，沿用旧对象即可，其余状态重置照常执行。
+        print("[Hooper AI 2.0] 字幕树内容指纹未变化，跳过树重建 (P9)")
+    else
+        rebuild_tree_from_rows(rows, window, {skip_sort = true})
+        _G.SUBFIX_REFRESH_TREE_FP[window] = next_tree_fp
     end
+    print(string.format("[Hooper AI 2.0] 字幕树渲染耗时: %d ms", math.floor(((os.clock() - render_started_at) * 1000) + 0.5)))
 
     undo_stack = {}
     redo_stack = {}
@@ -13172,11 +11335,10 @@ function refresh_subtitles(target_window, options)
     set_current_preview_source(PREVIEW_SOURCE_TIMELINE)
     reset_backup_selector_to_placeholder()
     update_undo_redo_button_states()
-    if is_mini_window(window) then
-        set_mini_subtitle_area_state(window, true)
-    end
 
-    -- 完整版窗口与字幕树都延后到用户首次切换时创建，避免首次加载时抢占 UI 线程。
+    -- 字幕数据已重建：复位跟随触发记忆，下个 tick 按新数组重新判定
+    playhead_follow_last_row_id = nil
+    playhead_follow_last_seen_frame = nil
 
     current_work_scope.row_count = current_rows and #current_rows or 0
     sync_work_scope_ui(window)
@@ -13188,10 +11350,20 @@ function refresh_subtitles(target_window, options)
         startup_elapsed_ms()))
 
     reset_subtitle_edit_box(window)
+    -- 刚从时间线重新载入：以此为「无未应用修改」基线。
+    pcall(capture_subfix_timeline_baseline)
     return true
 end
 
-function load_generate_selection_core_for_subfix()
+-- 生成选区字幕 core：embedded 模式只加载一次并注入宿主 dispatcher/timer 路由。
+-- standalone 调试入口（「生成选区字幕.lua」直接跑 core.run）不受影响。
+generate_selection_core_singleton = nil
+generate_selection_core_root = nil
+
+function get_generate_selection_core()
+    if generate_selection_core_singleton then
+        return generate_selection_core_singleton, nil, generate_selection_core_root
+    end
     local script_root = SUBFIX_AUDIO_ALIGN and SUBFIX_AUDIO_ALIGN.resolve_support_root and SUBFIX_AUDIO_ALIGN.resolve_support_root() or "."
     -- Keep the shared core under .subfix_support so Resolve only lists user-facing entry scripts.
     local core_path = tostring(script_root or "."):gsub("[/\\]$", "") .. "/.subfix_support/subfix_generate_selection_core.lua"
@@ -13200,42 +11372,114 @@ function load_generate_selection_core_for_subfix()
         return nil, "缺少生成模块: " .. core_path .. " " .. tostring(load_err or ""), script_root
     end
 
+    -- 注入宿主环境：core 内嵌面板复用本窗口的 UIManager/dispatcher，timer 走宿主路由，
+    -- 绝不让 core 自建第二个 UIDispatcher 或覆盖本文件的 disp.On.Timeout。
+    _G.SUBFIX_GENERATE_CORE_HOST = {
+        mode = "embedded",
+        ui = ui,
+        dispatcher = dispatcher,
+        register_timer = register_ui_timer,
+        unregister_timer = unregister_ui_timer,
+        -- Fusion loadfile 的 chunk 与主脚本沙箱全局不互通（core 里 rawget(_G,"SUBFIX_DESIGN")
+        -- 实测拿到 nil，会退回它自带的旧兜底样式），设计令牌必须显式随 host_env 注入。
+        design = SUBFIX_DESIGN,
+    }
+
     local ok, core_or_err = pcall(chunk)
+    _G.SUBFIX_GENERATE_CORE_HOST = nil
     if not ok then
         return nil, "生成模块初始化失败: " .. tostring(core_or_err), script_root
     end
-    if type(core_or_err) ~= "table" or type(core_or_err.run) ~= "function" then
-        return nil, "生成模块接口无效: " .. core_path, script_root
+    if type(core_or_err) ~= "table" or type(core_or_err.attach_embedded_panel) ~= "function" then
+        return nil, "生成模块接口无效（版本过旧）: " .. core_path, script_root
     end
+    generate_selection_core_singleton = core_or_err
+    generate_selection_core_root = script_root
     return core_or_err, nil, script_root
 end
 
-function run_generate_selection_subtitles_from_subfix(target_window)
-    local window = resolve_window(target_window)
-    update_shared_status(window, "正在生成选区字幕...")
-
-    local core, core_err, script_root = load_generate_selection_core_for_subfix()
-    if not core then
-        update_shared_status(window, core_err or "无法加载生成模块")
-        return false
-    end
-
-    local ok, run_err = core.run({
-        script_root = script_root,
-        target_subtitle_track = 1
-    })
-    if not ok then
-        local message = tostring(run_err or "生成选区字幕失败")
-        if message:find("已取消", 1, true) then
-            update_shared_status(window, "已取消生成字幕")
-        else
-            update_shared_status(window, "生成选区字幕失败: " .. message)
+-- 「选区识别」面板描述符（三步工作台第 0 页使用 wide 形态）；
+-- core 不可用时给出不可用占位，主窗口照常启动。
+function build_generate_embedded_panel_descriptor(wide)
+    local core = get_generate_selection_core()
+    if core and type(core.build_embedded_panel) == "function" then
+        local ok, descriptor = pcall(function() return core.build_embedded_panel({wide = wide == true}) end)
+        if ok and descriptor then
+            return descriptor
         end
+        print("[Hooper AI 2.0] 内嵌生成面板构造失败: " .. tostring(descriptor))
+    end
+    if wide then
+        return ui:VGroup({
+            ID = "GenerateSelectionPanelUnavailable",
+            Weight = 1,
+            ContentsMargins = {0, 0, 0, 0},
+            Spacing = 8,
+            ui:Label({Text = "选区识别", Weight = 0, Font = ui:Font{PixelSize = 16}}),
+            ui:Label({
+                ID = "GenerateSelectionUnavailableLabel",
+                Text = "选区识别模块不可用，请检查 .subfix_support 安装。",
+                Weight = 0,
+                WordWrap = true,
+                MinimumSize = {0, 36}
+            }),
+            ui:VGap(0, 1)
+        })
+    end
+    return ui:VGroup({
+        ID = "GenerateSelectionPanelUnavailable",
+        Weight = 0,
+        MinimumSize = {330, 0},
+        MaximumSize = {390, 16777215},
+        ContentsMargins = {12, 12, 12, 12},
+        Spacing = 8,
+        ui:Label({Text = "选区识别", Weight = 0, Font = ui:Font{PixelSize = 15}}),
+        ui:Label({
+            ID = "GenerateSelectionUnavailableLabel",
+            Text = "选区识别模块不可用，请检查 .subfix_support 安装。",
+            Weight = 0,
+            WordWrap = true
+        })
+    })
+end
+
+-- 主窗口创建后绑定内嵌面板事件并首次刷新选区上下文。
+function attach_generate_embedded_panel(host_window)
+    local core, core_err, script_root = get_generate_selection_core()
+    if not core then
+        print("[Hooper AI 2.0] " .. tostring(core_err))
         return false
     end
-
-    update_shared_status(window, "选区字幕已生成，正在刷新...")
-    refresh_subtitles(window, {show_loading_placeholder = true})
+    local ok, attach_err = pcall(function()
+        return core.attach_embedded_panel(host_window, {
+            script_root = script_root,
+            target_subtitle_track = tonumber(current_subtitle_target_track) or current_track or 1,
+            on_busy_changed = function(running)
+                -- 记录选区生成忙态：生成中点退出时不弹未应用修改确认（保持立即终止语义）。
+                subfix_generation_running = (running == true)
+                -- 生成期间禁用精修动作，「取消生成」保持可用（其 ID 不在 GATED_ACTION_IDS 内）。
+                pcall(set_gated_actions_enabled, running ~= true)
+                -- 进度块/取消按钮在 Hidden 间切换，重排避免留白或叠压。
+                subfix_recalc_layout(win)
+            end,
+            on_finish = function(success, err)
+                if success then
+                    -- 刷新成功（set_subtitle_loaded_state(true)）后自动进入「② 精修工具」。
+                    subfix_pending_goto_refine = true
+                    update_shared_status(win, "选区字幕已生成，正在刷新...")
+                    refresh_subtitles(win, {show_loading_placeholder = true})
+                    pcall(function() core.refresh_embedded_context() end)
+                else
+                    update_shared_status(win, "生成选区字幕失败: " .. tostring(err or ""))
+                end
+            end,
+        })
+    end)
+    if not ok or attach_err == false then
+        print("[Hooper AI 2.0] 内嵌生成面板绑定失败: " .. tostring(attach_err))
+        return false
+    end
+    pcall(function() core.refresh_embedded_context() end)
     return true
 end
 
@@ -13352,55 +11596,6 @@ rebuild_tree_from_rows = function(rows, target_window, options)
 
     invalidate_search_cache("rebuild_tree")
     SEARCH_VIEW.render_current_view(target_window or resolve_window())
-    -- 标记另一个窗口的字幕树需要刷新（延迟到切换时再渲染，避免每次操作都双重渲染）
-    local current_window = target_window or resolve_window()
-    if current_window and is_mini_window(current_window) then
-        full_window_tree_dirty = true
-    end
-end
-
-function collect_exportable_subtitles()
-    local rows = {}
-    local seen = {}
-
-    local function append_entry(entry)
-        if type(entry) ~= "table" and type(entry) ~= "string" then
-            return
-        end
-        if type(entry) == "table" then
-            if seen[entry] then return end
-            seen[entry] = true
-        end
-        table.insert(rows, entry)
-    end
-
-    -- 核心修复：优先使用 current_rows（全量数据），避免搜索过滤导致数据丢失
-    if current_rows and #current_rows > 0 then
-        for _, entry in ipairs(current_rows) do
-            append_entry(entry)
-        end
-    end
-
-    -- 兜底：如果 current_rows 为空，再尝试 subtitle_data_map
-    if #rows == 0 and next(subtitle_data_map) then
-        for _, entry in pairs(subtitle_data_map) do
-            append_entry(entry)
-        end
-    end
-
-    -- 最后的兜底：使用全局 subtitle_data
-    if #rows == 0 and type(subtitle_data) == "table" then
-        for _, entry in pairs(subtitle_data) do
-            append_entry(entry)
-        end
-    end
-
-    -- 核心修复：按 start_frame 排序，确保导出的 SRT 时序正确
-    table.sort(rows, function(a, b)
-        return (tonumber(a.start_frame) or 0) < (tonumber(b.start_frame) or 0)
-    end)
-
-    return rows
 end
 
 function normalize_export_subtitle(entry, fallback_index)
@@ -13460,8 +11655,14 @@ function normalize_export_subtitle(entry, fallback_index)
     }
 end
 
--- ========== 日志输出辅助函数 ==========
+-- ========== 日志输出辅助函数（P4：环形缓冲 + 防抖刷新 + 批量落盘） ==========
 function append_subfix_debug_log_line(line)
+    append_subfix_debug_log_lines({tostring(line or "")})
+end
+
+-- 批量落盘：一次 io.open 写多行，替代旧的每行一开一关。2MB 截断重置语义保持不变。
+function append_subfix_debug_log_lines(lines)
+    if type(lines) ~= "table" or #lines == 0 then return end
     local backup_path = current_backup_path
     if not backup_path or backup_path == "" then
         local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
@@ -13483,25 +11684,67 @@ function append_subfix_debug_log_line(line)
         if write_mode == "w" then
             SUBFIX_DEBUG_LOG_BYTES = 0
             file:write("[SubFix] 调试日志超过会话上限(~2MB)，已截断重置\n")
+            SUBFIX_DEBUG_LOG_BYTES = SUBFIX_DEBUG_LOG_BYTES + #("[SubFix] 调试日志超过会话上限(~2MB)，已截断重置") + 1
         end
-        file:write(tostring(line or "") .. "\n")
+        local blob = table.concat(lines, "\n") .. "\n"
+        file:write(blob)
         file:close()
-        SUBFIX_DEBUG_LOG_BYTES = SUBFIX_DEBUG_LOG_BYTES + #tostring(line or "") + 1
+        SUBFIX_DEBUG_LOG_BYTES = SUBFIX_DEBUG_LOG_BYTES + #blob
     elseif not ok_dir then
         print("[Hooper AI 2.0] 无法创建调试日志目录: " .. tostring(backup_path))
     end
 end
 
+-- 把环形缓冲按"最新在前"拼成字符串并同步给日志视图（防抖 timer 每 200ms 最多一次）。
+function flush_workflow_log_view(force)
+    if not workflow_log_view_dirty and not force then return end
+    workflow_log_view_dirty = false
+    local parts = {}
+    if workflow_log_ring_count > 0 then
+        local slot = workflow_log_ring_head
+        for _ = 1, workflow_log_ring_count do
+            parts[#parts + 1] = workflow_log_ring[slot]
+            slot = slot - 1
+            if slot < 1 then slot = WORKFLOW_LOG_RING_CAP end
+        end
+    end
+    workflow_log_buffer = table.concat(parts, "\n")
+    update_log_window_view()
+end
+
+-- 批量落盘 pending 日志（1s timer / 超 64KB / 退出钩子调用）。
+function flush_workflow_log_file()
+    local pending = workflow_log_pending_lines
+    if not pending or #pending == 0 then return end
+    workflow_log_pending_lines = {}
+    workflow_log_pending_bytes = 0
+    append_subfix_debug_log_lines(pending)
+end
+
 LogMsg = function(msg)
     local time_str = os.date("%H:%M:%S")
-    local line = "[" .. time_str .. "] " .. msg
-    if workflow_log_buffer == "" then
-        workflow_log_buffer = line
-    else
-        workflow_log_buffer = line .. "\n" .. workflow_log_buffer
+    local line = "[" .. time_str .. "] " .. tostring(msg)
+
+    -- O(1) 环形写入（最新在 head），超出 500 行自动覆盖最旧。
+    workflow_log_ring_head = (workflow_log_ring_head % WORKFLOW_LOG_RING_CAP) + 1
+    workflow_log_ring[workflow_log_ring_head] = line
+    if workflow_log_ring_count < WORKFLOW_LOG_RING_CAP then
+        workflow_log_ring_count = workflow_log_ring_count + 1
     end
-    update_log_window_view()
-    append_subfix_debug_log_line(line)
+    workflow_log_view_dirty = true
+
+    -- 落盘先进 pending；timer 未就绪（UI 尚未初始化的启动早期）走立即刷，行为同旧版。
+    if not workflow_log_pending_lines then workflow_log_pending_lines = {} end
+    workflow_log_pending_lines[#workflow_log_pending_lines + 1] = line
+    workflow_log_pending_bytes = workflow_log_pending_bytes + #line + 1
+    if not workflow_log_timers_ready then
+        flush_workflow_log_view(true)
+        flush_workflow_log_file()
+        return
+    end
+    if workflow_log_pending_bytes >= 64 * 1024 then
+        flush_workflow_log_file()
+    end
 end
 
 function format_subtitle_track_delta_summary(delta_result)
@@ -13544,7 +11787,14 @@ function resolve_subtitle_navigation_frame(row, timeline)
 end
 
 function timecode_to_frame_count(timecode, fps)
-    local hh, mm, ss, sep, ff = tostring(timecode or ""):match("^(%d+):(%d+):(%d+)([:;,%.])(%d+)$")
+    -- Resolve 个别版本/上下文中时间码可能带首尾空白（含换行），先 trim 再匹配，
+    -- 否则严格的 ^...$ 锚定会整体失配返回 nil（播放头跟随/拆分依赖此解析）。
+    local tc_text = trim_text(tostring(timecode or ""))
+    local hh, mm, ss, sep, ff = tc_text:match("^(%d+):(%d+):(%d+)([:;,%.])(%d+)$")
+    if not hh then
+        -- 宽松兜底：容忍多余前后缀，只要文本里能找到 H:M:S:F 结构即可。
+        hh, mm, ss, sep, ff = tc_text:match("(%d+):(%d+):(%d+)([:;,%.])(%d+)")
+    end
     if not hh then
         return nil, nil
     end
@@ -13622,7 +11872,7 @@ function go_to_subtitle(target_window, row_override)
     local window = resolve_window(target_window)
     print("[Hooper AI 2.0] 定位跳转触发")
 
-    if not find_window_item(window, "SubtitleTree", "MiniSubtitleTree") then
+    if not find_window_item(window, "SubtitleTree") then
         print("[Hooper AI 2.0] 无法获取 Tree")
         return
     end
@@ -13649,18 +11899,22 @@ function go_to_subtitle(target_window, row_override)
     if not resolve then return end
     
     local pm = resolve:GetProjectManager()
+    if not pm then
+        print("[Hooper AI 2.0] 无法获取 ProjectManager")
+        return
+    end
     local project = pm:GetCurrentProject()
     if not project then
         print("[Hooper AI 2.0] 没有项目")
         return
     end
-    
+
     local timeline = project:GetCurrentTimeline()
     if not timeline then
         print("[Hooper AI 2.0] 没有时间线")
         return
     end
-    
+
     local tc, abs_start = resolve_subtitle_navigation_timecode(data, timeline)
     local timeline_start_tc = ""
     pcall(function() timeline_start_tc = tostring(timeline:GetStartTimecode() or "") end)
@@ -13702,16 +11956,35 @@ function do_replace()
     if not has_current_rows and not has_subtitle_map then
         print("[Hooper AI 2.0] 没有字幕数据")
         local status = win:Find("StatusLabel")
-        if status then status:Set("Text", "没有字幕数据") end
+        if status then subfix_status_set(status, "没有字幕数据") end
         return
     end
 
-    local escaped_find = find_text:gsub("([%%%^%$%(%)%%.%[%]%*%+%-%?])", "%%%1")
+    -- 查找/替换均按纯文本处理：不把用户输入当模式，也不对替换串做 % 转义
+    -- （直接走 gsub 时，替换文本里的 %1、% 等会触发 invalid capture index）。
+    local function plain_replace_all(text, find_text_str, repl_text)
+        find_text_str = tostring(find_text_str or "")
+        if find_text_str == "" then return text end
+        repl_text = tostring(repl_text or "")
+        local parts = {}
+        local start_idx = 1
+        while true do
+            local s, e = string.find(text, find_text_str, start_idx, true)
+            if not s then
+                parts[#parts + 1] = string.sub(text, start_idx)
+                break
+            end
+            parts[#parts + 1] = string.sub(text, start_idx, s - 1)
+            parts[#parts + 1] = repl_text
+            start_idx = e + 1
+        end
+        return table.concat(parts)
+    end
 
     if find_text == "" then
         print("[Hooper AI 2.0] 请输入要查找的文字")
         local status = win:Find("StatusLabel")
-        if status then status:Set("Text", "请输入要查找的文字") end
+        if status then subfix_status_set(status, "请输入要查找的文字") end
         return
     end
 
@@ -13727,7 +12000,7 @@ function do_replace()
         for i, data in ipairs(current_rows) do
             if data and data.text then
                 local old_text = tostring(data.text or "")
-                local new_text = string.gsub(old_text, escaped_find, replace_text)
+                local new_text = plain_replace_all(old_text, find_text, replace_text)
                 if new_text ~= old_text then
                     report_entries[#report_entries + 1] = report_helpers.format_batch_change_report_line(
                         data.index or i,
@@ -13760,7 +12033,7 @@ function do_replace()
         for node, data in pairs(subtitle_data_map) do
             if data and data.text then
                 local old_text = tostring(data.text or "")
-                local new_text = string.gsub(old_text, escaped_find, replace_text)
+                local new_text = plain_replace_all(old_text, find_text, replace_text)
                 if new_text ~= old_text then
                     report_entries[#report_entries + 1] = report_helpers.format_batch_change_report_line(
                         data.index,
@@ -13790,7 +12063,7 @@ function do_replace()
 
     print("[Hooper AI 2.0] 批量替换完成，修改了 " .. count .. " 条")
     local status = win:Find("StatusLabel")
-    if status then status:Set("Text", "已替换 " .. count .. " 条") end
+    if status then subfix_status_set(status, "已替换 " .. count .. " 条") end
     report_helpers.show_batch_result_report(action_label, report_entries, count)
 end
 
@@ -13808,59 +12081,6 @@ function work_scopes_match(left, right)
         and tonumber(left.end_frame) == tonumber(right.end_frame)
         and tostring(left.mark_type or "") == tostring(right.mark_type or "")
 end
-
-function timeline_item_timing_key(item)
-    local ok_start, start_frame = pcall(function() return item:GetStart() end)
-    local ok_end, end_frame = pcall(function() return item:GetEnd() end)
-    return tostring(ok_start and start_frame or "") .. "|" .. tostring(ok_end and end_frame or "")
-end
-
-
-function filter_new_subtitle_items_for_track(timeline, track_index, before_snapshot)
-    local items = select(1, get_subtitle_track_items(track_index, timeline)) or {}
-    local known_counts = clone_table(((before_snapshot or {}).tracks or {})[track_index] or {})
-    local new_items = {}
-
-    for _, item in ipairs(items) do
-        local key = timeline_item_timing_key(item)
-        if (known_counts[key] or 0) > 0 then
-            known_counts[key] = known_counts[key] - 1
-        else
-            new_items[#new_items + 1] = item
-        end
-    end
-
-    return new_items
-end
-
-
-
-function parse_first_srt_timing_line(srt_path)
-    local path = tostring(srt_path or "")
-    if path == "" then
-        return "", ""
-    end
-
-    local file = io.open(path, "r")
-    if not file then
-        return "", ""
-    end
-
-    for line in file:lines() do
-        local start_time, end_time = tostring(line or ""):match("^(%d+:%d+:%d+,%d+)%s+%-%-%>%s+(%d+:%d+:%d+,%d+)")
-        if start_time then
-            file:close()
-            return start_time, end_time
-        end
-    end
-
-    file:close()
-    return "", ""
-end
-
-
-
-
 
 function build_selection_composite_rows(timeline, track_index, scope, selection_rows, fps)
     if type(scope) ~= "table" or scope.mode ~= WORK_SCOPE_MODE_SELECTION then
@@ -13999,13 +12219,14 @@ end
 function update_timeline_selection_scope()
     print("[Hooper AI 2.0] 选区模式更新时间线按钮点击")
     LogMsg("开始选区合成整轨写回，脚本版本 " .. tostring(SUBFIX_SCRIPT_BUILD) .. "，目标字幕轨 " .. tostring(current_subtitle_target_track))
+    suspend_playhead_follow(3)
 
     local status = win and win:Find("StatusLabel")
     local function fail_selection_update(message)
         local text = tostring(message or "选区模式暂不支持安全写回")
         print("[Hooper AI 2.0] " .. text)
         LogMsg(text)
-        if status then status:Set("Text", text) end
+        if status then subfix_status_set(status, text) end
         return false
     end
 
@@ -14076,7 +12297,7 @@ function update_timeline_selection_scope()
     )
     print("[Hooper AI 2.0] " .. msg)
     LogMsg(msg)
-    if status then status:Set("Text", msg) end
+    if status then subfix_status_set(status, msg) end
 
     local original_rows = current_rows
     local original_scope = clone_work_scope(current_work_scope)
@@ -14093,6 +12314,10 @@ function update_timeline_selection_scope()
         return fail_selection_update("选区合成整轨写回失败: " .. tostring(result))
     end
 
+    if result ~= false then
+        -- 写回成功：当前内存即为时间线内容，重置未应用修改基线。
+        pcall(capture_subfix_timeline_baseline)
+    end
     return result ~= false
 end
 
@@ -14100,17 +12325,23 @@ end
 update_timeline = function(target_window)
     print("[Hooper AI 2.0] 更新时间线按钮点击")
     LogMsg("开始更新时间线，目标字幕轨 " .. tostring(current_subtitle_target_track))
+    -- 整轨重导入期间挂起播放跟随，避免播放头恢复动作触发误跟随。
+    suspend_playhead_follow(3)
     
     local resolve = get_resolve()
     if not resolve then return end
     
     local pm = resolve:GetProjectManager()
+    if not pm then
+        print("[Hooper AI 2.0] 无法获取 ProjectManager")
+        return
+    end
     local project = pm:GetCurrentProject()
     if not project then
         print("[Hooper AI 2.0] 没有项目")
         return
     end
-    
+
     local mediaPool = project:GetMediaPool()
     local timeline = project:GetCurrentTimeline()
     if not timeline then
@@ -14129,7 +12360,23 @@ update_timeline = function(target_window)
     end
 
     local original_playhead_timecode = capture_timeline_playhead_timecode(timeline)
+    -- isolate 前的轨道启用快照与“目标轨保持启用”标志：写回的所有退出路径
+    -- （成功或任意中途失败）都经 finish_timeline_update 统一恢复，
+    -- 杜绝其他字幕轨被 isolate 临时禁用后永久关闭。
+    local pre_isolate_track_snapshot = nil
+    local isolate_keep_target_track = nil
     local function finish_timeline_update(result)
+        if pre_isolate_track_snapshot then
+            local restore_ok, restore_err = restore_subtitle_track_enabled_states(
+                pre_isolate_track_snapshot, isolate_keep_target_track, timeline
+            )
+            if restore_ok then
+                LogMsg("已恢复导入前字幕轨启用状态")
+            else
+                print("[Hooper AI 2.0] " .. tostring(restore_err))
+                LogMsg(tostring(restore_err))
+            end
+        end
         restore_timeline_playhead_timecode(timeline, original_playhead_timecode, "更新时间线")
         return result
     end
@@ -14139,17 +12386,13 @@ update_timeline = function(target_window)
     local srt_filename = "Timeline_Update_" .. unique_id .. ".srt"
     local srt_path = current_backup_path .. "/" .. srt_filename
 
-    -- 状态提示跟随发起窗口（迷你版为 MiniStatusLabel），并回退到完整版 StatusLabel；
-    -- 完整版窗口尚未创建时也不会因 win 为 nil 而报错。
-    local status = target_window and find_window_item(target_window, "StatusLabel", "MiniStatusLabel") or nil
+    -- 状态提示跟随发起窗口的 StatusLabel；主窗口尚未创建时回退到全局 win。
+    local status = target_window and find_window_item(target_window, "StatusLabel") or nil
     if not status and win and win.Find then
         local ok_status, full_status = pcall(function() return win:Find("StatusLabel") end)
         if ok_status then status = full_status end
     end
-    if not status then
-        status = find_window_item(mini_win, "MiniStatusLabel")
-    end
-    if status then status:Set("Text", "准备更新字幕轨 " .. tostring(current_subtitle_target_track)) end
+    if status then subfix_status_set(status, "准备更新字幕轨 " .. tostring(current_subtitle_target_track)) end
     LogMsg("准备更新字幕轨 " .. tostring(current_subtitle_target_track))
 
     local approved_pending_count, pending_dirty_row_ids = apply_approved_pending_changes_to_rows(current_rows)
@@ -14163,7 +12406,7 @@ update_timeline = function(target_window)
     if not file then
         print("[Hooper AI 2.0] 无法创建 SRT 文件")
         LogMsg("无法创建 SRT 文件: " .. tostring(srt_path))
-        if status then status:Set("Text", "无法创建更新用 SRT") end
+        if status then subfix_status_set(status, "无法创建更新用 SRT") end
         return finish_timeline_update()
     end
 
@@ -14238,7 +12481,7 @@ update_timeline = function(target_window)
     if index == 1 then
         print("[Hooper AI 2.0] 没有生成任何字幕")
         LogMsg("没有生成任何字幕，已取消更新时间线")
-        if status then status:Set("Text", "没有可导入的字幕") end
+        if status then subfix_status_set(status, "没有可导入的字幕") end
         return finish_timeline_update()
     end
     
@@ -14268,15 +12511,15 @@ update_timeline = function(target_window)
     if not ensured_items then
         print("[Hooper AI 2.0] " .. tostring(ensure_err))
         LogMsg("确保目标字幕轨存在失败: " .. tostring(ensure_err))
-        if status then status:Set("Text", "目标字幕轨准备失败") end
+        if status then subfix_status_set(status, "目标字幕轨准备失败") end
         return finish_timeline_update()
     end
 
     LogMsg("已确认目标字幕轨存在: 轨道 " .. tostring(current_subtitle_target_track) .. "，当前 " .. tostring(#ensured_items) .. " 条字幕")
 
-    local original_track_state_snapshot = select(1, get_subtitle_track_state_snapshot(timeline))
-    if original_track_state_snapshot then
-        local before_state_msg = "导入前字幕轨状态: " .. format_subtitle_track_state_snapshot(original_track_state_snapshot)
+    pre_isolate_track_snapshot = select(1, get_subtitle_track_state_snapshot(timeline))
+    if pre_isolate_track_snapshot then
+        local before_state_msg = "导入前字幕轨状态: " .. format_subtitle_track_state_snapshot(pre_isolate_track_snapshot)
         print("[Hooper AI 2.0] " .. before_state_msg)
         LogMsg(before_state_msg)
     end
@@ -14292,19 +12535,21 @@ update_timeline = function(target_window)
         print("[Hooper AI 2.0] 切换字幕启用轨失败: " .. tostring(isolate_msg))
         LogMsg("切换字幕启用轨失败: " .. tostring(isolate_msg))
         if status then
-            status:Set("Text", "无法切换到字幕轨 " .. tostring(current_subtitle_target_track))
+            subfix_status_set(status, "无法切换到字幕轨 " .. tostring(current_subtitle_target_track))
         end
         return finish_timeline_update()
     end
     print("[Hooper AI 2.0] 已切换字幕启用轨: " .. tostring(isolate_msg))
     LogMsg("已切换字幕启用轨: " .. tostring(isolate_msg))
+    -- isolate 成功：写回完成后目标轨保持启用，其余轨按快照恢复。
+    isolate_keep_target_track = current_subtitle_target_track
 
     local clear_ok, deleted_count, remaining_count, clear_err = clear_subtitle_track_clips(current_subtitle_target_track, timeline)
     if not clear_ok then
         print("[Hooper AI 2.0] 清空目标字幕轨失败: " .. tostring(clear_err))
         LogMsg("清空目标字幕轨失败: " .. tostring(clear_err))
         if status then
-            status:Set("Text", "清空轨道 " .. tostring(current_subtitle_target_track) .. " 失败")
+            subfix_status_set(status, "清空轨道 " .. tostring(current_subtitle_target_track) .. " 失败")
         end
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
@@ -14315,13 +12560,13 @@ update_timeline = function(target_window)
     local cleared_msg = string.format("已清空轨道 %d 旧字幕 %d 条", current_subtitle_target_track, deleted_count or 0)
     print("[Hooper AI 2.0] " .. cleared_msg)
     LogMsg(cleared_msg)
-    if status then status:Set("Text", cleared_msg) end
+    if status then subfix_status_set(status, cleared_msg) end
 
     local before_snapshot, before_err = snapshot_subtitle_tracks(timeline)
     if not before_snapshot then
         print("[Hooper AI 2.0] 导入前快照失败: " .. tostring(before_err))
         LogMsg("导入前快照失败: " .. tostring(before_err))
-        if status then status:Set("Text", "导入前轨道快照失败") end
+        if status then subfix_status_set(status, "导入前轨道快照失败") end
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
@@ -14333,7 +12578,7 @@ update_timeline = function(target_window)
     if not mediaPoolItems or #mediaPoolItems == 0 then
         print("[Hooper AI 2.0] 导入字幕到媒体池失败")
         LogMsg("导入字幕到媒体池失败")
-        if status then status:Set("Text", "导入字幕到媒体池失败") end
+        if status then subfix_status_set(status, "导入字幕到媒体池失败") end
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
@@ -14348,7 +12593,7 @@ update_timeline = function(target_window)
     if not append_ok or append_result == false or append_result == nil then
         print("[Hooper AI 2.0] 插入失败")
         LogMsg("AppendToTimeline 插入失败")
-        if status then status:Set("Text", "字幕追加到时间线失败") end
+        if status then subfix_status_set(status, "字幕追加到时间线失败") end
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
@@ -14361,7 +12606,7 @@ update_timeline = function(target_window)
     if not final_after_snapshot then
         print("[Hooper AI 2.0] 导入后快照失败: " .. tostring(after_err))
         LogMsg("导入后快照失败: " .. tostring(after_err))
-        if status then status:Set("Text", "字幕已导入，但无法验证落轨") end
+        if status then subfix_status_set(status, "字幕已导入，但无法验证落轨") end
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
@@ -14380,7 +12625,7 @@ update_timeline = function(target_window)
         local ok_msg = string.format("字幕已更新，样式轨复用成功（轨道 %d）", current_subtitle_target_track)
         print("[Hooper AI 2.0] " .. ok_msg)
         LogMsg(ok_msg)
-        if status then status:Set("Text", ok_msg) end
+        if status then subfix_status_set(status, ok_msg) end
     elseif final_delta.detected_track then
         local warn_msg = string.format(
             "字幕已更新，但 Resolve 将新字幕放入了轨道 %d，未复用目标轨样式",
@@ -14388,12 +12633,12 @@ update_timeline = function(target_window)
         )
         print("[Hooper AI 2.0] " .. warn_msg)
         LogMsg(warn_msg)
-        if status then status:Set("Text", warn_msg) end
+        if status then subfix_status_set(status, warn_msg) end
     else
         local unknown_msg = "字幕已导入，但未检测到新增字幕轨变化，请手动检查时间线"
         print("[Hooper AI 2.0] " .. unknown_msg)
         LogMsg(unknown_msg)
-        if status then status:Set("Text", unknown_msg) end
+        if status then subfix_status_set(status, unknown_msg) end
     end
 
     if fallback_locked then
@@ -14406,6 +12651,9 @@ update_timeline = function(target_window)
         end
     end
 
+    -- 写回成功：当前内存字幕（含已合并的批准建议）即时间线内容，重置退出提醒基线。
+    -- 中途任何失败路径都提前 return，不会走到这里，因此脏状态得以保留。
+    pcall(capture_subfix_timeline_baseline)
     return finish_timeline_update()
 end
 
@@ -14417,7 +12665,7 @@ function do_ai_fix()
     AI_CANCEL_REQUESTED = false
 
     local status = win:Find("StatusLabel")
-    if status then status:Set("Text", "正在调用 AI 处理...") end
+    if status then subfix_status_set(status, "正在调用 AI 处理...") end
     reset_pending_review_session()
     
     -- 获取 AI 配置；配置弹窗按需创建，未打开时直接读取本地持久化配置。
@@ -14451,30 +12699,30 @@ function do_ai_fix()
     if provider_allows_api_url_edit(provider_def) then
         if api_url == "" then
             print("[Hooper AI 2.0] 请输入 API Base URL")
-            if status then status:Set("Text", "请输入 API Base URL") end
+            if status then subfix_status_set(status, "请输入 API Base URL") end
             return
         end
         if model == "" then
             print("[Hooper AI 2.0] 请输入模型名称")
-            if status then status:Set("Text", "请输入模型名称") end
+            if status then subfix_status_set(status, "请输入模型名称") end
             return
         end
     elseif provider_protocol == "gemini_native" and model == "" then
         print("[Hooper AI 2.0] 请输入 Gemini 模型名称")
-        if status then status:Set("Text", "请输入 Gemini 模型名称") end
+        if status then subfix_status_set(status, "请输入 Gemini 模型名称") end
         return
     end
 
     if api_key == "" then
         print("[Hooper AI 2.0] 请输入 API Key")
-        if status then status:Set("Text", "请输入 API Key") end
+        if status then subfix_status_set(status, "请输入 API Key") end
         return
     end
     
     -- 修复：优先使用 current_rows，避免搜索过滤导致 AI 处理数据丢失
     if not current_rows or #current_rows == 0 then
         print("[Hooper AI 2.0] 没有字幕数据")
-        if status then status:Set("Text", "没有字幕数据") end
+        if status then subfix_status_set(status, "没有字幕数据") end
         return
     end
     
@@ -15254,267 +13502,6 @@ function do_ai_fix()
             end
         end
         return nil
-    end
-
-    local function decode_json_text(json_text)
-        if type(json_text) ~= "string" or json_text == "" then
-            return nil, "JSON 为空或不是字符串"
-        end
-
-        local pos = 1
-        local json_len = #json_text
-        local parse_value
-
-        local function fail(msg)
-            error(msg .. "（位置 " .. tostring(pos) .. "）", 0)
-        end
-
-        local function skip_whitespace()
-            while pos <= json_len do
-                local ch = json_text:sub(pos, pos)
-                if ch == " " or ch == "\n" or ch == "\r" or ch == "\t" then
-                    pos = pos + 1
-                else
-                    break
-                end
-            end
-        end
-
-        local function codepoint_to_utf8(code)
-            if code <= 127 then
-                return string.char(code)
-            elseif code <= 2047 then
-                local byte1 = 192 + math.floor(code / 64)
-                local byte2 = 128 + (code % 64)
-                return string.char(byte1, byte2)
-            elseif code <= 65535 then
-                local byte1 = 224 + math.floor(code / 4096)
-                local byte2 = 128 + (math.floor(code / 64) % 64)
-                local byte3 = 128 + (code % 64)
-                return string.char(byte1, byte2, byte3)
-            elseif code <= 1114111 then
-                local byte1 = 240 + math.floor(code / 262144)
-                local byte2 = 128 + (math.floor(code / 4096) % 64)
-                local byte3 = 128 + (math.floor(code / 64) % 64)
-                local byte4 = 128 + (code % 64)
-                return string.char(byte1, byte2, byte3, byte4)
-            end
-
-            return ""
-        end
-
-        local function parse_string()
-            if json_text:sub(pos, pos) ~= '"' then
-                fail("JSON 字符串必须以双引号开始")
-            end
-
-            pos = pos + 1
-            local parts = {}
-            local chunk_start = pos
-
-            while pos <= json_len do
-                local ch = json_text:sub(pos, pos)
-                if ch == '"' then
-                    if pos > chunk_start then
-                        table.insert(parts, json_text:sub(chunk_start, pos - 1))
-                    end
-                    pos = pos + 1
-                    return table.concat(parts)
-                elseif ch == "\\" then
-                    if pos > chunk_start then
-                        table.insert(parts, json_text:sub(chunk_start, pos - 1))
-                    end
-
-                    local esc = json_text:sub(pos + 1, pos + 1)
-                    if esc == "" then
-                        fail("JSON 字符串转义不完整")
-                    elseif esc == '"' or esc == "\\" or esc == "/" then
-                        table.insert(parts, esc)
-                        pos = pos + 2
-                    elseif esc == "b" then
-                        table.insert(parts, "\b")
-                        pos = pos + 2
-                    elseif esc == "f" then
-                        table.insert(parts, "\f")
-                        pos = pos + 2
-                    elseif esc == "n" then
-                        table.insert(parts, "\n")
-                        pos = pos + 2
-                    elseif esc == "r" then
-                        table.insert(parts, "\r")
-                        pos = pos + 2
-                    elseif esc == "t" then
-                        table.insert(parts, "\t")
-                        pos = pos + 2
-                    elseif esc == "u" then
-                        local hex = json_text:sub(pos + 2, pos + 5)
-                        if #hex < 4 or not hex:match("^[0-9a-fA-F]+$") then
-                            fail("JSON Unicode 转义无效")
-                        end
-
-                        local code = tonumber(hex, 16)
-                        pos = pos + 6
-
-                        if code >= 55296 and code <= 56319 and json_text:sub(pos, pos + 1) == "\\u" then
-                            local low_hex = json_text:sub(pos + 2, pos + 5)
-                            local low_code = low_hex:match("^[0-9a-fA-F]+$") and tonumber(low_hex, 16) or nil
-                            if low_code and low_code >= 56320 and low_code <= 57343 then
-                                code = 65536 + (code - 55296) * 1024 + (low_code - 56320)
-                                pos = pos + 6
-                            end
-                        end
-
-                        table.insert(parts, codepoint_to_utf8(code))
-                    else
-                        fail("遇到不支持的 JSON 转义字符")
-                    end
-
-                    chunk_start = pos
-                else
-                    local byte = string.byte(json_text, pos)
-                    if byte and byte < 32 then
-                        fail("JSON 字符串包含非法控制字符")
-                    end
-                    pos = pos + 1
-                end
-            end
-
-            fail("JSON 字符串未正确闭合")
-        end
-
-        local function parse_number()
-            local tail = json_text:sub(pos)
-            local number_text = tail:match("^%-?%d+%.%d+[eE][%+%-]?%d+")
-                or tail:match("^%-?%d+%.%d+")
-                or tail:match("^%-?%d+[eE][%+%-]?%d+")
-                or tail:match("^%-?%d+")
-
-            if not number_text then
-                fail("JSON 数字格式无效")
-            end
-
-            local value = tonumber(number_text)
-            if not value then
-                fail("JSON 数字无法转换")
-            end
-
-            pos = pos + #number_text
-            return value
-        end
-
-        local function parse_array()
-            pos = pos + 1
-            skip_whitespace()
-
-            local result = {}
-            if json_text:sub(pos, pos) == "]" then
-                pos = pos + 1
-                return result
-            end
-
-            while true do
-                result[#result + 1] = parse_value()
-                skip_whitespace()
-
-                local ch = json_text:sub(pos, pos)
-                if ch == "," then
-                    pos = pos + 1
-                    skip_whitespace()
-                elseif ch == "]" then
-                    pos = pos + 1
-                    break
-                else
-                    fail("JSON 数组缺少逗号或右中括号")
-                end
-            end
-
-            return result
-        end
-
-        local function parse_object()
-            pos = pos + 1
-            skip_whitespace()
-
-            local result = {}
-            if json_text:sub(pos, pos) == "}" then
-                pos = pos + 1
-                return result
-            end
-
-            while true do
-                skip_whitespace()
-                if json_text:sub(pos, pos) ~= '"' then
-                    fail("JSON 对象键必须是字符串")
-                end
-
-                local key = parse_string()
-                skip_whitespace()
-                if json_text:sub(pos, pos) ~= ":" then
-                    fail("JSON 对象键值之间缺少冒号")
-                end
-
-                pos = pos + 1
-                result[key] = parse_value()
-                skip_whitespace()
-
-                local ch = json_text:sub(pos, pos)
-                if ch == "," then
-                    pos = pos + 1
-                    skip_whitespace()
-                elseif ch == "}" then
-                    pos = pos + 1
-                    break
-                else
-                    fail("JSON 对象缺少逗号或右大括号")
-                end
-            end
-
-            return result
-        end
-
-        parse_value = function()
-            skip_whitespace()
-            local ch = json_text:sub(pos, pos)
-
-            if ch == "" then
-                fail("JSON 提前结束")
-            elseif ch == '"' then
-                return parse_string()
-            elseif ch == "{" then
-                return parse_object()
-            elseif ch == "[" then
-                return parse_array()
-            elseif ch == "t" and json_text:sub(pos, pos + 3) == "true" then
-                pos = pos + 4
-                return true
-            elseif ch == "f" and json_text:sub(pos, pos + 4) == "false" then
-                pos = pos + 5
-                return false
-            elseif ch == "n" and json_text:sub(pos, pos + 3) == "null" then
-                pos = pos + 4
-                return nil
-            elseif ch == "-" or ch:match("%d") then
-                return parse_number()
-            end
-
-            fail("无法识别的 JSON 值")
-        end
-
-        local ok, result = pcall(function()
-            skip_whitespace()
-            local value = parse_value()
-            skip_whitespace()
-            if pos <= json_len then
-                fail("JSON 尾部存在多余内容")
-            end
-            return value
-        end)
-
-        if ok then
-            return result
-        end
-
-        return nil, tostring(result)
     end
 
     local function strip_code_block(text)
@@ -16309,7 +14296,7 @@ function do_ai_fix()
         local err_msg = string.format("参考文稿过长（%d 字），超过 %d 字上限，请精简后重试。", script_char_count, REFERENCE_SCRIPT_HARD_LIMIT)
         print("[Hooper AI 2.0] " .. err_msg)
         LogMsg("[AI] " .. err_msg)
-        if status then status:Set("Text", err_msg) end
+        if status then subfix_status_set(status, err_msg) end
         return
     end
 
@@ -16471,7 +14458,7 @@ function do_ai_fix()
             on_cancel = function()
                 AI_CANCEL_REQUESTED = true
                 kill_ai_curl_process()
-                if status then status:Set("Text", "❌ AI 处理已取消") end
+                if status then subfix_status_set(status, "❌ AI 处理已取消") end
             end
         })
     end
@@ -16676,7 +14663,9 @@ function do_ai_fix()
         end
 
         print("[Hooper AI 2.0] JSON payload 长度: " .. #json_payload)
-        print("[Hooper AI 2.0] 转义后的字幕(前200字符): " .. string.sub(escaped_subs, 1, 200))
+        if SUBFIX_AI_DEBUG_VERBOSE then
+            print("[Hooper AI 2.0] 转义后的字幕(前200字符): " .. string.sub(escaped_subs, 1, 200))
+        end
         print("[Hooper AI 2.0] 请求标签: " .. tostring(request_label or "default"))
         print("[Hooper AI 2.0] 请求协议: " .. tostring(provider_protocol))
         print("[Hooper AI 2.0] 请求地址: " .. tostring(request_url))
@@ -16688,11 +14677,13 @@ function do_ai_fix()
         req_file:write(json_payload)
         req_file:close()
 
-        local req_debug_f = io.open(temp_req_file, "r")
-        if req_debug_f then
-            local req_debug = req_debug_f:read("*a")
-            req_debug_f:close()
-            print("[Hooper AI 2.0] 请求文件内容(前300字符):\n" .. string.sub(req_debug, 1, 300))
+        if SUBFIX_AI_DEBUG_VERBOSE then
+            local req_debug_f = io.open(temp_req_file, "r")
+            if req_debug_f then
+                local req_debug = req_debug_f:read("*a")
+                req_debug_f:close()
+                print("[Hooper AI 2.0] 请求文件内容(前300字符):\n" .. string.sub(req_debug, 1, 300))
+            end
         end
 
         print("[Hooper AI 2.0] 执行 curl 请求 (后台 + 嵌套 RunLoop 等待)...")
@@ -16841,7 +14832,9 @@ function do_ai_fix()
         resp_file:close()
 
         print("[Hooper AI 2.0] API 响应长度: " .. #resp_content)
-        print("[Hooper AI 2.0] API 原始响应内容:\n" .. tostring(resp_content))
+        if SUBFIX_AI_DEBUG_VERBOSE then
+            print("[Hooper AI 2.0] API 原始响应内容:\n" .. tostring(resp_content))
+        end
 
         local curl_output_lower = string.lower(tostring(curl_error_output or ""))
         local resp_content_lower = string.lower(tostring(resp_content or ""))
@@ -16996,7 +14989,7 @@ function do_ai_fix()
         })
         local detected_type, detection_err, detection_status = detect_ai_task_direction(task_type, sorted_list, execute_ai_request)
         if not detected_type then
-            if status then status:Set("Text", detection_err) end
+            if status then subfix_status_set(status, detection_err) end
             finish_ai_progress(ai_progress, detection_status == "cancelled" and "cancelled" or "failed", detection_err)
             return
         end
@@ -17022,7 +15015,7 @@ function do_ai_fix()
             -- 用户在上一批后按了 ⏻ → 直接退出，不再发起新一批
             if AI_CANCEL_REQUESTED then
                 print("[Hooper AI 2.0] 完整纠错被用户取消（第 " .. batch_idx .. " 批前）")
-                if status then status:Set("Text", "❌ AI 处理已取消") end
+                if status then subfix_status_set(status, "❌ AI 处理已取消") end
                 finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 return
             end
@@ -17040,7 +15033,7 @@ function do_ai_fix()
                 progress_total = total_batches * 2
             })
             if status then
-                status:Set("Text", string.format("正在调用完整纠错...（第 %d/%d 批）", batch_idx, total_batches))
+                subfix_status_set(status, string.format("正在调用完整纠错...（第 %d/%d 批）", batch_idx, total_batches))
             end
 
             ai_content, finish_reason, request_err, request_err_type = execute_ai_request(batch_subtitle_list, "fix_batch_" .. tostring(batch_idx), {
@@ -17052,7 +15045,7 @@ function do_ai_fix()
                 local fallback_msg = "参考文稿过长，已自动切换为无文稿模式重试。"
                 print("[Hooper AI 2.0] " .. fallback_msg .. "（第 " .. batch_idx .. "/" .. total_batches .. " 批）")
                 LogMsg("[AI] " .. fallback_msg .. "（第 " .. batch_idx .. "/" .. total_batches .. " 批）")
-                if status then status:Set("Text", fallback_msg) end
+                if status then subfix_status_set(status, fallback_msg) end
                 update_ai_progress(ai_progress, {
                     stage = "完整纠错",
                     message = fallback_msg,
@@ -17071,7 +15064,7 @@ function do_ai_fix()
             end
             if not ai_content then
                 print("[Hooper AI 2.0] 请求失败: " .. tostring(request_err))
-                if status then status:Set("Text", tostring(request_err)) end
+                if status then subfix_status_set(status, tostring(request_err)) end
                 if request_err_type == "cancelled" then
                     finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 else
@@ -17082,7 +15075,7 @@ function do_ai_fix()
 
             if finish_reason == "length" then
                 print("[Hooper AI 2.0] AI 输出被截断，未执行替换。")
-                if status then status:Set("Text", "❌ AI 输出被截断，请缩小批次或重试。") end
+                if status then subfix_status_set(status, "❌ AI 输出被截断，请缩小批次或重试。") end
                 finish_ai_progress(ai_progress, "failed", "❌ AI 输出被截断，请缩小批次或重试。")
                 return
             end
@@ -17090,7 +15083,7 @@ function do_ai_fix()
             local batch_subtitle_map, payload_err, missing_indices = ai_helpers.parse_ai_line_payload(ai_content, batch_end - batch_start + 1, batch_start, true)
             if not batch_subtitle_map then
                 print("[Hooper AI 2.0] AI 行文本结果校验失败: " .. tostring(payload_err))
-                if status then status:Set("Text", "❌ AI 返回结果校验失败，未覆盖字幕。") end
+                if status then subfix_status_set(status, "❌ AI 返回结果校验失败，未覆盖字幕。") end
                 finish_ai_progress(ai_progress, "failed", "❌ AI 返回结果校验失败，未覆盖字幕。")
                 return
             end
@@ -17121,7 +15114,7 @@ function do_ai_fix()
             )
             if boundary_request_status == "cancelled" or AI_CANCEL_REQUESTED then
                 print("[Hooper AI 2.0] 完整纠错边界修复被用户取消（第 " .. batch_idx .. " 批）")
-                if status then status:Set("Text", "❌ AI 处理已取消") end
+                if status then subfix_status_set(status, "❌ AI 处理已取消") end
                 finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 return
             end
@@ -17279,7 +15272,7 @@ function do_ai_fix()
             -- 用户在上一批后按了 ⏻ → 直接退出，不再发起新一批
             if AI_CANCEL_REQUESTED then
                 print("[Hooper AI 2.0] 的地得专项检测被用户取消（第 " .. batch_idx .. " 批前）")
-                if status then status:Set("Text", "❌ AI 处理已取消") end
+                if status then subfix_status_set(status, "❌ AI 处理已取消") end
                 finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 return
             end
@@ -17296,7 +15289,7 @@ function do_ai_fix()
                 progress_total = total_batches
             })
             if status then
-                status:Set("Text", string.format("正在调用的地得专项检测...（第 %d/%d 批）", batch_idx, total_batches))
+                subfix_status_set(status, string.format("正在调用的地得专项检测...（第 %d/%d 批）", batch_idx, total_batches))
             end
 
             local request_status = nil
@@ -17307,7 +15300,7 @@ function do_ai_fix()
             })
             if not ai_content then
                 print("[Hooper AI 2.0] 请求失败: " .. tostring(request_err))
-                if status then status:Set("Text", tostring(request_err)) end
+                if status then subfix_status_set(status, tostring(request_err)) end
                 if request_status == "cancelled" then
                     finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 else
@@ -17318,7 +15311,7 @@ function do_ai_fix()
 
             if finish_reason == "length" then
                 print("[Hooper AI 2.0] 的地得专项检测输出被截断，未执行替换。")
-                if status then status:Set("Text", "❌ AI 输出被截断，请缩小批次或重试。") end
+                if status then subfix_status_set(status, "❌ AI 输出被截断，请缩小批次或重试。") end
                 finish_ai_progress(ai_progress, "failed", "❌ AI 输出被截断，请缩小批次或重试。")
                 return
             end
@@ -17326,7 +15319,7 @@ function do_ai_fix()
             local batch_subtitle_map, payload_err, missing_indices = ai_helpers.parse_ai_line_payload(ai_content, batch_end - batch_start + 1, batch_start, true)
             if not batch_subtitle_map then
                 print("[Hooper AI 2.0] AI 行文本结果校验失败: " .. tostring(payload_err))
-                if status then status:Set("Text", "❌ AI 返回结果校验失败，未覆盖字幕。") end
+                if status then subfix_status_set(status, "❌ AI 返回结果校验失败，未覆盖字幕。") end
                 finish_ai_progress(ai_progress, "failed", "❌ AI 返回结果校验失败，未覆盖字幕。")
                 return
             end
@@ -17380,7 +15373,7 @@ function do_ai_fix()
         for batch_idx = 1, total_translation_batches do
             if AI_CANCEL_REQUESTED then
                 print("[Hooper AI 2.0] 翻译被用户取消（第 " .. batch_idx .. " 批前）")
-                if status then status:Set("Text", "❌ AI 处理已取消") end
+                if status then subfix_status_set(status, "❌ AI 处理已取消") end
                 finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 return
             end
@@ -17397,7 +15390,7 @@ function do_ai_fix()
                 progress_total = total_translation_batches
             })
             if status then
-                status:Set("Text", string.format("正在调用%s...（第 %d/%d 批）", tostring(task_name or "翻译"), batch_idx, total_translation_batches))
+                subfix_status_set(status, string.format("正在调用%s...（第 %d/%d 批）", tostring(task_name or "翻译"), batch_idx, total_translation_batches))
             end
 
             local request_status = nil
@@ -17406,7 +15399,7 @@ function do_ai_fix()
             })
             if not ai_content then
                 print("[Hooper AI 2.0] 请求失败: " .. tostring(request_err))
-                if status then status:Set("Text", tostring(request_err)) end
+                if status then subfix_status_set(status, tostring(request_err)) end
                 if request_status == "cancelled" then
                     finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 else
@@ -17417,7 +15410,7 @@ function do_ai_fix()
 
             if finish_reason == "length" then
                 print("[Hooper AI 2.0] 翻译输出被截断，未执行替换。")
-                if status then status:Set("Text", "❌ AI 输出被截断，请缩小批次或重试。") end
+                if status then subfix_status_set(status, "❌ AI 输出被截断，请缩小批次或重试。") end
                 finish_ai_progress(ai_progress, "failed", "❌ AI 输出被截断，请缩小批次或重试。")
                 return
             end
@@ -17425,7 +15418,7 @@ function do_ai_fix()
             local batch_subtitle_map, payload_err, missing_indices = ai_helpers.parse_ai_line_payload(ai_content, batch_end - batch_start + 1, batch_start, true)
             if not batch_subtitle_map then
                 print("[Hooper AI 2.0] AI 行文本结果校验失败: " .. tostring(payload_err))
-                if status then status:Set("Text", "❌ AI 返回结果校验失败，未覆盖字幕。") end
+                if status then subfix_status_set(status, "❌ AI 返回结果校验失败，未覆盖字幕。") end
                 finish_ai_progress(ai_progress, "failed", "❌ AI 返回结果校验失败，未覆盖字幕。")
                 return
             end
@@ -17447,7 +15440,7 @@ function do_ai_fix()
             for retry_index, missing_idx in ipairs(translation_missing_indices) do
                 if AI_CANCEL_REQUESTED then
                     print("[Hooper AI 2.0] 翻译重试被用户取消（index=" .. tostring(missing_idx) .. "）")
-                    if status then status:Set("Text", "❌ AI 处理已取消") end
+                    if status then subfix_status_set(status, "❌ AI 处理已取消") end
                     finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                     return
                 end
@@ -17464,7 +15457,7 @@ function do_ai_fix()
                     progress_total = total_translation_batches + #translation_missing_indices
                 })
                 if status then
-                    status:Set("Text", string.format("正在重试%s漏回字幕...（index %d）", tostring(task_name or "翻译"), missing_idx))
+                    subfix_status_set(status, string.format("正在重试%s漏回字幕...（index %d）", tostring(task_name or "翻译"), missing_idx))
                 end
 
                 local retry_status = nil
@@ -17473,7 +15466,7 @@ function do_ai_fix()
                 })
                 if not retry_ai_content then
                     print("[Hooper AI 2.0] 翻译漏行重试失败: " .. tostring(retry_err))
-                    if status then status:Set("Text", "❌ AI 漏回字幕重试失败，未覆盖字幕。") end
+                    if status then subfix_status_set(status, "❌ AI 漏回字幕重试失败，未覆盖字幕。") end
                     if retry_status == "cancelled" then
                         finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                     else
@@ -17484,7 +15477,7 @@ function do_ai_fix()
 
                 if retry_finish_reason == "length" then
                     print("[Hooper AI 2.0] 翻译漏行重试输出被截断，未执行替换。")
-                    if status then status:Set("Text", "❌ AI 漏回字幕重试输出被截断，未覆盖字幕。") end
+                    if status then subfix_status_set(status, "❌ AI 漏回字幕重试输出被截断，未覆盖字幕。") end
                     finish_ai_progress(ai_progress, "failed", "❌ AI 漏回字幕重试输出被截断，未覆盖字幕。")
                     return
                 end
@@ -17492,14 +15485,14 @@ function do_ai_fix()
                 local retry_map, retry_payload_err = ai_helpers.parse_ai_line_payload(retry_ai_content, 1, missing_idx, false)
                 if not retry_map then
                     print("[Hooper AI 2.0] 翻译漏行重试结果校验失败: " .. tostring(retry_payload_err))
-                    if status then status:Set("Text", "❌ AI 漏回字幕重试校验失败，未覆盖字幕。") end
+                    if status then subfix_status_set(status, "❌ AI 漏回字幕重试校验失败，未覆盖字幕。") end
                     finish_ai_progress(ai_progress, "failed", "❌ AI 漏回字幕重试校验失败，未覆盖字幕。")
                     return
                 end
 
                 if type(retry_map[missing_idx]) ~= "string" or trim_text(retry_map[missing_idx]) == "" then
                     print("[Hooper AI 2.0] 翻译漏行重试缺少有效文本: index=" .. tostring(missing_idx))
-                    if status then status:Set("Text", "❌ AI 漏回字幕重试缺少有效文本，未覆盖字幕。") end
+                    if status then subfix_status_set(status, "❌ AI 漏回字幕重试缺少有效文本，未覆盖字幕。") end
                     finish_ai_progress(ai_progress, "failed", "❌ AI 漏回字幕重试缺少有效文本，未覆盖字幕。")
                     return
                 end
@@ -17558,7 +15551,7 @@ function do_ai_fix()
     end
 
     print("[Hooper AI 2.0] " .. status_text)
-    if status then status:Set("Text", status_text) end
+    if status then subfix_status_set(status, status_text) end
     LogMsg("[AI] " .. status_text)
     finish_ai_progress(ai_progress, "done", status_text)
     
@@ -17989,207 +15982,10 @@ end
 WINDOW_META = {
     tab_switch_old_code_removed = true,
     orphaned_tabs_removed = true,
-    mini_window_id = "HooperAI_v2_minimal",
-    mini_window_title = "找个字幕",
     main_window_id = "HooperAI_v2_compact_narrow500_final_h960",
-    main_window_title = "改个字幕",
+    main_window_title = "SubFix 字幕工作台",
 }
 
-mini_content = ui:VGroup({
-    Weight = 1,
-    ID = "MiniRoot",
-    Font = ui:Font{PixelSize = 14},
-    StyleSheet = SUBFIX_MAIN_ROOT_STYLESHEET,
-    ContentsMargins = {10, 8, 10, 8},
-    Spacing = 4,
-
-    ui:HGroup({
-        ID = "MiniTopBar",
-        Weight = 0,
-        MinimumSize = {0, 34},
-        Spacing = 4,
-        ui:Label({ID = "MiniTrackLabel", Text = "字幕轨", Weight = 0}),
-        ui:HGroup({
-            ID = "MiniTrackSpinWrap",
-            Weight = 0,
-            Spacing = 4,
-            MinimumSize = {64, 32},
-            ui:LineEdit({
-                ID = "MiniTrackSpin",
-                Text = "1",
-                Weight = 1,
-                MinimumSize = {40, 32},
-                Alignment = {AlignHCenter = true, AlignVCenter = true}
-            }),
-            ui:VGroup({
-                ID = "MiniTrackStepGroup",
-                Weight = 0,
-                Spacing = 0,
-                MinimumSize = {20, 32},
-                ui:Button({ID = "MiniTrackSpinUp", Text = "▲", Weight = 1, MinimumSize = {20, 16}, StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT}),
-                ui:Button({ID = "MiniTrackSpinDown", Text = "▼", Weight = 1, MinimumSize = {20, 16}, StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT})
-            })
-        }),
-        ui:Button({ID = "MiniRefreshBtn", Text = "刷新字幕", Weight = 0, StyleSheet = SUBFIX_BTN_SECONDARY}),
-        ui:Button({ID = "MiniOpenFullBtn", Text = "打开完整版", Weight = 0, MinimumSize = {120, 28}, StyleSheet = SUBFIX_BTN_ACCENT}),
-        ui:Label({
-            ID = "MiniLoadStatusLabel",
-            Text = "⚠️ 请先刷新字幕",
-            Weight = 0,
-            MinimumSize = {60, 20},
-            Alignment = {AlignLeft = true, AlignVCenter = true}
-        }),
-        ui:HGap(0, 1.0),
-        ui:Button({ID = "ExportBtn", Text = "📤 导出", Weight = 0, MinimumSize = {88, 28}, StyleSheet = SUBFIX_BTN_SECONDARY})
-    }),
-
-        ui:HGroup({
-            ID = "MiniSearchRow",
-            Weight = 0,
-            Spacing = 0,
-            MinimumSize = {0, 38},
-            MaximumSize = {16777215, 38},
-            ui:VGroup({
-                Weight = 1,
-                MinimumSize = {0, 38},
-                MaximumSize = {16777215, 38},
-                ContentsMargins = {0, 3, 0, 3},
-                Spacing = 0,
-                ui:LineEdit({
-                    ID = "MiniSearchBox",
-                    PlaceholderText = "搜索字幕内容（双击跳转）",
-                    Weight = 0,
-                    MinimumSize = {0, 32},
-                    MaximumSize = {16777215, 32}
-                })
-            })
-        }),
-
-    ui:VGap(6),
-
-    ui:VGroup({
-        ID = "MiniSubtitleArea",
-        Weight = 1,
-        Spacing = 0,
-        ui:VGroup({
-            ID = "MiniSubtitlePlaceholder",
-            Weight = 1,
-            Spacing = 8,
-            ui:VGap(0, 1),
-            ui:Label({
-                ID = "MiniSubtitlePlaceholderLabel",
-                Text = "正在自动加载字幕…",
-                Weight = 0,
-                Alignment = {AlignHCenter = true, AlignVCenter = true},
-                WordWrap = true
-            }),
-            ui:HGroup({
-                Weight = 0,
-                ui:HGap(0, 1),
-                ui:Button({
-                    ID = "MiniGenerateSelectionSubtitlesBtn",
-                    Text = "生成选区字幕",
-                    Weight = 0,
-                    MinimumSize = {132, 30},
-                    MaximumSize = {180, 32},
-                    StyleSheet = SUBFIX_BTN_ACCENT
-                }),
-                ui:HGap(0, 1)
-            }),
-            ui:VGap(0, 1)
-        }),
-        ui:HGroup({
-            ID = "MiniSubtitleTreeWrap",
-            Weight = 1,
-            Spacing = 0,
-            ui:Tree({
-                ID = "MiniSubtitleTree",
-                Weight = 1,
-                Header = {Text = "字幕预览  ·  双击跳转"},
-                Events = { ItemClicked = true, ItemDoubleClicked = true }
-            })
-        })
-    }),
-
-    -- 字幕编辑区（常驻编辑框）：与完整版一致，选中字幕行后在此编辑并保存
-    ui:VGroup({
-        ID = "MiniSubtitleEditArea",
-        Weight = 0,
-        ContentsMargins = {0, 4, 0, 4},
-        Spacing = 4,
-        ui:Label({
-            ID = "MiniEditSubtitleLabel",
-            Text = "请选择一条字幕进行编辑",
-            Weight = 0,
-            Alignment = {AlignLeft = true, AlignVCenter = true}
-        }),
-        ui:LineEdit({
-            ID = "MiniEditSubtitleText",
-            Text = "",
-            Weight = 1,
-            MinimumSize = {0, 28},
-            Events = { ReturnPressed = true }
-        }),
-        ui:HGroup({
-            ID = "MiniSubtitleEditButtons",
-            Weight = 0,
-            Spacing = 8,
-            ui:Button({ID = "MiniEditSubtitleRevertBtn", Text = "还原", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_SECONDARY}),
-            ui:Button({ID = "MiniEditSubtitleSaveBtn", Text = "保存修改", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_ACCENT})
-        })
-    }),
-
-    -- 更新到时间线：目标字幕轨 + 执行按钮（与完整版一致）
-    ui:HGroup({
-        ID = "MiniTimelineRow",
-        Weight = 0,
-        MinimumSize = {0, 34},
-        Spacing = 8,
-        ui:Label({
-            Text = "更新到轨",
-            Weight = 0,
-            Alignment = {AlignLeft = true, AlignVCenter = true}
-        }),
-        ui:HGroup({
-            ID = "MiniTargetTrackSpinWrap",
-            Weight = 0,
-            Spacing = 4,
-            MinimumSize = {76, 34},
-            ui:LineEdit({
-                ID = "MiniTargetTrackSpin",
-                Text = "1",
-                Weight = 1,
-                MinimumSize = {44, 34},
-                Alignment = {AlignHCenter = true, AlignVCenter = true}
-            }),
-            ui:VGroup({
-                ID = "MiniTargetTrackStepGroup",
-                Weight = 0,
-                Spacing = 0,
-                MinimumSize = {22, 34},
-                ui:Button({ID = "MiniTargetTrackSpinUp", Text = "▲", Weight = 1, MinimumSize = {22, 17}, StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT}),
-                ui:Button({ID = "MiniTargetTrackSpinDown", Text = "▼", Weight = 1, MinimumSize = {22, 17}, StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT})
-            })
-        }),
-        ui:Button({
-            ID = "MiniUpdateBtn",
-            Text = "📝 更新时间线",
-            Weight = 1,
-            MinimumSize = {0, 34},
-            Enabled = false,
-            StyleSheet = SUBFIX_BTN_ACCENT
-        })
-    }),
-
-    -- 状态行：承载刷新/保存/更新到时间线的提示（对应完整版的 StatusLabel）
-    ui:Label({
-        ID = "MiniStatusLabel",
-        Text = "准备就绪",
-        Weight = 0,
-        MinimumSize = {0, 18},
-        Alignment = {AlignLeft = true, AlignVCenter = true}
-    })
-})
 
 function create_full_content()
 return ui:VGroup({
@@ -18198,57 +15994,59 @@ return ui:VGroup({
     Font = ui:Font{PixelSize = 14},
     StyleSheet = SUBFIX_MAIN_ROOT_STYLESHEET,
     ContentsMargins = 8,
-    Spacing = 5,
+    Spacing = 8,
 
     -- 1. 顶部工具区
     ui:VGroup({
         ID = "TopArea",
         Weight = 0,
-        Spacing = 5,
+        Spacing = 8,
         ui:HGroup({
             ID = "TopBar",
             Weight = 0,
-            Spacing = 10,
+            Spacing = 8,
             ui:Label({ID = "TrackLabel", Text = "字幕轨", Weight = 0}),
             ui:HGroup({
                 ID = "TrackSpinWrap",
                 Weight = 0,
                 Spacing = 4,
-                MinimumSize = {64, 32},
+                MinimumSize = {72, 40},
                 ui:LineEdit({
                     ID = "TrackSpin",
                     Text = "1",
                     Weight = 1,
-                    MinimumSize = {40, 32},
+                    MinimumSize = {44, 32},
+                    ToolTip = "字幕所在轨道号（1–10）",
                     Alignment = {AlignHCenter = true, AlignVCenter = true}
                 }),
                 ui:VGroup({
                     ID = "TrackStepGroup",
                     Weight = 0,
                     Spacing = 0,
-                    MinimumSize = {20, 32},
-                    ui:Button({ID = "TrackSpinUp", Text = "▲", Weight = 1, MinimumSize = {20, 16}, StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT}),
-                    ui:Button({ID = "TrackSpinDown", Text = "▼", Weight = 1, MinimumSize = {20, 16}, StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT})
+                    MinimumSize = {24, 40},
+                    ui:Button({ID = "TrackSpinUp", Text = "▲", Weight = 1, MinimumSize = {24, 20}, ToolTip = "轨道号 +1", StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT}),
+                    ui:Button({ID = "TrackSpinDown", Text = "▼", Weight = 1, MinimumSize = {24, 20}, ToolTip = "轨道号 -1", StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT})
                 })
             }),
-            ui:Button({ID = "RefreshBtn", Text = "刷新字幕", Weight = 0, StyleSheet = SUBFIX_BTN_ACCENT}),
-            ui:Button({ID = "CheckUpdateBtn", Text = "检查更新", Weight = 0, StyleSheet = SUBFIX_BTN_SECONDARY}),
-            ui:Button({ID = "ExportBtn", Text = "📤 导出", Weight = 0, MinimumSize = {88, 32}, StyleSheet = SUBFIX_BTN_SECONDARY}),
+            -- 高频但非终极写回动作：降为次级按钮，把唯一主色留给「更新时间线」。
+            ui:Button({ID = "RefreshBtn", Text = "刷新字幕", Weight = 0, MinimumSize = {0, 32}, StyleSheet = SUBFIX_BTN_SECONDARY}),
+            ui:Button({ID = "CheckUpdateBtn", Text = "检查更新", Weight = 0, MinimumSize = {0, 32}, StyleSheet = SUBFIX_BTN_SECONDARY}),
+            ui:Button({ID = "ExportBtn", Text = "导出", Weight = 0, MinimumSize = {88, 32}, ToolTip = "导出当前字幕（SRT/TXT）", StyleSheet = SUBFIX_BTN_SECONDARY}),
             -- 加载状态标签已删除（底部「已加载 N 条」更准确）。HGap 保留右侧空间。
             ui:HGap(0, 1.0),
             ui:Button({
                 ID = "ForceQuitBtn",
-                Text = "⏻",
+                Text = "退出",
                 Weight = 0,
-                MinimumSize = {44, 40},
-                MaximumSize = {44, 40},
-                ToolTip = "强制退出 SubFix（关闭所有 SubFix 窗口，不可撤销）"
+                MinimumSize = {88, 32},
+                ToolTip = "强制退出 SubFix（关闭所有 SubFix 窗口，不可撤销）",
+                StyleSheet = SUBFIX_BTN_SECONDARY
             })
         }),
         ui:HGroup({
             ID = "SearchRow",
             Weight = 0,
-            Spacing = 5,
+            Spacing = 8,
             MinimumSize = {0, 38},
             MaximumSize = {16777215, 38},
             ui:VGroup({
@@ -18265,97 +16063,202 @@ return ui:VGroup({
                     MaximumSize = {16777215, 30}
                 })
             })
-        }),
-        ui:VGap(0)
-    }),
-    
-    -- 3. 选项卡面板
-    ui:HGroup({
-        Weight = 0,
-        Spacing = 0,
-        ui:TabBar({
-            ID = "MainTabs",
-            Weight = 1
-        })
-    }),
-    
-    -- 4. 面板堆叠区
-    ui:Stack({
-            ID = "TabStack",
-            Weight = 0,
-            
-            -- 面板 A：精修工具
-            ui:VGroup({
-                ID = "ToolTabPage",
-                Weight = 0,
-                Spacing = 4,
-                ui:HGroup({
-                    Weight = 0,
-                    Spacing = 8,
-                    ui:Button({ID = "BtnStep3", Text = "规整字幕长度", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY}),
-                    ui:Button({ID = "BtnStep2", Text = "中文数字互转", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY})
-                }),
-                ui:HGroup({
-                    Weight = 0,
-                    Spacing = 8,
-                    ui:Button({ID = "BtnStep1", Text = "修改英文排版", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY}),
-                    ui:Button({ID = "BtnStep4", Text = "最终交付检查", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY})
-                }),
-                ui:HGroup({
-                    Weight = 0,
-                    Spacing = 5,
-                    ui:Label({Text = "查找:", Weight = 0, MinimumSize = {35, 24}, Alignment = {AlignRight = true, AlignVCenter = true}}),
-                    ui:LineEdit({ID = "FindInput", PlaceholderText = "例如：错别字", Weight = 1}),
-                    ui:Label({Text = "替换为:", Weight = 0, MinimumSize = {45, 24}, Alignment = {AlignRight = true, AlignVCenter = true}}),
-                    ui:LineEdit({ID = "ReplaceInput", Weight = 1}),
-                    ui:Button({ID = "BatchReplaceBtn", Text = "执行批量替换", Weight = 0, MinimumSize = {112, 28}, StyleSheet = SUBFIX_BTN_ACCENT})
-                })
-            }),
-            
-            -- 面板 B：AI 工作台
-            ui:VGroup({
-                ID = "AITabPage",
-                Weight = 0,
-                Spacing = 3,
-                ui:HGroup({
-                    Weight = 0,
-                    Spacing = 5,
-                    ui:Label({Text = "任务:", Weight = 0, MinimumSize = {35, 24}, Alignment = {AlignRight = true, AlignVCenter = true}}),
-                    ui:ComboBox({ID = "AITaskSelect", Weight = 1})
-                }),
-                ui:HGroup({
-                    Weight = 0,
-                    Spacing = 5,
-                    ui:Label({Text = "引擎:", Weight = 0, MinimumSize = {35, 24}, Alignment = {AlignRight = true, AlignVCenter = true}}),
-                    ui:ComboBox({ID = "PresetCombo", Weight = 1})
-                }),
-                ui:HGroup({
-                    Weight = 0,
-                    Spacing = 5,
-                    MinimumSize = {0, 34},
-                    ui:Button({ID = "ConfigBtn", Text = "⚙️ 配置", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_SECONDARY}),
-                    ui:Button({ID = "AIFixBtn", Text = "开始 AI 处理", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_ACCENT})
-                }),
-                ui:VGap(4)
-            })
-        }),
-    
-    -- 5. 核心字幕列表区
-    ui:HGroup({
-        Weight = 1,
-        Spacing = 0,
-        ui:Tree({
-            ID = "SubtitleTree",
-            Weight = 1,
-            Header = {Text = "字幕预览  ·  双击跳转"},
-            Events = { ItemClicked = true, ItemDoubleClicked = true }
         })
     }),
 
-    -- 5.5 字幕编辑区（常驻编辑框）
+    -- 2. 主工作区：三步工作台
+    --    ① 选区识别（语音转写/文稿匹配）→ ② 精修工具 / ③ AI 工作台 → 写回时间线。
+    --    Stack 页 0 是 core wide 面板（占满工作区）；字幕树/编辑区在识别页隐藏，
+    --    把垂直空间全部让给音频树；切到②③时恢复并把 Stack 收回固定高。
+    ui:VGroup({
+        ID = "LeftWorkspace",
+        Weight = 1,
+        Spacing = 8,
+
+        -- 选项卡
+        ui:HGroup({
+            Weight = 0,
+            Spacing = 0,
+            ui:TabBar({
+                ID = "MainTabs",
+                Weight = 1
+            })
+        }),
+
+        -- 面板插槽：识别页必须 Weight=1 占满工作区，core 面板内 Weight=1 的音频树才能
+        -- 吸收全部剩余纵向空间；若这里是 Weight=0（按内容自然高），树只能拿到 120px 最小高，
+        -- 而 LeftWorkspace 的剩余高度无处分配，会在「开始生成」与底部栏之间空出一大片
+        -- （绿框留白），且树过矮、音轨一多时行与下方提示/「生成选项」叠字（红框）。
+        -- 切到②③时仅 Hidden=true：隐藏控件 RecalcLayout 后不占空间（与 SubtitleTreeWrap 同）。
+        ui:VGroup({
+            ID = "RecognitionSlot",
+            Weight = 1,
+            Spacing = 0,
+            ContentsMargins = {0, 0, 0, 0},
+            build_generate_embedded_panel_descriptor(true)
+        }),
+
+        -- 面板堆叠区（页序：精修 / AI / 未解锁引导）；②③ 时才显示。
+        ui:Stack({
+                ID = "TabStack",
+                Weight = 0,
+                Hidden = true,
+
+                -- 页 0：精修工具
+                ui:VGroup({
+                    ID = "ToolTabPage",
+                    Weight = 0,
+                    Spacing = 4,
+                    ui:HGroup({
+                        Weight = 0,
+                        Spacing = 8,
+                        ui:Button({ID = "BtnStep3", Text = "规整字幕长度", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY}),
+                        ui:Button({ID = "BtnStep2", Text = "中文数字互转", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY})
+                    }),
+                    ui:HGroup({
+                        Weight = 0,
+                        Spacing = 8,
+                        ui:Button({ID = "BtnStep1", Text = "修改英文排版", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY}),
+                        ui:Button({ID = "BtnStep4", Text = "最终交付检查", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY})
+                    }),
+                    ui:HGroup({
+                        Weight = 0,
+                        Spacing = 8,
+                        ui:Button({ID = "BtnStep6", Text = "敏感词替换", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY}),
+                        ui:Button({ID = "BtnStep7", Text = "清空行", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY}),
+                        ui:Button({ID = "BtnStep8", Text = "提取纯文本", Weight = 1, StyleSheet = SUBFIX_BTN_SECONDARY})
+                    }),
+                    ui:HGroup({
+                        Weight = 0,
+                        Spacing = 5,
+                        ui:Label({Text = "查找:", Weight = 0, MinimumSize = {46, 24}, Alignment = {AlignRight = true, AlignVCenter = true}}),
+                        ui:LineEdit({ID = "FindInput", PlaceholderText = "例如：错别字", Weight = 1}),
+                        ui:Label({Text = "替换为:", Weight = 0, MinimumSize = {46, 24}, Alignment = {AlignRight = true, AlignVCenter = true}}),
+                        ui:LineEdit({ID = "ReplaceInput", Weight = 1}),
+                        ui:Button({ID = "BatchReplaceBtn", Text = "执行批量替换", Weight = 0, MinimumSize = {112, 28}, StyleSheet = SUBFIX_BTN_ACCENT_OUTLINE})
+                    })
+                }),
+
+                -- 页 2：AI 工作台
+                ui:VGroup({
+                    ID = "AITabPage",
+                    Weight = 0,
+                    Spacing = 3,
+                    ui:HGroup({
+                        Weight = 0,
+                        Spacing = 5,
+                        ui:Label({Text = "任务:", Weight = 0, MinimumSize = {46, 24}, Alignment = {AlignRight = true, AlignVCenter = true}}),
+                        ui:ComboBox({ID = "AITaskSelect", Weight = 1})
+                    }),
+                    ui:HGroup({
+                        Weight = 0,
+                        Spacing = 5,
+                        ui:Label({Text = "引擎:", Weight = 0, MinimumSize = {46, 24}, Alignment = {AlignRight = true, AlignVCenter = true}}),
+                        ui:ComboBox({ID = "PresetCombo", Weight = 1})
+                    }),
+                    ui:HGroup({
+                        Weight = 0,
+                        Spacing = 5,
+                        MinimumSize = {0, 34},
+                        ui:Button({ID = "ConfigBtn", Text = "配置", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_SECONDARY}),
+                        ui:Button({ID = "AIFixBtn", Text = "开始 AI 处理", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_ACCENT})
+                    }),
+                    ui:VGap(4)
+                }),
+
+                -- 页 3：未解锁引导（无字幕时点②③看到）
+                ui:VGroup({
+                    ID = "LockedHintPage",
+                    Weight = 1,
+                    ContentsMargins = {0, 0, 0, 0},
+                    ui:VGap(0, 1),
+                    ui:HGroup({
+                        Weight = 0,
+                        Spacing = 0,
+                        ui:HGap(0, 1),
+                        ui:VGroup({
+                            Weight = 0,
+                            Spacing = 8,
+                            ui:Label({Text = "①", Weight = 0, Font = ui:Font{PixelSize = 34}, Alignment = {AlignHCenter = true}}),
+                            ui:Label({Text = "还没有可精修的字幕", Weight = 0, Font = ui:Font{PixelSize = 16}, Alignment = {AlignHCenter = true}}),
+                            ui:Label({
+                                Text = "请先在「① 选区识别」中用语音转写或文稿匹配生成字幕，再回来精修与写回。",
+                                Weight = 0,
+                                WordWrap = true,
+                                MinimumSize = {360, 36},
+                                MaximumSize = {420, 16777215},
+                                Font = ui:Font{PixelSize = (SUBFIX_DESIGN.font and SUBFIX_DESIGN.font.meta) or 12},
+                                Alignment = {AlignHCenter = true, AlignVCenter = true}
+                            }),
+                            ui:HGroup({
+                                Weight = 0,
+                                Spacing = 8,
+                                MinimumSize = {0, 36},
+                                ui:HGap(0, 1),
+                                ui:Button({ID = "GotoRecognitionBtn", Text = "去选区识别", Weight = 0, MinimumSize = {132, 32}, StyleSheet = SUBFIX_BTN_ACCENT}),
+                                ui:HGap(0, 1)
+                            })
+                        }),
+                        ui:HGap(0, 1)
+                    }),
+                    ui:VGap(0, 1)
+                })
+        }),
+
+        -- 3. 字幕列表区（识别页隐藏）；内含空状态：无字幕时替换树给出引导。
+        ui:VGroup({
+            ID = "SubtitleTreeWrap",
+            Weight = 1,
+            Spacing = 0,
+            Hidden = true,
+
+            ui:Tree({
+                ID = "SubtitleTree",
+                Weight = 1,
+                Header = {Text = "字幕预览  ·  双击跳转"},
+                Events = { ItemClicked = true, ItemDoubleClicked = true }
+            }),
+
+            ui:VGroup({
+                ID = "SubtitleEmptyState",
+                Weight = 1,
+                Spacing = 0,
+                Hidden = true,
+                ui:VGap(0, 1),
+                ui:HGroup({
+                    Weight = 0,
+                    Spacing = 0,
+                    ui:HGap(0, 1),
+                    ui:VGroup({
+                        Weight = 0,
+                        Spacing = 8,
+                        ui:Label({Text = "当前轨道没有字幕", Weight = 0, Font = ui:Font{PixelSize = 16}, Alignment = {AlignHCenter = true}}),
+                        ui:Label({
+                            Text = "先在第 ① 步用语音转写或文稿匹配生成字幕",
+                            Weight = 0,
+                            Font = ui:Font{PixelSize = (SUBFIX_DESIGN.font and SUBFIX_DESIGN.font.meta) or 12},
+                            Alignment = {AlignHCenter = true}
+                        }),
+                        ui:HGroup({
+                            Weight = 0,
+                            Spacing = 8,
+                            MinimumSize = {0, 36},
+                            ui:Button({ID = "GotoRecognitionFromEmptyBtn", Text = "去选区识别", Weight = 0, MinimumSize = {120, 32}, StyleSheet = SUBFIX_BTN_ACCENT}),
+                            ui:Button({ID = "EmptyRefreshBtn", Text = "重新刷新", Weight = 0, MinimumSize = {120, 32}, StyleSheet = SUBFIX_BTN_SECONDARY})
+                        })
+                    }),
+                    ui:HGap(0, 1)
+                }),
+                ui:VGap(0, 1)
+            })
+        })
+    }),
+
+    -- 4. 字幕编辑区（识别页隐藏）
     ui:VGroup({
         ID = "SubtitleEditArea",
         Weight = 0,
+        Hidden = true,
         ContentsMargins = {0, 4, 0, 4},
         Spacing = 4,
         ui:Label({
@@ -18369,40 +16272,35 @@ return ui:VGroup({
             Text = "",
             Weight = 1,
             MinimumSize = {0, 28},
-            Events = { ReturnPressed = true }
+            Events = { ReturnPressed = true, TextChanged = true }
         }),
         ui:HGroup({
             ID = "SubtitleEditButtons",
             Weight = 0,
             Spacing = 8,
             ui:Button({ID = "EditSubtitleRevertBtn", Text = "还原", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_SECONDARY}),
+            ui:Button({ID = "EditSubtitleSplitBtn", Text = "拆分", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_SECONDARY,
+                ToolTip = "按编辑框当前光标位置直接拆成两条字幕（先在文本中点击拆分点，再点此按钮，不弹窗）"}),
             ui:Button({ID = "EditSubtitleSaveBtn", Text = "保存修改", Weight = 1, MinimumSize = {0, 28}, StyleSheet = SUBFIX_BTN_ACCENT})
         })
     }),
 
-    -- 6. 底部操作栏
+    -- 5. 底部操作栏（备份与撤回/清空合并为一行，压缩固定高度，给字幕区让空间）
     ui:VGroup({
         ID = "BottomBar",
         Weight = 0,
-        ContentsMargins = {0, 6, 0, 6},
-        Spacing = 6,
+        ContentsMargins = {0, 4, 0, 4},
+        Spacing = 8,
         ui:HGroup({
             ID = "BackupRow",
             Weight = 0,
-            Spacing = 5,
-            ui:Label({Text = "备份", Weight = 0}),
-            ui:Button({ID = "BackupFolderBtn", Text = "📁", Weight = 0, StyleSheet = SUBFIX_BTN_SECONDARY}),
-            ui:ComboBox({ID = "BackupPathInput", Weight = 1})
-        }),
-        ui:HGroup({
-            ID = "BackupActionRow",
-            Weight = 0,
             Spacing = 8,
-            MinimumSize = {0, 34},
-            ui:Button({ID = "UndoBtn", Text = "撤回", Weight = 1, MinimumSize = {0, 30}, StyleSheet = SUBFIX_BTN_SECONDARY}),
-            ui:Button({ID = "CleanBtn", Text = "清空", Weight = 1, MinimumSize = {0, 30}, StyleSheet = SUBFIX_BTN_SECONDARY})
+            MinimumSize = {0, 32},
+            ui:Button({ID = "BackupFolderBtn", Text = "备份", Weight = 0, MinimumSize = {52, 32}, ToolTip = "打开备份文件夹", StyleSheet = SUBFIX_BTN_SECONDARY}),
+            ui:ComboBox({ID = "BackupPathInput", Weight = 1}),
+            ui:Button({ID = "UndoBtn", Text = "撤回", Weight = 0, MinimumSize = {88, 32}, StyleSheet = SUBFIX_BTN_SECONDARY}),
+            ui:Button({ID = "CleanBtn", Text = "清空", Weight = 0, MinimumSize = {88, 32}, StyleSheet = SUBFIX_BTN_SECONDARY})
         }),
-        ui:VGap(4),
         ui:HGroup({
             ID = "TargetTrackRow",
             Weight = 0,
@@ -18412,7 +16310,7 @@ return ui:VGroup({
                 ID = "TargetTrackControlGroup",
                 Weight = 0,
                 MinimumSize = {0, 36},
-                Spacing = 6,
+                Spacing = 8,
                 ui:Label({
                     Text = "更新到轨",
                     Weight = 0,
@@ -18421,13 +16319,14 @@ return ui:VGroup({
                 ui:HGroup({
                     ID = "TargetTrackSpinWrap",
                     Weight = 0,
-                    Spacing = 8,
-                    MinimumSize = {80, 36},
+                    Spacing = 4,
+                    MinimumSize = {84, 36},
                     ui:LineEdit({
                         ID = "TargetTrackSpin",
                         Text = "1",
                         Weight = 1,
-                        MinimumSize = {48, 36},
+                        MinimumSize = {48, 32},
+                        ToolTip = "写回字幕的目标轨道号（1–10）",
                         Alignment = {AlignHCenter = true, AlignVCenter = true}
                     }),
                     ui:VGroup({
@@ -18435,14 +16334,15 @@ return ui:VGroup({
                         Weight = 0,
                         Spacing = 0,
                         MinimumSize = {24, 36},
-                        ui:Button({ID = "TargetTrackSpinUp", Text = "▲", Weight = 1, MinimumSize = {24, 18}, StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT}),
-                        ui:Button({ID = "TargetTrackSpinDown", Text = "▼", Weight = 1, MinimumSize = {24, 18}, StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT})
+                        ui:Button({ID = "TargetTrackSpinUp", Text = "▲", Weight = 1, MinimumSize = {24, 18}, ToolTip = "轨道号 +1", StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT}),
+                        ui:Button({ID = "TargetTrackSpinDown", Text = "▼", Weight = 1, MinimumSize = {24, 18}, ToolTip = "轨道号 -1", StyleSheet = SUBFIX_BTN_SECONDARY_TIGHT})
                     })
                 })
             }),
-            ui:Button({ID = "UpdateBtn", Text = "📝 更新时间线", Weight = 1, MinimumSize = {0, 36}, StyleSheet = SUBFIX_BTN_ACCENT})
+            -- 「更新时间线」是工作台一切修改落地到字幕轨的唯一闸门（未点击则不生效），
+            -- 语义为终极写回动作，故常驻满橙主按钮，作为底栏唯一视觉重点。
+            ui:Button({ID = "UpdateBtn", Text = "更新时间线", Weight = 1, MinimumSize = {0, 36}, StyleSheet = SUBFIX_BTN_ACCENT})
         }),
-        ui:VGap(2),
         ui:Label({
             ID = "StatusLabel",
             Text = "准备就绪",
@@ -18454,24 +16354,13 @@ return ui:VGroup({
 })
 end
 
-function create_mini_window()
-    return dispatcher:AddWindow({
-        ID = WINDOW_META.mini_window_id,
-        WindowTitle = WINDOW_META.mini_window_title,
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, SUBFIX_WINDOW_SIZE.mini.width, SUBFIX_WINDOW_SIZE.mini.height})
-    }, mini_content)
-end
-
 function create_full_window()
     return dispatcher:AddWindow({
         ID = WINDOW_META.main_window_id,
         WindowTitle = WINDOW_META.main_window_title,
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, SUBFIX_WINDOW_SIZE.full.width, SUBFIX_WINDOW_SIZE.full.height})
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({100, 80, SUBFIX_WINDOW_SIZE.full.width, SUBFIX_WINDOW_SIZE.full.height})
     }, create_full_content())
 end
-
--- 创建窗口
-mini_win = create_mini_window()
 
 ensure_ai_config_window = function()
     if AIConfigPopWin then
@@ -18709,19 +16598,59 @@ pre_delivery_final_check_timer = ui:Timer({
     SingleShot = true
 })
 
+-- 自动跟随常驻低频轮询：750ms 读一次时间码，仅在返回值变化（暂停/拖动）时跳转。
+-- 不用高频定时器：播放中时间码冻结，高频轮询纯属空耗。
+playhead_follow_timer = ui:Timer({
+    ID = "PlayheadFollowTimer",
+    Interval = 750,
+    SingleShot = false
+})
+
+-- 树重建后延迟 30ms 补一次选中：让 Qt 先消化 Clear/AddTopLevelItem 重建事件，
+-- 再对节点置 Selected=true，橙色高亮才稳定绘制（跟随跳转专用）。
+playhead_follow_select_timer = ui:Timer({
+    ID = "PlayheadFollowSelectTimer",
+    Interval = 30,
+    SingleShot = true
+})
+
+-- 编辑框“编辑即存内存”去抖：停笔 400ms 后落盘当前行。
+edit_text_autosave_timer = ui:Timer({
+    ID = "EditTextAutosaveTimer",
+    Interval = 400,
+    SingleShot = true
+})
+
+-- P4：日志面板 200ms 防抖刷新 + 1s 批量落盘（循环 timer，回调内部自行判脏）。
+workflow_log_view_timer = ui:Timer({
+    ID = "WorkflowLogViewTimer",
+    Interval = 200,
+    SingleShot = false
+})
+workflow_log_file_timer = ui:Timer({
+    ID = "WorkflowLogFileTimer",
+    Interval = 1000,
+    SingleShot = false
+})
+
 -- 全局变量（避免主 chunk local 数量再次逼近 Lua 5.1 的 200 上限）
 pending_search_window = nil
 
 register_ui_timer(startup_refresh_timer, function()
-    if not mini_win then
+    if not win then
         return
     end
 
-    set_mini_subtitle_area_state(mini_win, false, "正在自动加载字幕…")
-    update_shared_status(mini_win, "正在自动加载字幕...")
-    set_load_status_label(false, "<font color='#FA8C16'>⏳ 正在自动加载</font>", mini_win)
-    refresh_subtitles(mini_win, {skip_backup = true, show_loading_placeholder = true})
-    print("[Hooper AI 2.0] 极简版窗口已显示，并已尝试自动加载字幕。")
+    update_shared_status(win, "正在自动加载字幕...")
+    refresh_subtitles(win, {skip_backup = true, show_loading_placeholder = true})
+    -- 首次自动刷新后再检测一次选区音频候选（时间线此时已就绪）。
+    local core = get_generate_selection_core()
+    if core then
+        pcall(function() core.refresh_embedded_context() end)
+    end
+    print("[Hooper AI 2.0] 主窗口已显示，并已尝试自动加载字幕。")
+    -- 自动跟随默认开启（暂停/拖动播放头后 1 秒内定位字幕，播放中不跳）
+    pcall(set_playhead_follow_enabled, true)
 end)
 
 register_ui_timer(full_window_deferred_sync_timer, function()
@@ -18730,10 +16659,14 @@ register_ui_timer(full_window_deferred_sync_timer, function()
     end
     ensure_backup_selector_fresh(nil, { preserve_current_selection = false, default_index = 0 })
     apply_lightweight_shared_state_to_window(win)
+    -- 首屏布局兜底：WordWrap Label/Weight 在 Show 后可能仍按旧 sizeHint 摆放，
+    -- 先 RecalcLayout，再做一次 1px geometry nudge（等价 resize，修复默认窗口裁切）。
+    subfix_recalc_layout(win)
+    subfix_geometry_nudge_relayout(win)
 end)
 
 register_ui_timer(search_debounce_timer, function()
-    local target_window = pending_search_window or active_window or mini_win or win
+    local target_window = pending_search_window or active_window or win
     pending_search_window = nil
     if target_window then
         do_search(target_window)
@@ -18754,8 +16687,48 @@ register_ui_timer(pre_delivery_final_check_timer, function()
     run_pre_delivery_final_check(target_window)
 end)
 
+register_ui_timer(playhead_follow_timer, function()
+    -- tick 内部全程防御式 pcall：跟随是增强功能，绝不能拖垮主界面事件循环。
+    local ok, err = pcall(playhead_follow_tick)
+    if not ok then
+        print("[SubFix] 自动跟随 tick 失败: " .. tostring(err))
+    end
+end)
+
+register_ui_timer(playhead_follow_select_timer, function()
+    local row_id = playhead_follow_pending_row_id
+    playhead_follow_pending_row_id = nil
+    if not row_id or not win then return end
+    pcall(function()
+        local tree = find_window_item(win, "SubtitleTree")
+        local node = get_subtitle_row_id_node_map_for_window(win)[row_id]
+        if tree and node then
+            playhead_follow_suppress_tree_events = true
+            pcall(function() tree:ScrollToItem(node) end)
+            set_tree_current_item(tree, node)
+            pcall(function() tree:Repaint() end)
+            playhead_follow_suppress_tree_events = false
+        end
+    end)
+    playhead_follow_suppress_tree_events = false
+end)
+
+register_ui_timer(edit_text_autosave_timer, function()
+    local target_window = active_window or win
+    pcall(flush_edit_text_autosave, target_window)
+end)
+
+-- P4：日志防抖 timer 注册。从这一刻起 LogMsg 只写内存环形缓冲，由两个循环 timer 刷。
+register_ui_timer(workflow_log_view_timer, function()
+    pcall(flush_workflow_log_view, false)
+end)
+register_ui_timer(workflow_log_file_timer, function()
+    pcall(flush_workflow_log_file)
+end)
+workflow_log_timers_ready = true
+
 function schedule_debounced_search(target_window, input_id)
-    pending_search_window = target_window or active_window or mini_win or win
+    pending_search_window = target_window or active_window or win
     SEARCH_VIEW.input_window = pending_search_window
     SEARCH_VIEW.input_id = input_id
     restart_ui_timer(search_debounce_timer)
@@ -18803,199 +16776,6 @@ function detect_ai_task_direction(task_type, rows, execute_request)
         return nil, "无法确定字幕转换方向，未修改字幕。请检查字幕内容后重试。"
     end
     return direction
-end
-
-function open_full_window()
-    local full_window = ensure_full_window_initialized()
-    if not full_window then
-        update_shared_status(mini_win, "无法打开完整版窗口")
-        return
-    end
-    win = full_window
-    update_search_query_from_window(mini_win)
-    get_row_from_tree_selection(mini_win)
-
-    if not full_window_ai_controls_initialized then
-        local preset_combo = win and win:Find("PresetCombo")
-        if preset_combo then
-            provider_combo_bootstrap_in_progress = true
-            for _, provider_def in ipairs(AI_PROVIDER_DEFS) do
-                preset_combo:AddItem(provider_def.label)
-            end
-        end
-
-        local full_items = win and win:GetItems()
-        if full_items and full_items.AITaskSelect then
-            full_items.AITaskSelect:AddItem("1. 完整纠错")
-            full_items.AITaskSelect:AddItem("2. 的地得专项检测")
-            full_items.AITaskSelect:AddItem("3. 中英翻译")
-            full_items.AITaskSelect:AddItem("4. 简繁转换")
-        end
-
-        full_window_ai_controls_initialized = true
-        sync_provider_combo_selection(current_ai_provider_id)
-        provider_combo_bootstrap_in_progress = false
-    else
-        sync_provider_combo_selection(current_ai_provider_id)
-    end
-
-    active_window = win
-    activate_preview_tree_maps_for_window(win)
-    pcall(function()
-        if win.SetAttrs then
-            win:SetAttrs({Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 500, 700})})
-        end
-    end)
-
-    local switch_started_at = os.clock()
-
-    -- 字幕树在首次打开、或撤回/重做/AI 操作后按需渲染。
-    if full_window_tree_dirty then
-        local render_start = os.clock()
-        local context = SEARCH_VIEW.build_current_view_context()
-        if context and context.visible_rows then
-            render_rows_to_window(win, context.visible_rows)
-        end
-        full_window_tree_dirty = false
-        print(string.format("[Hooper AI 2.0] 切换到完整版-同步渲染字幕树: %d ms",
-            math.floor(((os.clock() - render_start) * 1000) + 0.5)))
-    end
-
-    local show_start = os.clock()
-    apply_lightweight_shared_state_to_window(win)
-    win:Show()
-    if mini_win then
-        mini_win:Hide()
-    end
-    print(string.format("[Hooper AI 2.0] 切换到完整版-显示窗口: %d ms",
-        math.floor(((os.clock() - show_start) * 1000) + 0.5)))
-    print(string.format("[Hooper AI 2.0] 切换到完整版-总耗时: %d ms",
-        math.floor(((os.clock() - switch_started_at) * 1000) + 0.5)))
-
-    restart_ui_timer(full_window_deferred_sync_timer)
-end
-
--- ========== 事件绑定 ==========
-
--- Tab 切换由 MainTabs.CurrentChanged 统一控制
-
-mini_win.On[WINDOW_META.mini_window_id].Close = function(ev)
-    handle_main_window_close()
-end
-
-function mini_win.On.MiniTrackSpin.TextChanged(ev)
-    if suppress_track_change_events then return end
-    local text = trim(ev.Text or "")
-    if text == "" then
-        return
-    end
-    if not text:match("^%d+$") then
-        sync_track_control(mini_win)
-        return
-    end
-    current_track = math.max(1, math.min(10, math.floor(tonumber(text) or current_track or 1)))
-    set_target_track_value(current_track, false)
-    print("[Hooper AI 2.0] 极简版轨道切换: " .. current_track)
-    refresh_subtitles(mini_win)
-end
-
-function mini_win.On.MiniTrackSpinUp.Clicked(ev)
-    current_track = math.max(1, math.min(10, (current_track or 1) + 1))
-    sync_track_control(mini_win)
-    set_target_track_value(current_track, false)
-    print("[Hooper AI 2.0] 极简版轨道切换: " .. current_track)
-    refresh_subtitles(mini_win)
-end
-
-function mini_win.On.MiniTrackSpinDown.Clicked(ev)
-    current_track = math.max(1, math.min(10, (current_track or 1) - 1))
-    sync_track_control(mini_win)
-    set_target_track_value(current_track, false)
-    print("[Hooper AI 2.0] 极简版轨道切换: " .. current_track)
-    refresh_subtitles(mini_win)
-end
-
-function mini_win.On.MiniRefreshBtn.Clicked(ev)
-    print("[Hooper AI 2.0] 极简版刷新按钮点击")
-    update_shared_status(mini_win, "正在刷新...")
-    set_load_status_label(false, "<font color='#FA8C16'>⏳ 正在刷新字幕...</font>", mini_win)
-    refresh_subtitles(mini_win)
-end
-
-function mini_win.On.MiniGenerateSelectionSubtitlesBtn.Clicked(ev)
-    print("[Hooper AI 2.0] 极简版生成选区字幕按钮点击")
-    run_generate_selection_subtitles_from_subfix(mini_win)
-end
-
--- 字幕编辑框：保存 / 还原 / 回车保存（与完整版同逻辑，作用于迷你窗口）
-function mini_win.On.MiniEditSubtitleSaveBtn.Clicked(ev)
-    save_subtitle_edit_box(mini_win)
-end
-
-function mini_win.On.MiniEditSubtitleRevertBtn.Clicked(ev)
-    local row = current_selected_row_id and find_row_by_id(current_selected_row_id) or nil
-    load_selected_subtitle_into_edit_box(mini_win, row)
-end
-
-function mini_win.On.MiniEditSubtitleText.ReturnPressed(ev)
-    save_subtitle_edit_box(mini_win)
-end
-
--- 更新到时间线：目标轨同步 / 加减 / 执行
-function mini_win.On.MiniTargetTrackSpin.TextChanged(ev)
-    local text = trim(ev.Text or "")
-    if text == "" then
-        return
-    end
-    if not text:match("^%d+$") then
-        sync_target_track_control()
-        return
-    end
-    set_target_track_value(text, true)
-end
-
-function mini_win.On.MiniTargetTrackSpinUp.Clicked(ev)
-    set_target_track_value((current_subtitle_target_track or 1) + 1, true)
-end
-
-function mini_win.On.MiniTargetTrackSpinDown.Clicked(ev)
-    set_target_track_value((current_subtitle_target_track or 1) - 1, true)
-end
-
-function mini_win.On.MiniUpdateBtn.Clicked(ev)
-    print("[Hooper AI 2.0] 极简版更新时间线按钮点击")
-    active_window = mini_win
-    persist_timeline_update_backup()
-    update_timeline(mini_win)
-end
-
-function mini_win.On.MiniSearchBox.TextChanged(ev)
-    if suppress_search_change_events then return end
-    -- 通过防抖：连续按键/退格时只在停顿后做一次重渲染，避免中间态多次重建树
-    schedule_debounced_search(mini_win)
-end
-
-function mini_win.On.MiniOpenFullBtn.Clicked(ev)
-    open_full_window()
-end
-
-function mini_win.On.ExportBtn.Clicked(ev)
-    show_export_dialog(mini_win)
-end
-
-function mini_win.On.MiniSubtitleTree.ItemClicked(ev)
-    local row = handle_preview_tree_item_clicked(mini_win, ev)
-    if is_preview_tree_edit_column_event(ev) then
-        open_preview_edit_dialog(mini_win, ev, row)
-    end
-    load_selected_subtitle_into_edit_box(mini_win, row)
-end
-
-function mini_win.On.MiniSubtitleTree.ItemDoubleClicked(ev)
-    print("[Hooper AI 2.0] 极简版字幕列表双击")
-    update_shared_status(mini_win, "检测到双击，正在跳转...")
-    local row = handle_preview_tree_item_clicked(mini_win, ev)
-    go_to_subtitle(mini_win, row)
 end
 
 -- 完整版事件在首次打开完整版后才绑定，避免启动阶段要求提前创建完整窗口。
@@ -19057,7 +16837,6 @@ end
 function win.On.RefreshBtn.Clicked(ev)
     print("[Hooper AI 2.0] 刷新按钮点击")
     update_shared_status(win, "正在刷新...")
-    set_load_status_label(false, "<font color='#FA8C16'>⏳ 正在刷新字幕...</font>", win)
     refresh_subtitles(win)
 end
 
@@ -19097,7 +16876,7 @@ function run_chinese_number_conversion(chosen_direction, target_window)
     -- 修复：优先使用 current_rows
     if not current_rows or #current_rows == 0 then
         local status = win and win:Find("StatusLabel")
-        if status then status:Set("Text", "没有字幕数据") end
+        if status then subfix_status_set(status, "没有字幕数据") end
         return
     end
 
@@ -19587,7 +17366,7 @@ function run_chinese_number_conversion(chosen_direction, target_window)
     else
         msg = "[Hooper AI 2.0] 🔄 执行: " .. current_action .. " | 修改了 0 条。未发现可转换数字。"
     end
-    if status then status:Set("Text", msg) end
+    if status then subfix_status_set(status, msg) end
     print(msg)
     if modify_count > 0 then
         report_helpers.show_batch_result_report(current_action, report_entries, modify_count)
@@ -20014,21 +17793,6 @@ PRE_DELIVERY_MAX_SUBTITLE_DURATION_SECONDS = 6
 PRE_DELIVERY_MAX_SUBTITLE_CHARS = 24
 PRE_DELIVERY_SUBTITLE_GAP_WARNING_FRAMES = 3
 PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES = 6
-PRE_DELIVERY_SPEECH_CONSISTENCY_ENABLED = true
-PRE_DELIVERY_SPEECH_CONSISTENCY_MIN_SCORE = 0.72
-PRE_DELIVERY_SPEECH_MIN_CHAR_COVERAGE = 0.86
-PRE_DELIVERY_SPEECH_MIN_ASR_CHAR_COVERAGE = 0.96
-PRE_DELIVERY_SPEECH_CTC_MIN_CONFIDENCE = 0.35
-PRE_DELIVERY_SPEECH_MISSING_SUBTITLE_MIN_SECONDS = 0.35
-PRE_DELIVERY_SPEECH_OVERLAP_TOLERANCE_SECONDS = 0.08
-PRE_DELIVERY_SPEECH_MAX_GROUP_ROWS = 2
-PRE_DELIVERY_SPEECH_TIMELINE_EXPORT_PADDING_SECONDS = 1.0
-PRE_DELIVERY_SPEECH_LOCAL_PADDING_SECONDS = 0.0
-PRE_DELIVERY_SPEECH_MERGE_MAX_GAP_SECONDS = 0.25
-PRE_DELIVERY_SPEECH_MERGE_MAX_CHARS = 36
-PRE_DELIVERY_SPEECH_EXTRA_TAIL_MIN_CHARS = 1
-PRE_DELIVERY_SPEECH_CTC_DIAGNOSTIC_ENABLED = false
-PRE_DELIVERY_SPEECH_SKIP_SINGLE_TRACK_PROBE = true
 
 function is_timeline_transition_bridge(item_ranges, item_index)
     local previous_item = item_ranges[item_index - 1]
@@ -20312,13 +18076,22 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
     end
 
     local function add_boundary_alignment_issue(row, row_index, boundary_frame, boundary_label)
+        -- P3：cut_frames 已升序去重（collect_visible_timeline_cut_frames 末尾 table.sort）。
+        -- 容差内最近点只可能是入位位置左右两个邻居，等价于原来的全量遍历，但只需 O(log n)。
         local nearest_cut = nil
         local nearest_delta = nil
-        for _, cut_frame in ipairs(cut_frames) do
-            local delta = math.abs(cut_frame - boundary_frame)
-            if delta > 0 and delta <= cut_tolerance_frames and (not nearest_delta or delta < nearest_delta) then
-                nearest_cut = cut_frame
-                nearest_delta = delta
+        local insert_at = subfix_lower_bound(cut_frames, boundary_frame)
+        if insert_at then
+            for _, candidate_frame in ipairs({
+                insert_at <= #cut_frames and cut_frames[insert_at] or nil,
+                insert_at - 1 >= 1 and cut_frames[insert_at - 1] or nil,
+            }) do
+                local delta = candidate_frame and math.abs(candidate_frame - boundary_frame) or nil
+                if delta and delta > 0 and delta <= cut_tolerance_frames
+                    and (not nearest_delta or delta < nearest_delta) then
+                    nearest_cut = candidate_frame
+                    nearest_delta = delta
+                end
             end
         end
         if nearest_cut then
@@ -20387,840 +18160,6 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
 
     return issues
 end
-
-function collect_rows_overlapping_asr_segment(rows, asr_segment, tolerance_frames)
-    local overlapping_rows = {}
-    local tolerance = math.max(0, tonumber(tolerance_frames) or 0)
-    local segment_start = (tonumber(asr_segment and asr_segment.start_frame) or 0) - tolerance
-    local segment_end = (tonumber(asr_segment and asr_segment.end_frame) or segment_start) + tolerance
-    for _, row in ipairs(rows or {}) do
-        local source_row = row and (row.source_row_ref or row) or nil
-        local row_start = tonumber(source_row and source_row.start_frame) or 0
-        local row_end = tonumber(source_row and source_row.end_frame) or row_start
-        if math.min(row_end, segment_end) > math.max(row_start, segment_start) then
-            overlapping_rows[#overlapping_rows + 1] = source_row
-        end
-    end
-    table.sort(overlapping_rows, function(a, b)
-        local a_start = tonumber(a and a.start_frame) or 0
-        local b_start = tonumber(b and b.start_frame) or 0
-        if a_start == b_start then
-            return (tonumber(a and a.index) or 0) < (tonumber(b and b.index) or 0)
-        end
-        return a_start < b_start
-    end)
-    return overlapping_rows
-end
-
-function join_speech_check_rows_text(rows)
-    local parts = {}
-    for _, row in ipairs(rows or {}) do
-        local text = trim_text(row and row.text or "")
-        if text ~= "" then
-            parts[#parts + 1] = text
-        end
-    end
-    return table.concat(parts, "")
-end
-
-function join_speech_check_asr_text(asr_segments)
-    local parts = {}
-    for _, segment in ipairs(asr_segments or {}) do
-        local text = trim_text(segment and segment.text or "")
-        if text ~= "" then
-            parts[#parts + 1] = text
-        end
-    end
-    return table.concat(parts, "")
-end
-
-function speech_rows_frame_window(rows)
-    local window_start = nil
-    local window_end = nil
-    for _, row in ipairs(rows or {}) do
-        local row_start = tonumber(row and row.start_frame)
-        local row_end = tonumber(row and row.end_frame)
-        if row_start then
-            window_start = window_start and math.min(window_start, row_start) or row_start
-        end
-        if row_end then
-            window_end = window_end and math.max(window_end, row_end) or row_end
-        end
-    end
-    return window_start or 0, window_end or window_start or 0
-end
-
-function subtitle_row_middle_frame(row, fallback_frame)
-    local start_frame = tonumber(row and row.start_frame)
-    local end_frame = tonumber(row and row.end_frame)
-    if start_frame and end_frame and end_frame > start_frame then
-        return math.floor(((start_frame + end_frame) / 2) + 0.5)
-    end
-    return tonumber(fallback_frame) or start_frame or 0
-end
-
-function split_raw_text_chars(text)
-    local chars = {}
-    for char in tostring(text or ""):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-        if char ~= "" then
-            chars[#chars + 1] = char
-        end
-    end
-    return chars
-end
-
-function slice_asr_segment_text_for_frame_window(segment, window_start_frame, window_end_frame)
-    local text = trim_text(segment and segment.text or "")
-    local text_chars = split_raw_text_chars(text)
-    local text_len = #text_chars
-    if text_len <= 0 then return "" end
-    local segment_start = tonumber(segment and segment.start_frame) or 0
-    local segment_end = tonumber(segment and segment.end_frame) or segment_start
-    if segment_end <= segment_start then return text end
-
-    local overlap_start = math.max(segment_start, tonumber(window_start_frame) or segment_start)
-    local overlap_end = math.min(segment_end, tonumber(window_end_frame) or segment_end)
-    if overlap_end <= overlap_start then return "" end
-
-    local duration = math.max(1, segment_end - segment_start)
-    local start_ratio = math.max(0, math.min(1, (overlap_start - segment_start) / duration))
-    local end_ratio = math.max(start_ratio, math.min(1, (overlap_end - segment_start) / duration))
-    local padding_ratio = math.min(0.12, math.max(0.03, (end_ratio - start_ratio) * 0.5))
-    start_ratio = math.max(0, start_ratio - padding_ratio)
-    end_ratio = math.min(1, end_ratio + padding_ratio)
-
-    local start_char = math.max(1, math.floor(text_len * start_ratio + 0.5))
-    local end_char = math.min(text_len, math.ceil(text_len * end_ratio + 0.5))
-    if end_char < start_char then return "" end
-    local sliced = {}
-    for index = start_char, end_char do
-        sliced[#sliced + 1] = text_chars[index]
-    end
-    return table.concat(sliced)
-end
-
-
-function collect_asr_segments_overlapping_row(asr_segments, row, tolerance_frames)
-    local overlapping_segments = {}
-    local tolerance = math.max(0, tonumber(tolerance_frames) or 0)
-    local row_start = (tonumber(row and row.start_frame) or 0) - tolerance
-    local row_end = (tonumber(row and row.end_frame) or row_start) + tolerance
-    for _, segment in ipairs(asr_segments or {}) do
-        local segment_start = tonumber(segment and segment.start_frame) or 0
-        local segment_end = tonumber(segment and segment.end_frame) or segment_start
-        if math.min(row_end, segment_end) > math.max(row_start, segment_start) then
-            overlapping_segments[#overlapping_segments + 1] = segment
-        end
-    end
-    table.sort(overlapping_segments, function(a, b)
-        local a_start = tonumber(a and a.start_frame) or 0
-        local b_start = tonumber(b and b.start_frame) or 0
-        if a_start == b_start then
-            return (tonumber(a and a.index) or 0) < (tonumber(b and b.index) or 0)
-        end
-        return a_start < b_start
-    end)
-    return overlapping_segments
-end
-
-
-function chinese_digit_sequence_to_arabic(sequence)
-    local value = tostring(sequence or "")
-    value = value:gsub("零", "0"):gsub("〇", "0")
-    value = value:gsub("一", "1")
-    value = value:gsub("二", "2"):gsub("两", "2")
-    value = value:gsub("三", "3"):gsub("四", "4"):gsub("五", "5")
-    value = value:gsub("六", "6"):gsub("七", "7"):gsub("八", "8"):gsub("九", "9")
-    return value:gsub("%D+", "")
-end
-
-function extract_speech_digit_sequences(text)
-    local sequences = {}
-    local normalized = SUBFIX_AUDIO_ALIGN.normalize_text(text)
-    for digits in tostring(normalized or ""):gmatch("%d+") do
-        sequences[#sequences + 1] = digits
-    end
-    for chinese_digits in tostring(normalized or ""):gmatch("[零一二三四五六七八九〇两二]+") do
-        if #chinese_digits >= 2 then
-            local converted = chinese_digit_sequence_to_arabic(chinese_digits)
-            if converted ~= "" then
-                sequences[#sequences + 1] = converted
-            end
-        end
-    end
-    return sequences
-end
-
-function speech_digit_mismatch(subtitle_text, asr_text)
-    local subtitle_digits = extract_speech_digit_sequences(subtitle_text)
-    if #subtitle_digits == 0 then return false end
-    local asr_digits = extract_speech_digit_sequences(asr_text)
-    local asr_digit_seen = {}
-    for _, asr_value in ipairs(asr_digits) do
-        asr_digit_seen[tostring(asr_value)] = true
-    end
-    for _, digits in ipairs(subtitle_digits) do
-        if not asr_digit_seen[tostring(digits)] then
-            return true
-        end
-    end
-    return false
-end
-
-function split_normalized_text_chars(text)
-    local normalized = SUBFIX_AUDIO_ALIGN.normalize_text(text)
-    local chars = {}
-    for char in tostring(normalized or ""):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-        if char ~= "" then
-            chars[#chars + 1] = char
-        end
-    end
-    return chars
-end
-
-function SUBFIX_AUDIO_ALIGN.char_lcs_ratio(source_text, reference_text)
-    local source_chars = split_normalized_text_chars(source_text)
-    local reference_chars = split_normalized_text_chars(reference_text)
-    if #source_chars == 0 or #reference_chars == 0 then return 0 end
-    local previous = {}
-    local current = {}
-    for j = 0, #reference_chars do
-        previous[j] = 0
-    end
-    for i = 1, #source_chars do
-        current[0] = 0
-        for j = 1, #reference_chars do
-            if source_chars[i] == reference_chars[j] then
-                current[j] = (previous[j - 1] or 0) + 1
-            else
-                current[j] = math.max(previous[j] or 0, current[j - 1] or 0)
-            end
-        end
-        previous, current = current, previous
-    end
-    return (previous[#reference_chars] or 0) / math.max(1, #source_chars)
-end
-
-function speech_text_consistency_failed(subtitle_text, asr_text, min_score, context_text)
-    if SUBFIX_AUDIO_ALIGN.normalize_text(subtitle_text) == SUBFIX_AUDIO_ALIGN.normalize_text(asr_text) then
-        return false, 1, 1, "", 1
-    end
-    local score = SUBFIX_AUDIO_ALIGN.local_text_score(subtitle_text, asr_text)
-    local coverage = SUBFIX_AUDIO_ALIGN.char_lcs_ratio(subtitle_text, asr_text)
-    local asr_coverage = SUBFIX_AUDIO_ALIGN.char_lcs_ratio(asr_text, subtitle_text)
-    local has_extra_tail = speech_asr_has_extra_tail_after_subtitle(subtitle_text, asr_text, context_text)
-    if speech_text_has_equal_length_small_substitution(subtitle_text, asr_text) then
-        return true, score, coverage, "small_substitution", asr_coverage
-    end
-    if score < (tonumber(min_score) or 0.72) then
-        return true, score, coverage, "score", asr_coverage
-    end
-    if speech_text_has_small_character_difference(subtitle_text, asr_text) then
-        return true, score, coverage, "small_diff", asr_coverage
-    end
-    if coverage < (tonumber(PRE_DELIVERY_SPEECH_MIN_CHAR_COVERAGE) or 0.86) then
-        return true, score, coverage, "coverage", asr_coverage
-    end
-    if asr_coverage < (tonumber(PRE_DELIVERY_SPEECH_MIN_ASR_CHAR_COVERAGE) or 0.96) then
-        return true, score, coverage, "asr_coverage", asr_coverage
-    end
-    if has_extra_tail then
-        return true, score, coverage, "extra_tail", asr_coverage
-    end
-    return false, score, coverage, "", asr_coverage
-end
-
-function speech_text_character_difference_count(left_text, right_text)
-    local left_chars = split_normalized_text_chars(left_text)
-    local right_chars = split_normalized_text_chars(right_text)
-    if #left_chars == 0 and #right_chars == 0 then return 0 end
-    local ratio = SUBFIX_AUDIO_ALIGN.char_lcs_ratio(table.concat(left_chars), table.concat(right_chars))
-    local lcs = math.floor((ratio * math.max(1, #left_chars)) + 0.5)
-    return math.max(0, (#left_chars - lcs) + (#right_chars - lcs))
-end
-
-function speech_text_has_small_character_difference(subtitle_text, asr_text)
-    local subtitle_chars = split_normalized_text_chars(subtitle_text)
-    local asr_chars = split_normalized_text_chars(asr_text)
-    local subtitle_normalized = table.concat(subtitle_chars)
-    local asr_normalized = table.concat(asr_chars)
-    if subtitle_normalized == "" or asr_normalized == "" or subtitle_normalized == asr_normalized then return false end
-    return speech_text_character_difference_count(subtitle_text, asr_text) <= 2
-end
-
-function speech_text_has_equal_length_small_substitution(subtitle_text, asr_text)
-    local subtitle_chars = split_normalized_text_chars(subtitle_text)
-    local asr_chars = split_normalized_text_chars(asr_text)
-    if #subtitle_chars == 0 or #subtitle_chars ~= #asr_chars then return false end
-    local mismatch_count = 0
-    for index, subtitle_char in ipairs(subtitle_chars) do
-        if subtitle_char ~= asr_chars[index] then
-            mismatch_count = mismatch_count + 1
-            if mismatch_count > 2 then return false end
-        end
-    end
-    return mismatch_count > 0
-end
-
-function speech_asr_has_extra_tail_after_subtitle(subtitle_text, asr_text, context_text)
-    local subtitle_normalized = SUBFIX_AUDIO_ALIGN.normalize_text(subtitle_text or "")
-    local asr_normalized = SUBFIX_AUDIO_ALIGN.normalize_text(asr_text or "")
-    if subtitle_normalized == "" or asr_normalized == "" then return false end
-    local match_start, match_end = asr_normalized:find(subtitle_normalized, 1, true)
-    if not match_start or not match_end then return false end
-    local suffix = asr_normalized:sub(match_end + 1)
-    local context_normalized = SUBFIX_AUDIO_ALIGN.normalize_text(context_text or subtitle_text or "")
-    if context_normalized ~= "" then
-        local context_match_start, context_match_end = context_normalized:find(subtitle_normalized, 1, true)
-        if context_match_start and context_match_end then
-            local context_suffix = context_normalized:sub(context_match_end + 1)
-            if context_suffix ~= "" then
-                if context_suffix:find(suffix, 1, true) then
-                    return false
-                end
-                local covered_start, covered_end = suffix:find(context_suffix, 1, true)
-                if covered_start and covered_end then
-                    suffix = suffix:sub(covered_end + 1)
-                elseif SUBFIX_AUDIO_ALIGN.char_lcs_ratio(suffix, context_suffix) >= 0.75 then
-                    return false
-                end
-            end
-        end
-    end
-    return speech_check_effective_char_count(suffix) >= math.max(1, tonumber(PRE_DELIVERY_SPEECH_EXTRA_TAIL_MIN_CHARS) or 2)
-end
-
-function speech_check_effective_char_count(text)
-    return #(split_normalized_text_chars(text) or {})
-end
-
-function speech_row_has_strong_sentence_end(row)
-    local text = trim_text(row and row.text or "")
-    if text == "" then return false end
-    -- 逐字面量比较末字符，避免 [] 字节类误判含相同字节的汉字。
-    for _, punct in ipairs({ "。", "！", "？", "!", "?", "；", ";", "：", ":" }) do
-        if text:sub(-#punct) == punct then return true end
-    end
-    return false
-end
-
-function collect_speech_context_rows_for_window(rows, window_start_frame, window_end_frame)
-    local context_rows = {}
-    local start_frame = tonumber(window_start_frame) or 0
-    local end_frame = tonumber(window_end_frame) or start_frame
-    for _, row in ipairs(rows or {}) do
-        local row_start = tonumber(row and row.start_frame) or 0
-        local row_end = tonumber(row and row.end_frame) or row_start
-        if math.min(row_end, end_frame) > math.max(row_start, start_frame) then
-            context_rows[#context_rows + 1] = row
-        end
-    end
-    table.sort(context_rows, function(a, b)
-        local a_start = tonumber(a and a.start_frame) or 0
-        local b_start = tonumber(b and b.start_frame) or 0
-        if a_start == b_start then
-            return (tonumber(a and a.index) or 0) < (tonumber(b and b.index) or 0)
-        end
-        return a_start < b_start
-    end)
-    return context_rows
-end
-
-function build_speech_consistency_review_windows(rows, audio_source, fps)
-    local review_windows = {}
-    local row_list = {}
-    local rate = tonumber(fps) or tonumber(current_fps) or 24
-    local merge_gap_frames = math.max(0, math.floor(((tonumber(PRE_DELIVERY_SPEECH_MERGE_MAX_GAP_SECONDS) or 0.25) * rate) + 0.5))
-    local max_merge_chars = math.max(1, math.floor(tonumber(PRE_DELIVERY_SPEECH_MERGE_MAX_CHARS) or 36))
-
-    for _, row in ipairs(rows or {}) do
-        local source_row = row and (row.source_row_ref or row) or nil
-        if source_row and trim_text(source_row.text or "") ~= "" then
-            row_list[#row_list + 1] = source_row
-        end
-    end
-    table.sort(row_list, function(a, b)
-        local a_start = tonumber(a and a.start_frame) or 0
-        local b_start = tonumber(b and b.start_frame) or 0
-        if a_start == b_start then
-            return (tonumber(a and a.index) or 0) < (tonumber(b and b.index) or 0)
-        end
-        return a_start < b_start
-    end)
-
-    local function append_window(window_rows, review_type)
-        if #window_rows == 0 then return end
-        local window_start_frame, window_end_frame = speech_rows_frame_window(window_rows)
-        local review_audio_source = SUBFIX_AUDIO_ALIGN.review_audio_source_for_window(audio_source, window_start_frame, window_end_frame, fps)
-        if not review_audio_source then return end
-        local first_row = window_rows[1] or {}
-        local last_row = window_rows[#window_rows] or first_row
-        review_windows[#review_windows + 1] = {
-            rows = window_rows,
-            context_rows = collect_speech_context_rows_for_window(row_list, review_audio_source.start_frame, review_audio_source.end_frame),
-            row = first_row,
-            audio_source = review_audio_source,
-            review_type = review_type,
-            text = join_speech_check_rows_text(window_rows),
-            context_text = join_speech_check_rows_text(collect_speech_context_rows_for_window(row_list, review_audio_source.start_frame, review_audio_source.end_frame)),
-            marker_frame = subtitle_row_middle_frame(first_row, review_audio_source.start_frame),
-            window_label = string.format(
-                "%s %.3f-%.3f",
-                tostring(review_type or "local"),
-                tonumber(review_audio_source.source_start_seconds) or 0,
-                tonumber(review_audio_source.source_end_seconds) or 0
-            ),
-            row_label = (#window_rows == 1)
-                and string.format("#%s", tostring(first_row.index or "?"))
-                or string.format("#%s-#%s", tostring(first_row.index or "?"), tostring(last_row.index or "?"))
-        }
-    end
-
-    for index, row in ipairs(row_list) do
-        append_window({row}, "single_row")
-        local next_row = row_list[index + 1]
-        if next_row then
-            local row_end = tonumber(row.end_frame) or tonumber(row.start_frame) or 0
-            local next_start = tonumber(next_row.start_frame) or row_end
-            local gap_frames = next_start - row_end
-            local merged_text = join_speech_check_rows_text({row, next_row})
-            if gap_frames >= 0
-                and gap_frames <= merge_gap_frames
-                and speech_check_effective_char_count(merged_text) <= max_merge_chars
-                and not speech_row_has_strong_sentence_end(row)
-            then
-                append_window({row, next_row}, "merged_pair")
-            end
-        end
-    end
-
-    -- Regression anchors: 那第一次看到这个界面 + 你可能会愣一下 => 那第一次看到这个界面你可能会愣一下；2026 vs 二零一六；保护自己 vs 保护自己的；比如草 vs 比如杂草；目的就是为了压制蜂群 vs 目目的就是为了压制蜂群；来减少对应的 vs 攻击性。
-    return review_windows
-end
-
-function speech_review_payload_text(review_info)
-    if type(review_info) ~= "table" then return "" end
-    local text = trim_text(review_info.text or "")
-    if text ~= "" then return text end
-    return join_speech_check_asr_text(review_info.rows or {})
-end
-
-function speech_local_asr_hallucination_reason(asr_text, subtitle_text)
-    local raw_text = trim_text(asr_text or "")
-    if raw_text == "" then return nil end
-    if speech_local_asr_filler_only(raw_text) then
-        return "局部 ASR 只有语气词"
-    end
-    local normalized = SUBFIX_AUDIO_ALIGN.normalize_text(raw_text)
-    local subtitle_normalized = SUBFIX_AUDIO_ALIGN.normalize_text(subtitle_text or "")
-    local known_patterns = {
-        "字幕製作",
-        "字幕制作",
-        "字幕由",
-        "zither%s*harp",
-        "amara",
-        "subtitles?by",
-        "captionedby",
-        "点赞",
-        "订阅",
-        "转发",
-        "打赏",
-        "明镜",
-        "点点栏目"
-    }
-    local raw_lower = tostring(raw_text):lower()
-    local normalized_lower = tostring(normalized):lower()
-    for _, pattern in ipairs(known_patterns) do
-        if raw_lower:find(pattern, 1, false) or normalized_lower:find(pattern, 1, false) then
-            if subtitle_normalized == "" or SUBFIX_AUDIO_ALIGN.local_text_score(subtitle_text, raw_text) < 0.35 then
-                return "疑似 Whisper 幻觉字幕署名"
-            end
-        end
-    end
-    return nil
-end
-
-function speech_local_asr_filler_only(asr_text)
-    local normalized = SUBFIX_AUDIO_ALIGN.normalize_text(asr_text or "")
-    if normalized == "" then return false end
-    if #normalized > 12 then return false end
-    local filler_patterns = {
-        "^嗯+$",
-        "^嗯对$",
-        "^对$",
-        "^啊+$",
-        "^呃+$",
-        "^额+$",
-        "^好$",
-        "^是$",
-        "^哦+$"
-    }
-    for _, pattern in ipairs(filler_patterns) do
-        if normalized:find(pattern) then
-            return true
-        end
-    end
-    return false
-end
-
-function run_local_speech_review_asr(audio_source, fps, options)
-    options = type(options) == "table" and options or {}
-    return SUBFIX_AUDIO_ALIGN.run_asr_alignment(audio_source, fps, options)
-end
-
-function select_best_speech_review_result(row, review_results)
-    local single_row_review = nil
-    local skipped_single_row_review = nil
-    local passed_merged_pair_review = nil
-    local best_review = nil
-    for _, review in ipairs(review_results or {}) do
-        if review and review.review_type == "single_row" then
-            if review.skipped then
-                skipped_single_row_review = skipped_single_row_review or review
-            else
-                single_row_review = review
-            end
-        elseif review and review.review_type == "merged_pair" and review.passed == true then
-            passed_merged_pair_review = review
-        end
-        if review and not review.skipped then
-            if not best_review then
-                best_review = review
-            else
-                local best_score = tonumber(best_review.score) or -1
-                local review_score = tonumber(review.score) or -1
-                local best_coverage = tonumber(best_review.coverage) or -1
-                local review_coverage = tonumber(review.coverage) or -1
-                if review_score > best_score or (review_score == best_score and review_coverage > best_coverage) then
-                    best_review = review
-                end
-            end
-        end
-    end
-    if single_row_review and speech_review_failure_requires_marker(single_row_review, review_results) then
-        return single_row_review
-    end
-    if single_row_review and single_row_review.passed == true then
-        return single_row_review
-    end
-    if passed_merged_pair_review then
-        return passed_merged_pair_review
-    end
-    if single_row_review and not single_row_review.skipped then
-        return single_row_review
-    end
-    if best_review then return best_review end
-    if skipped_single_row_review then return skipped_single_row_review end
-    return (review_results or {})[1]
-end
-
-function speech_review_failure_requires_marker(review, review_results)
-    if not review or review.skipped or review.passed == true then return false end
-    local fail_reason = tostring(review.fail_reason or "")
-    return review.digit_mismatch == true
-        or fail_reason == "score"
-        or fail_reason == "coverage"
-        or fail_reason == "extra_tail"
-        or fail_reason == "asr_coverage"
-        or fail_reason == "small_substitution"
-        or (fail_reason == "small_diff" and speech_review_has_confirming_small_difference(review, review_results))
-end
-
-function speech_review_issue_kind(review)
-    if not review then return "口播字幕不一致" end
-    local subtitle_text = tostring(review.subtitle_text or join_speech_check_rows_text(review.rows or {}))
-    local asr_text = tostring(review.local_speech_text or "")
-    local fail_reason = tostring(review.fail_reason or "")
-    if fail_reason == "small_substitution" or speech_text_has_equal_length_small_substitution(subtitle_text, asr_text) then
-        return "口播字幕疑似字词替换"
-    end
-    if fail_reason == "small_diff" then
-        return "口播字幕小差异"
-    end
-    return "口播字幕不一致"
-end
-
-function speech_review_has_confirming_small_difference(review, review_results)
-    if not review or review.skipped or review.passed == true then return false end
-    for _, candidate in ipairs(review_results or {}) do
-        if candidate
-            and candidate ~= review
-            and candidate.review_type == "merged_pair"
-            and not candidate.skipped
-            and candidate.passed ~= true
-        then
-            local candidate_reason = tostring(candidate.fail_reason or "")
-            if candidate_reason == "small_diff" or candidate_reason == "extra_tail" or candidate_reason == "asr_coverage" or candidate_reason == "coverage" then
-                return true
-            end
-        end
-    end
-    return false
-end
-
-function speech_review_find_single_row_result(review_results)
-    for _, review in ipairs(review_results or {}) do
-        if review and review.review_type == "single_row" then
-            return review
-        end
-    end
-    return nil
-end
-
-
-function SUBFIX_AUDIO_ALIGN.build_speech_consistency_batch_plan_for_track(track_info, rows)
-    local batches = {}
-    for _, source in ipairs(track_info and track_info.sources or {}) do
-        batches[#batches + 1] = {
-            audio_source = source,
-            rows = {},
-            source_start_frame = source.start_frame,
-            source_end_frame = source.end_frame
-        }
-    end
-
-    local unassigned_rows = {}
-    for _, row in ipairs(rows or {}) do
-        local row_start = tonumber(row.start_frame) or 0
-        local row_end = tonumber(row.end_frame) or (row_start + 1)
-        local row_center = (row_start + row_end) / 2
-        local selected_batch = nil
-        local best_overlap = 0
-
-        for _, batch in ipairs(batches) do
-            local source = batch.audio_source or {}
-            local source_start = tonumber(source.start_frame) or 0
-            local source_end = tonumber(source.end_frame) or 0
-            if row_center >= source_start and row_center < source_end then
-                selected_batch = batch
-                break
-            end
-            local overlap = SUBFIX_AUDIO_ALIGN.frame_overlap(row_start, row_end, source_start, source_end)
-            if overlap > best_overlap then
-                best_overlap = overlap
-                selected_batch = batch
-            end
-        end
-
-        local center_inside_selected = false
-        if selected_batch and selected_batch.audio_source then
-            center_inside_selected = row_center >= (tonumber(selected_batch.audio_source.start_frame) or 0)
-                and row_center < (tonumber(selected_batch.audio_source.end_frame) or 0)
-        end
-        if selected_batch and (best_overlap > 0 or center_inside_selected) then
-            local batch_row = SUBFIX_AUDIO_ALIGN.copy_row_for_audio_source(row, selected_batch.audio_source)
-            if batch_row then
-                selected_batch.rows[#selected_batch.rows + 1] = batch_row
-            else
-                unassigned_rows[#unassigned_rows + 1] = row
-            end
-        else
-            unassigned_rows[#unassigned_rows + 1] = row
-        end
-    end
-
-    local filtered_batches = {}
-    for _, batch in ipairs(batches) do
-        if #batch.rows > 0 then
-            filtered_batches[#filtered_batches + 1] = batch
-        end
-    end
-    if #filtered_batches == 0 then return nil end
-
-    return {
-        track_index = track_info.track_index,
-        overlap_frames = track_info.overlap_frames,
-        batches = filtered_batches,
-        unassigned_rows = unassigned_rows,
-        speech_reliable_count = tonumber(track_info.speech_reliable_count) or 0,
-        speech_hallucination_count = tonumber(track_info.speech_hallucination_count) or 0,
-        speech_empty_count = tonumber(track_info.speech_empty_count) or 0
-    }
-end
-
-function SUBFIX_AUDIO_ALIGN.collect_speech_consistency_audio_track_candidates(timeline, rows, fps)
-    local range_start, range_end = SUBFIX_AUDIO_ALIGN.get_rows_frame_range(rows)
-    if not range_start or not range_end or range_end <= range_start then
-        return nil, "缺少有效字幕时间范围"
-    end
-    local ok_track_count, track_count = pcall(function() return timeline:GetTrackCount("audio") end)
-    track_count = ok_track_count and tonumber(track_count) or 0
-    if track_count <= 0 then
-        return nil, "时间线没有音频轨"
-    end
-
-    local tracks = {}
-    for track_index = 1, track_count do
-        local track_info = {track_index = track_index, overlap_frames = 0, sources = {}}
-        local ok_items, items = pcall(function() return timeline:GetItemListInTrack("audio", track_index) end)
-        items = ok_items and items or {}
-        for item_index, item in ipairs(items or {}) do
-            local ok_start, item_start = pcall(function() return item:GetStart() end)
-            local ok_end, item_end = pcall(function() return item:GetEnd() end)
-            item_start = ok_start and tonumber(item_start) or nil
-            item_end = ok_end and tonumber(item_end) or nil
-            if item_start and item_end and item_end > item_start then
-                local overlap = SUBFIX_AUDIO_ALIGN.frame_overlap(range_start, range_end, item_start, item_end)
-                if overlap > 0 then
-                    local source = SUBFIX_AUDIO_ALIGN.audio_source_from_item(item, track_index, item_index, fps, overlap)
-                    if source then
-                        track_info.overlap_frames = track_info.overlap_frames + overlap
-                        track_info.sources[#track_info.sources + 1] = source
-                    end
-                end
-            end
-        end
-        if #track_info.sources > 0 then
-            table.sort(track_info.sources, function(a, b)
-                return (tonumber(a.start_frame) or 0) < (tonumber(b.start_frame) or 0)
-            end)
-            tracks[#tracks + 1] = track_info
-        end
-    end
-    return tracks
-end
-
-function probe_speech_consistency_audio_track_candidate(track_info, rows, fps, options)
-    options = type(options) == "table" and options or {}
-    local plan = SUBFIX_AUDIO_ALIGN.build_speech_consistency_batch_plan_for_track(track_info, rows)
-    if not plan then return nil, "候选轨没有覆盖字幕" end
-
-    local max_probe = math.max(1, math.floor(tonumber(options.max_probe_windows) or 3))
-    local min_probe_score = math.max(0.45, math.min(0.70, (tonumber(PRE_DELIVERY_SPEECH_CONSISTENCY_MIN_SCORE) or 0.72) - 0.12))
-    local probed = 0
-    local reliable_count = 0
-    local hallucination_count = 0
-    local empty_count = 0
-    local probe_score_total = 0
-    local probe_coverage_total = 0
-    for _, batch in ipairs(plan.batches or {}) do
-        for _, review_window in ipairs(build_speech_consistency_review_windows(batch.rows or {}, batch.audio_source, fps)) do
-            if review_window.review_type == "single_row" then
-                probed = probed + 1
-                local probe_info, probe_err, probe_status = run_local_speech_review_asr(review_window.audio_source, fps, {
-                    progress_label = "终检口播轨道探测",
-                    batch_index = probed,
-                    total_batches = max_probe,
-                    status_window = options.status_window,
-                    status_prefix = string.format("口播一致性｜探测主讲轨 A%s｜%d/%d", tostring(track_info.track_index or "?"), probed, max_probe),
-                    status_started_at = options.status_started_at
-                })
-                if probe_status == "cancelled" then
-                    return nil, "已取消", "cancelled"
-                end
-                if not probe_info then
-                    empty_count = empty_count + 1
-                    LogMsg("最终交付检查主讲轨探测失败: A" .. tostring(track_info.track_index) .. " " .. tostring(probe_err or ""))
-                else
-                    local probe_text = speech_review_payload_text(probe_info)
-                    if probe_info.empty_reason == "empty_asr" or trim_text(probe_text) == "" then
-                        empty_count = empty_count + 1
-                    elseif speech_local_asr_hallucination_reason(probe_text, review_window.text) then
-                        hallucination_count = hallucination_count + 1
-                    else
-                        local probe_failed, probe_score, probe_coverage = speech_text_consistency_failed(review_window.text, probe_text, min_probe_score)
-                        probe_score_total = probe_score_total + (tonumber(probe_score) or 0)
-                        probe_coverage_total = probe_coverage_total + (tonumber(probe_coverage) or 0)
-                        if not probe_failed then
-                            reliable_count = reliable_count + 1
-                        else
-                            hallucination_count = hallucination_count + 1
-                            LogMsg(string.format(
-                                "最终交付检查主讲轨探测文本不匹配: A%s subtitle=%s asr=%s score=%.2f coverage=%.2f",
-                                tostring(track_info.track_index or "?"),
-                                tostring(review_window.text or ""),
-                                tostring(probe_text or ""),
-                                tonumber(probe_score) or 0,
-                                tonumber(probe_coverage) or 0
-                            ))
-                        end
-                    end
-                end
-                if probed >= max_probe then
-                    track_info.speech_reliable_count = reliable_count
-                    track_info.speech_hallucination_count = hallucination_count
-                    track_info.speech_empty_count = empty_count
-                    track_info.speech_probe_score = probe_score_total
-                    track_info.speech_probe_coverage = probe_coverage_total
-                    return plan
-                end
-            end
-        end
-    end
-
-    track_info.speech_reliable_count = reliable_count
-    track_info.speech_hallucination_count = hallucination_count
-    track_info.speech_empty_count = empty_count
-    track_info.speech_probe_score = probe_score_total
-    track_info.speech_probe_coverage = probe_coverage_total
-    return plan
-end
-
-function score_speech_consistency_audio_track_candidate(track_info)
-    local reliable = tonumber(track_info and track_info.speech_reliable_count) or 0
-    local hallucination = tonumber(track_info and track_info.speech_hallucination_count) or 0
-    local empty = tonumber(track_info and track_info.speech_empty_count) or 0
-    local overlap = tonumber(track_info and track_info.overlap_frames) or 0
-    local probe_score = tonumber(track_info and track_info.speech_probe_score) or 0
-    local probe_coverage = tonumber(track_info and track_info.speech_probe_coverage) or 0
-    return reliable * 1000000 + math.floor((probe_score + probe_coverage) * 100000) + overlap - hallucination * 500000 - empty * 250000
-end
-
-function SUBFIX_AUDIO_ALIGN.find_speech_consistency_audio_track_batches(timeline, rows, fps, options)
-    if not timeline then return nil, "缺少时间线" end
-    local candidates, err = SUBFIX_AUDIO_ALIGN.collect_speech_consistency_audio_track_candidates(timeline, rows, fps)
-    if not candidates then return nil, err end
-    if #candidates == 0 then return nil, "未找到与当前字幕范围重叠的本地音频文件" end
-
-    local best_plan = nil
-    local best_track = nil
-    local best_score = nil
-    if #candidates == 1 and PRE_DELIVERY_SPEECH_SKIP_SINGLE_TRACK_PROBE == true then
-        local only_track = candidates[1]
-        local plan = SUBFIX_AUDIO_ALIGN.build_speech_consistency_batch_plan_for_track(only_track, rows)
-        if plan then
-            only_track.speech_reliable_count = 1
-            only_track.speech_hallucination_count = 0
-            only_track.speech_empty_count = 0
-            LogMsg("最终交付检查主讲轨唯一候选，跳过 ASR 探测: A" .. tostring(only_track.track_index or "?"))
-            return plan
-        end
-    end
-    for _, track_info in ipairs(candidates) do
-        local plan, plan_err, plan_status = probe_speech_consistency_audio_track_candidate(track_info, rows, fps, options)
-        if plan_status == "cancelled" then
-            return nil, tostring(plan_err or "已取消"), "cancelled"
-        end
-        if plan then
-            local score = score_speech_consistency_audio_track_candidate(track_info)
-            LogMsg(string.format(
-                "最终交付检查主讲轨候选: A%s overlap=%s reliable=%s hallucination=%s empty=%s score=%s",
-                tostring(track_info.track_index or "?"),
-                tostring(track_info.overlap_frames or 0),
-                tostring(track_info.speech_reliable_count or 0),
-                tostring(track_info.speech_hallucination_count or 0),
-                tostring(track_info.speech_empty_count or 0),
-                tostring(score)
-            ))
-            if (tonumber(track_info.speech_reliable_count) or 0) <= 0 then
-                LogMsg("最终交付检查主讲轨候选跳过: A" .. tostring(track_info.track_index or "?") .. " 主讲轨探测未匹配字幕")
-            elseif not best_score or score > best_score then
-                best_score = score
-                best_track = track_info
-                best_plan = plan
-            end
-        else
-            LogMsg("最终交付检查主讲轨候选跳过: A" .. tostring(track_info.track_index or "?") .. " " .. tostring(plan_err or ""))
-        end
-    end
-    if not best_plan then return nil, "主讲轨没有覆盖当前字幕的可对齐片段" end
-    LogMsg("最终交付检查选择主讲轨: A" .. tostring(best_track and best_track.track_index or "?"))
-    return best_plan
-end
-
-
-
-
 
 function timeline_has_pre_delivery_marker(timeline, custom_data)
     if not timeline or trim_text(custom_data) == "" then return false end
@@ -21300,11 +18239,15 @@ function pre_delivery_marker_frame(issue, timeline_start_frame)
     return math.max(0, math.floor((source_frame - (tonumber(timeline_start_frame) or 0)) + 0.5))
 end
 
-function add_pre_delivery_check_marker(timeline, issue, timeline_start_frame)
+function add_pre_delivery_check_marker(timeline, issue, timeline_start_frame, opts)
     if not timeline or type(issue) ~= "table" then return false end
+    opts = type(opts) == "table" and opts or {}
     local custom_data = pre_delivery_issue_key(issue)
     issue.custom_data = custom_data
-    clear_pre_delivery_marker_by_custom_data(timeline, custom_data)
+    -- P2：增量同步时同 key 已确认不存在，无需"先删同 key"（旧路径每次删+加造成 marker 闪烁）。
+    if not opts.skip_pre_clear then
+        clear_pre_delivery_marker_by_custom_data(timeline, custom_data)
+    end
 
     local frame = pre_delivery_marker_frame(issue, timeline_start_frame)
     local duration = 1
@@ -21318,7 +18261,8 @@ function add_pre_delivery_check_marker(timeline, issue, timeline_start_frame)
     local ok, ret = pcall(function()
         return timeline:AddMarker(frame, color, name, note, duration, custom_data)
     end)
-    if ok and ret == true and timeline_has_pre_delivery_marker(timeline, custom_data) then return true end
+    -- P2：增量路径刚做过同 key 快照，AddMarker 成功即采信，跳过每条一次的 GetMarkers 回读。
+    if ok and ret == true and (opts.skip_verify or timeline_has_pre_delivery_marker(timeline, custom_data)) then return true end
     local first_error = ok and ("AddMarker 返回 " .. tostring(ret)) or tostring(ret)
     ok, ret = pcall(function()
         return timeline:AddMarker(frame, color, name, note, duration)
@@ -21332,6 +18276,32 @@ function add_pre_delivery_check_marker(timeline, issue, timeline_start_frame)
     return false
 end
 
+-- P2：一次 GetMarkers 快照全部 SubFix 终检 marker：
+-- keys 为带 customData 的键集合（增量比对用）；legacy_frames 为只有"SubFix终检："命名前缀、
+-- 没有 customData 的历史遗留 marker 帧（保留旧版"清理无名 marker"的行为）。
+function snapshot_pre_delivery_markers(timeline)
+    local snapshot = {keys = {}, legacy_frames = {}}
+    if not timeline then return snapshot end
+    local ok, markers = pcall(function() return timeline:GetMarkers() end)
+    if not ok or type(markers) ~= "table" then return snapshot end
+    local prefix = "subfix-pre-delivery"
+    local name_prefix = "SubFix终检："
+    for frame, marker in pairs(markers) do
+        if type(marker) == "table" then
+            local custom_data = tostring(marker.customData or marker.custom_data or marker.CustomData or "")
+            if custom_data:sub(1, #prefix) == prefix then
+                snapshot.keys[custom_data] = true
+            else
+                local marker_name = tostring(marker.name or marker.Name or "")
+                if marker_name:sub(1, #name_prefix) == name_prefix then
+                    snapshot.legacy_frames[#snapshot.legacy_frames + 1] = tonumber(frame) or frame
+                end
+            end
+        end
+    end
+    return snapshot
+end
+
 function run_pre_delivery_final_check(target_window)
     local window = resolve_window(target_window) or win
     if not current_rows or #current_rows == 0 then
@@ -21340,7 +18310,8 @@ function run_pre_delivery_final_check(target_window)
     end
 
     update_shared_status(window, "正在最终交付检查：正在读取时间线...")
-    local project = resolve and resolve:GetProjectManager() and resolve:GetProjectManager():GetCurrentProject()
+    local pm = resolve and resolve:GetProjectManager()
+    local project = pm and pm:GetCurrentProject()
     local timeline = project and project:GetCurrentTimeline()
     if not timeline then
         update_shared_status(window, "最终交付检查失败：无法获取当前时间线")
@@ -21348,7 +18319,6 @@ function run_pre_delivery_final_check(target_window)
     end
 
     NORMALIZE_CANCEL_REQUESTED = false
-    clear_all_pre_delivery_markers(timeline)
     local fps = tonumber(current_fps) or parse_fps(timeline:GetSetting("timelineFrameRate") or current_fps)
     local issues = collect_pre_delivery_final_check_issues(current_rows, timeline, fps)
     local tl_start_frame = current_tl_start_frame or 0
@@ -21356,26 +18326,57 @@ function run_pre_delivery_final_check(target_window)
     if ok_start and tonumber(start_frame) then
         tl_start_frame = tonumber(start_frame)
     end
+
+    -- P2：marker 哈希化增量同步。一次快照得到现有键集合，目标键集合由 issues 生成；
+    -- 已存在的原样保留（不删不加不闪烁、不再每条 3 次 Resolve API），只新增缺失、删除过期。
+    local existing = snapshot_pre_delivery_markers(timeline)
+    local stale_keys = {}
+    for key in pairs(existing.keys) do
+        stale_keys[key] = true
+    end
+    for _, frame in ipairs(existing.legacy_frames) do
+        pcall(function() timeline:DeleteMarkerAtFrame(frame) end)
+    end
+
     local marker_count = 0
+    local marker_unchanged_count = 0
     local marker_failed_count = 0
+    local failed_issue = nil
     for _, issue in ipairs(issues) do
-        local ok_marker = add_pre_delivery_check_marker(timeline, issue, tl_start_frame)
-        if ok_marker then
+        local key = pre_delivery_issue_key(issue)
+        issue.custom_data = key
+        if existing.keys[key] then
+            marker_unchanged_count = marker_unchanged_count + 1
             marker_count = marker_count + 1
+            stale_keys[key] = nil
         else
-            marker_failed_count = marker_failed_count + 1
+            local ok_marker = add_pre_delivery_check_marker(timeline, issue, tl_start_frame, {
+                skip_pre_clear = true,
+                skip_verify = true,
+            })
+            if ok_marker then
+                marker_count = marker_count + 1
+                existing.keys[key] = true
+                stale_keys[key] = nil
+            else
+                marker_failed_count = marker_failed_count + 1
+                failed_issue = failed_issue or issue
+            end
         end
+    end
+    for key in pairs(stale_keys) do
+        pcall(function() timeline:DeleteMarkerByCustomData(key) end)
     end
 
     local status_text = string.format("最终交付检查完成，发现 %d 个问题，已打 %d 个 marker", #issues, marker_count)
     if marker_failed_count > 0 then
         status_text = status_text .. string.format("，marker 失败 %d 个", marker_failed_count)
-        for _, issue in ipairs(issues) do
-            if trim_text(issue.marker_error or "") ~= "" then
-                LogMsg("最终交付检查 marker 失败: " .. tostring(issue.marker_error))
-                break
-            end
+        if failed_issue and trim_text(failed_issue.marker_error or "") ~= "" then
+            LogMsg("最终交付检查 marker 失败: " .. tostring(failed_issue.marker_error))
         end
+    end
+    if marker_unchanged_count > 0 and marker_failed_count == 0 then
+        LogMsg(string.format("最终交付检查：%d 个 marker 无变化，已跳过重打", marker_unchanged_count))
     end
     update_shared_status(window, status_text)
     LogMsg(status_text)
@@ -21392,18 +18393,13 @@ function win.On.BtnStep4.Clicked(ev)
     end
 end
 
-function win.On.BtnStep5.Clicked(ev)
-    print("[Hooper AI 2.0] [5] 修改英文排版兼容入口")
-    show_english_typography_config_dialog(win)
-end
-
 -- [6] 敏感词替换 (动态 UID + CurrentIndex 防 ComboBox 报错)
 function win.On.BtnStep6.Clicked(ev)
     print("[Hooper AI 2.0] [6] 敏感词替换")
     -- 修复：优先使用 current_rows
     if not current_rows or #current_rows == 0 then
         local status = win:Find("StatusLabel")
-        if status then status:Set("Text", "没有字幕数据") end
+        if status then subfix_status_set(status, "没有字幕数据") end
         return
     end
 
@@ -21414,12 +18410,33 @@ function win.On.BtnStep6.Clicked(ev)
     }
     local found_list = {}
 
+    -- 纯文本替换：find 走 plain（词表里若出现 +、- 等也不当模式），
+    -- 替换串不走 gsub（用户填 100% 等含 % 的内容不会报「invalid capture index」）。
+    local function plain_replace_all(text, find_text, repl_text)
+        find_text = tostring(find_text or "")
+        if find_text == "" then return text end
+        repl_text = tostring(repl_text or "")
+        local parts = {}
+        local start_idx = 1
+        while true do
+            local s, e = string.find(text, find_text, start_idx, true)
+            if not s then
+                parts[#parts + 1] = string.sub(text, start_idx)
+                break
+            end
+            parts[#parts + 1] = string.sub(text, start_idx, s - 1)
+            parts[#parts + 1] = repl_text
+            start_idx = e + 1
+        end
+        return table.concat(parts)
+    end
+
     -- 修复：使用 current_rows 遍历
     if current_rows and #current_rows > 0 then
         for _, data in ipairs(current_rows) do
             if data and data.text then
                 for _, bw in ipairs(bad_words) do
-                    if data.text:find(bw) then
+                    if string.find(data.text, bw, 1, true) then
                         local exists = false
                         for _, f in ipairs(found_list) do
                             if f == bw then exists = true break end
@@ -21433,7 +18450,7 @@ function win.On.BtnStep6.Clicked(ev)
         for _, data in pairs(subtitle_data_map) do
             if data and data.text then
                 for _, bw in ipairs(bad_words) do
-                    if data.text:find(bw) then
+                    if string.find(data.text, bw, 1, true) then
                         local exists = false
                         for _, f in ipairs(found_list) do
                             if f == bw then exists = true break end
@@ -21447,7 +18464,7 @@ function win.On.BtnStep6.Clicked(ev)
 
     if #found_list == 0 then
         local status = win:Find("StatusLabel")
-        if status then status:Set("Text", "未检出敏感词") end
+        if status then subfix_status_set(status, "未检出敏感词") end
         print("[Hooper AI 2.0] 恭喜，当前字幕未检出常见敏感词！")
         LogMsg("[6] 未检出敏感词")
         return
@@ -21495,7 +18512,7 @@ function win.On.BtnStep6.Clicked(ev)
                 for i, data in ipairs(current_rows) do
                     if data and data.text then
                         local old = data.text
-                        local t = old:gsub(target, rep)
+                        local t = plain_replace_all(old, target, rep)
                         if t ~= old then
                             data.text = t
                             count = count + 1
@@ -21512,7 +18529,7 @@ function win.On.BtnStep6.Clicked(ev)
                 for node, data in pairs(subtitle_data_map) do
                     if data and data.text then
                         local old = data.text
-                        local t = old:gsub(target, rep)
+                        local t = plain_replace_all(old, target, rep)
                         if t ~= old then
                             data.text = t
                             count = count + 1
@@ -21528,7 +18545,7 @@ function win.On.BtnStep6.Clicked(ev)
                 commit_mutation_snapshot(mutation_snapshot)
             end
             local status = win:Find("StatusLabel")
-            if status then status:Set("Text", "已替换 '" .. target .. "' -> '" .. rep .. "' (" .. count .. "条)") end
+            if status then subfix_status_set(status, "已替换 '" .. target .. "' -> '" .. rep .. "' (" .. count .. "条)") end
             print("[Hooper AI 2.0] 已将所有 '" .. target .. "' 替换为 '" .. rep .. "'")
             LogMsg("[6] 已替换 '" .. target .. "'，共 " .. count .. " 条")
             dlg:Hide()
@@ -21544,7 +18561,7 @@ function win.On.BtnStep7.Clicked(ev)
     -- 修复：优先使用 current_rows
     if not current_rows or #current_rows == 0 then
         local status = win:Find("StatusLabel")
-        if status then status:Set("Text", "没有字幕数据") end
+        if status then subfix_status_set(status, "没有字幕数据") end
         return
     end
     local mutation_snapshot = prepare_mutation_snapshot("清理空行")
@@ -21577,7 +18594,7 @@ function win.On.BtnStep7.Clicked(ev)
         rebuild_tree_from_rows(current_rows, win)
     end
     local status = win:Find("StatusLabel")
-    if status then status:Set("Text", "清理空行完成，删除了 " .. count .. " 条空字幕") end
+    if status then subfix_status_set(status, "清理空行完成，删除了 " .. count .. " 条空字幕") end
     print("[Hooper AI 2.0] 步骤 7 完成：空字幕块已清理。")
     LogMsg("[7] 清理空行完成，删除了 " .. count .. " 条")
 end
@@ -21588,7 +18605,7 @@ function win.On.BtnStep8.Clicked(ev)
     -- 修复：使用 current_rows 替代 subtitle_data_map，避免搜索过滤导致数据丢失
     if not current_rows or #current_rows == 0 then
         local status = win:Find("StatusLabel")
-        if status then status:Set("Text", "没有字幕数据") end
+        if status then subfix_status_set(status, "没有字幕数据") end
         return
     end
     local sorted = {}
@@ -21606,97 +18623,13 @@ function win.On.BtnStep8.Clicked(ev)
     end
     pcall(function() bmd.setclipboard(txt) end)
     local status = win:Find("StatusLabel")
-    if status then status:Set("Text", "纯文本已复制到剪贴板，共 " .. #sorted .. " 条") end
+    if status then subfix_status_set(status, "纯文本已复制到剪贴板，共 " .. #sorted .. " 条") end
     print("[Hooper AI 2.0] 步骤 8 完成：纯文本已复制到剪贴板！")
     LogMsg("[8] 提取纯文本完成，共 " .. #sorted .. " 条，已复制到剪贴板")
 end
 
 function win.On.AIFixBtn.Clicked(ev)
     do_ai_fix()
-end
-
--- 导入媒体池：输出 SRT 后导入，不写入历史备份清单
-function win.On.ExportSrtBtn.Clicked(ev)
-    local export_rows = collect_exportable_subtitles()
-    local valid_subs = {}
-
-    for i, sub in ipairs(export_rows) do
-        local normalized = normalize_export_subtitle(sub, i)
-        if normalized then
-            table.insert(valid_subs, normalized)
-        end
-    end
-    
-    if #valid_subs == 0 then
-        print("[Hooper AI 2.0] ⚠️ 导入失败：当前内存中的字幕结构未能提取出有效时间和文本。")
-        return
-    end
-    
-    table.sort(valid_subs, function(a, b)
-        if a.sort_frame and b.sort_frame and a.sort_frame ~= b.sort_frame then
-            return a.sort_frame < b.sort_frame
-        end
-        if a.Start ~= b.Start then
-            return a.Start < b.Start
-        end
-        return (a.index or 0) < (b.index or 0)
-    end)
-    
-    if current_backup_path == "" then
-        print("[Hooper AI 2.0] ❌ 导入失败：备份目录为空。")
-        local status = win:Find("StatusLabel")
-        if status then status:Set("Text", "❌ 备份目录为空") end
-        return
-    end
-
-    local base_dir = subfix_path_to_utf8(current_backup_path)
-    subfix_create_directory(current_backup_path)
-
-    local sep = (base_dir:sub(-1) == "\\" or base_dir:sub(-1) == "/") and "" or "/"
-    local file_name = "HooperAI_双语_" .. os.date("%m%d_%H%M%S") .. ".srt"
-    local save_path = base_dir .. sep .. file_name
-    
-    local buf = {}
-    for i, sub in ipairs(valid_subs) do
-        buf[#buf + 1] = i .. "\n"
-        buf[#buf + 1] = sub.Start .. " --> " .. sub.End .. "\n"
-        buf[#buf + 1] = sub.Text .. "\n\n"
-    end
-    if subfix_write_file_bytes(save_path, table.concat(buf)) then
-        
-        -- 自动导入媒体池
-        local resolve = get_resolve()
-        if resolve then
-            local pm = resolve:GetProjectManager()
-            local project = pm and pm:GetCurrentProject()
-            local mediaPool = project and project:GetMediaPool()
-
-            if mediaPool then
-                local target_folder = mediaPool:GetCurrentFolder() or mediaPool:GetRootFolder()
-                if not target_folder then
-                    target_folder = mediaPool:GetRootFolder()
-                end
-                if target_folder then
-                    pcall(function() mediaPool:SetCurrentFolder(target_folder) end)
-                end
-
-                local importedItems = mediaPool:ImportMedia({save_path})
-                if importedItems and #importedItems > 0 then
-                    print("[Hooper AI 2.0] ✅ 成功！SRT 已写入备份目录并导入媒体池: " .. save_path)
-                    local status = win:Find("StatusLabel")
-                    if status then status:Set("Text", "✅ 已导入媒体池") end
-                else
-                    print("[Hooper AI 2.0] ⚠️ SRT 已生成到备份目录，但媒体池未接收该文件: " .. save_path)
-                    local status = win:Find("StatusLabel")
-                    if status then status:Set("Text", "⚠️ 已生成到备份目录，但导入媒体池失败") end
-                end
-            end
-        end
-    else
-        print("[Hooper AI 2.0] ❌ 导入失败：无法写入备份文件，请检查备份目录权限。")
-        local status = win:Find("StatusLabel")
-        if status then status:Set("Text", "❌ 备份目录写入失败") end
-    end
 end
 
 -- 清理备份按钮
@@ -21723,7 +18656,7 @@ function win.On.CleanBtn.Clicked(ev)
     sync_backup_selector()
 
     if status then
-        status:Set("Text", "✅ 已彻底清空历史备份！")
+        subfix_status_set(status, "✅ 已彻底清空历史备份！")
     end
     print("[Hooper AI 2.0] 已清理备份目录: " .. (current_backup_path or ""))
 end
@@ -21740,7 +18673,7 @@ function win.On.BackupFolderBtn.Clicked(ev)
             sync_backup_selector()
             local status = win:Find("StatusLabel")
             if status then
-                status:Set("Text", "备份目录已切换")
+                subfix_status_set(status, "备份目录已切换")
             end
             print("[Hooper AI 2.0] 📂 备份目录已切换: " .. current_backup_path)
         end
@@ -21759,7 +18692,7 @@ function win.On.BackupPathInput.CurrentIndexChanged(ev)
     local status = win and win:Find("StatusLabel")
     if ensure_backup_selector_fresh(nil, { preserve_current_selection = false, default_index = 0 }) then
         local message = "历史列表已刷新，请重新选择版本"
-        if status then status:Set("Text", message) end
+        if status then subfix_status_set(status, message) end
         print("[Hooper AI 2.0] " .. message)
         return
     end
@@ -21776,20 +18709,27 @@ function win.On.BackupPathInput.CurrentIndexChanged(ev)
     end
 end
 
--- 设置备份路径按钮
-function win.On.SetPathBtn.Clicked(ev)
-    return win.On.BackupFolderBtn.Clicked(ev)
+function subfix_update_helper_info()
+    -- 返回 (helper_path, target_root)：target_root 必须与实际运行的 helper 所在
+    -- Utility 根一致，否则更新器默认装到用户根，系统级安装会把新文件写到错误位置。
+    local utility = subfix_dr_utility_root()
+    local candidates = {
+        {path = utility.user and subfix_pjoin(subfix_support_dir(utility.user), "subfix_update.py") or nil, root = utility.user},
+        {path = utility.system and subfix_pjoin(subfix_support_dir(utility.system), "subfix_update.py") or nil, root = utility.system},
+    }
+    for _, candidate in ipairs(candidates) do
+        local file = candidate.path and io.open(candidate.path, "r") or nil
+        if file then
+            file:close()
+            return candidate.path, candidate.root
+        end
+    end
+    return nil, nil
 end
 
 function subfix_update_helper_path()
-    local utility = subfix_dr_utility_root()
-    local user_path = utility.user and subfix_pjoin(subfix_support_dir(utility.user), "subfix_update.py") or nil
-    local system_path = utility.system and subfix_pjoin(subfix_support_dir(utility.system), "subfix_update.py") or nil
-    local file = user_path and io.open(user_path, "r") or nil
-    if file then file:close(); return user_path end
-    file = system_path and io.open(system_path, "r")
-    if file then file:close(); return system_path end
-    return nil
+    local helper_path = subfix_update_helper_info()
+    return helper_path
 end
 
 function subfix_update_python_path(helper)
@@ -21871,19 +18811,29 @@ function run_subfix_update_check(cmd, output_path)
 end
 
 function run_subfix_update(payload)
-    local helper = subfix_update_helper_path()
+    local helper, target_root = subfix_update_helper_info()
     if not helper then return false, "缺少更新器，请先安装包含更新功能的 SubFix 版本" end
     local python = subfix_update_python_path(helper)
     if not python then return false, "未找到 Python 3，无法安装更新" end
     local output_path = subfix_temp_dir() .. "subfix_update_install_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
     local progress_path = output_path .. ".progress.json"
-    local cmd = table.concat({
+    local cmd_parts = {
         shell_quote(python), shell_quote(helper),
         "install", "--zip-url", shell_quote(tostring(payload.zip_url or "")),
         "--sha256-url", shell_quote(tostring(payload.sha256_url or "")),
         "--version", shell_quote(tostring(payload.version or "")),
-        "--output", shell_quote(output_path), "--progress", shell_quote(progress_path)
-    }, " ")
+    }
+    -- 显式指定安装目标根（user/system 由实际运行的 helper 决定），避免系统级
+    -- 安装被更新器默认写回用户 Utility 根，造成更新落到错误目录。
+    if target_root and target_root ~= "" then
+        cmd_parts[#cmd_parts + 1] = "--target-root"
+        cmd_parts[#cmd_parts + 1] = shell_quote(target_root)
+    end
+    cmd_parts[#cmd_parts + 1] = "--output"
+    cmd_parts[#cmd_parts + 1] = shell_quote(output_path)
+    cmd_parts[#cmd_parts + 1] = "--progress"
+    cmd_parts[#cmd_parts + 1] = shell_quote(progress_path)
+    local cmd = table.concat(cmd_parts, " ")
     -- 安装器会替换多个文件，不能在写入途中终止。
     local ok, result = run_subfix_update_with_progress(cmd, output_path, "下载并安装更新", false, progress_path)
     if not ok then return false, result end
@@ -21930,6 +18880,8 @@ function win.On.UpdateBtn.Clicked(ev)
 end
 
 function win.On.SubtitleTree.ItemClicked(ev)
+    -- 防递归：自动跟随程序化重建树/选中节点期间屏蔽一切树点击处理
+    if playhead_follow_suppress_tree_events then return end
     local row = handle_preview_tree_item_clicked(win, ev)
     if is_preview_tree_edit_column_event(ev) then
         open_preview_edit_dialog(win, ev, row)
@@ -21955,18 +18907,232 @@ function win.On.EditSubtitleRevertBtn.Clicked(ev)
     load_selected_subtitle_into_edit_box(win, row)
 end
 
+function win.On.EditSubtitleSplitBtn.Clicked(ev)
+    split_current_subtitle_row(win)
+end
+
 function win.On.EditSubtitleText.ReturnPressed(ev)
     save_subtitle_edit_box(win)
+end
+
+function win.On.EditSubtitleText.TextChanged(ev)
+    schedule_edit_text_autosave()
 end
 
 end
 
 handle_main_window_close = function()
-    -- 关窗 = 退出 SubFix（单实例插件）。直接复用 force_quit_subfix，
-    -- 这样可以同时取消正在跑的 AI 流程（设置 AI_CANCEL_REQUESTED + kill 后台 curl）
-    -- 并连续 5 次 ExitLoop 弹出嵌套 RunLoop。
-    -- 之前只 Hide + 单次 ExitLoop，AI 跑批时点关闭按钮无法终止 AI。
-    force_quit_subfix()
+    -- 关窗 = 退出 SubFix（单实例插件）。走退出闸门：有未写回修改时先弹确认窗
+    -- （弹窗内自行 Hide 主窗，Close 本身不会自动隐藏窗口）；
+    -- 后台任务进行中 / 无修改时等价于 force_quit_subfix（取消 AI、kill curl、
+    -- 连续 5 次 ExitLoop 弹出嵌套 RunLoop）。
+    request_subfix_exit()
+end
+
+-- ========== 退出前「未应用修改」提醒 ==========
+-- 一切编辑只改内存 current_rows；刷新字幕 / 成功写回时间线时 capture_subfix_timeline_baseline
+-- 记录基线。退出时满足任一即视为有未应用修改：
+--   1) 当前行内容签名（起止帧 + 文本）与基线不同（覆盖手动编辑/拆分/批换/精修/AI 自动应用/撤回还原等全部路径）；
+--   2) AI 待审建议数量多于基线（AI 刚产出建议，含尚未批准的）；
+--   3) 存在已批准但尚未写回合并的建议。
+function subfix_row_timeline_signature(rows)
+    local row_list = rows or current_rows
+    if type(row_list) ~= "table" or #row_list == 0 then
+        return nil
+    end
+    local parts = {}
+    for i, row in ipairs(row_list) do
+        parts[i] = table.concat({
+            tostring(row.start_frame or ""),
+            tostring(row.end_frame or ""),
+            tostring(row.text or "")
+        }, "|")
+    end
+    return table.concat(parts, "\n")
+end
+
+function capture_subfix_timeline_baseline()
+    subfix_timeline_baseline_sig = subfix_row_timeline_signature(current_rows)
+    local pending_count = 0
+    local approved_count = 0
+    if type(PendingChanges) == "table" then
+        pending_count = #PendingChanges
+        for _, pending in ipairs(PendingChanges) do
+            if type(pending) == "table" and pending.is_approved == true then
+                approved_count = approved_count + 1
+            end
+        end
+    end
+    subfix_timeline_baseline_pending_count = pending_count
+    -- 写回后已批准建议仍留在 PendingChanges 面板里，但其内容已落轨，计入基线避免再次误报。
+    subfix_timeline_baseline_approved_count = approved_count
+    print("[Hooper AI 2.0] 已记录时间线基线（" .. tostring(current_rows and #current_rows or 0)
+        .. " 行，AI 待审建议 " .. tostring(pending_count) .. " 条，其中已批准 "
+        .. tostring(approved_count) .. " 条）")
+end
+
+function subfix_has_unapplied_changes()
+    if type(current_rows) ~= "table" or #current_rows == 0 then
+        return false
+    end
+    if subfix_timeline_baseline_sig ~= nil
+        and subfix_row_timeline_signature(current_rows) ~= subfix_timeline_baseline_sig then
+        return true
+    end
+    if type(PendingChanges) == "table" then
+        if #PendingChanges > (tonumber(subfix_timeline_baseline_pending_count) or 0) then
+            return true
+        end
+        local approved_count = 0
+        for _, pending in ipairs(PendingChanges) do
+            if type(pending) == "table" and pending.is_approved == true then
+                approved_count = approved_count + 1
+            end
+        end
+        if approved_count > (tonumber(subfix_timeline_baseline_approved_count) or 0) then
+            return true
+        end
+    end
+    return false
+end
+
+function subfix_exit_is_busy()
+    if AI_RUNNING == true then return true end
+    if subfix_generation_running == true then return true end
+    if type(NormalizeProgress) == "table" and NormalizeProgress.running == true then return true end
+    -- 自动更新安装器在写入多个文件，中途退出会损坏安装。
+    if SUBFIX_UPDATE_RUNNING == true then return true end
+    return false
+end
+
+-- Quiet Pro 风格的退出确认弹窗：满橙主按钮「更新到时间线」+ 幽灵按钮「取消修改」。
+-- 关键：不使用嵌套 RunLoop（在 Close 回调里嵌套事件循环会让 ExitLoop 语义紊乱、
+-- 外层主循环退不干净），与「导出」弹窗一致做成无模态弹窗：只 Show，
+-- 按钮回调里直接执行动作；打开期间由 request_subfix_exit 隐藏主窗形成事实模态。
+subfix_unsaved_dialog = nil
+
+-- 弹窗底色方案（实测后的唯一可靠路径）：VGroup/窗口都是 plain QWidget，Qt 不绘制它们的
+-- stylesheet 背景，#对象名 选择器与创建后 SetAttrs(StyleSheet) 在本机 Fusion 也不生效
+-- （主窗口之所以黑，是因为表面被不透明子控件铺满，而非根自己画了背景）。QLabel 则不同：
+-- 静态 QSS 给 background-color 时它会老老实实绘制。所以整个弹窗用 QLabel 铺底——
+-- 标题/说明/弹性区/左右边距/底部边距全部是不透明 Label，保证每像素都是 page 底色。
+-- 标题/说明按主界面文字层级（16px 粗标题 / 13px text_muted 说明）。
+SUBFIX_UNSAVED_FILL_QSS = ([[QLabel{background-color:%s;}]]):format(SUBFIX_DESIGN.color.page)
+SUBFIX_UNSAVED_TITLE_QSS = ([[QLabel{background-color:%s;color:%s;font-size:16px;font-weight:bold;padding:16px 22px 0 22px;}]]):format(SUBFIX_DESIGN.color.page, SUBFIX_DESIGN.color.text)
+SUBFIX_UNSAVED_DESC_QSS = ([[QLabel{background-color:%s;color:%s;font-size:13px;padding:8px 22px 0 22px;}]]):format(SUBFIX_DESIGN.color.page, SUBFIX_DESIGN.color.text_muted)
+
+function ensure_subfix_unsaved_dialog()
+    if subfix_unsaved_dialog then
+        return subfix_unsaved_dialog
+    end
+    local dialog = dispatcher:AddWindow({
+        ID = "SubFixUnsavedChangesDialog",
+        WindowTitle = "未应用的修改",
+        -- 高 200=客户区高（标题栏另加）：标题42 + 说明70 + 按钮36 + 底距16 ≈ 164，余量进弹性 Label。
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({480, 300, 440, 200}),
+        -- 若该版本 Fusion 支持窗口级样式则白赚一层底色；不支持也由下面的 Label 铺满兜底。
+        StyleSheet = SUBFIX_MAIN_ROOT_STYLESHEET
+    },
+    ui:VGroup{
+        ID = "SubFixUnsavedRoot",
+        Weight = 1,
+        Font = ui:Font{PixelSize = 14},
+        StyleSheet = SUBFIX_MAIN_ROOT_STYLESHEET,
+        ContentsMargins = {0, 0, 0, 0},
+        Spacing = 0,
+        ui:Label{ID = "SubFixUnsavedTitle", Text = "有字幕修改尚未更新到时间线", Weight = 0, MinimumSize = {0, 42}, StyleSheet = SUBFIX_UNSAVED_TITLE_QSS},
+        ui:Label{
+            ID = "SubFixUnsavedDesc",
+            Text = "退出后这些修改将丢失，时间线保持原样。\n选择「更新到时间线」先写回再退出，或选择「取消修改」放弃修改并退出。",
+            WordWrap = true,
+            Weight = 0,
+            MinimumSize = {0, 70},
+            StyleSheet = SUBFIX_UNSAVED_DESC_QSS
+        },
+        -- 弹性区也是不透明 Label（空白处底色全靠它绘制）；VGap 在本仓是 VGap(尺寸,权重) 函数形态。
+        ui:Label{ID = "SubFixUnsavedSpacer", Text = "", Weight = 1, StyleSheet = SUBFIX_UNSAVED_FILL_QSS},
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 0,
+            ui:Label{Text = "", Weight = 0, MinimumSize = {22, 0}, StyleSheet = SUBFIX_UNSAVED_FILL_QSS},
+            ui:Button{ID = "SubFixUnsavedApplyBtn", Text = "更新到时间线", Weight = 1, MinimumSize = {0, 36}, StyleSheet = SUBFIX_BTN_ACCENT},
+            ui:Label{Text = "", Weight = 0, MinimumSize = {10, 0}, StyleSheet = SUBFIX_UNSAVED_FILL_QSS},
+            ui:Button{ID = "SubFixUnsavedDiscardBtn", Text = "取消修改", Weight = 1, MinimumSize = {0, 36}, ToolTip = "放弃全部未写回修改并退出", StyleSheet = SUBFIX_BTN_SECONDARY},
+            ui:Label{Text = "", Weight = 0, MinimumSize = {22, 0}, StyleSheet = SUBFIX_UNSAVED_FILL_QSS}
+        },
+        ui:Label{Text = "", Weight = 0, MinimumSize = {0, 16}, StyleSheet = SUBFIX_UNSAVED_FILL_QSS}
+    })
+
+    function dialog.On.SubFixUnsavedApplyBtn.Clicked(ev)
+        subfix_handle_unsaved_choice("apply")
+    end
+    function dialog.On.SubFixUnsavedDiscardBtn.Clicked(ev)
+        subfix_handle_unsaved_choice("discard")
+    end
+    -- 弹窗自身的 X 是保护性默认：误触 = 回到插件（不退出）。
+    function dialog.On.SubFixUnsavedChangesDialog.Close(ev)
+        subfix_handle_unsaved_choice("cancel")
+    end
+
+    subfix_unsaved_dialog = dialog
+    return dialog
+end
+
+-- 弹窗按钮 / X 的统一动作出口（运行在主事件循环 L1 的普通 click/close 派发里，
+-- 因此这里调 force_quit_subfix 与直接点退出按钮的退出路径完全等价）。
+function subfix_handle_unsaved_choice(choice)
+    local dialog = subfix_unsaved_dialog
+    -- 先解锁重入保护并隐藏弹窗，避免后续任何分支把闸门卡死。
+    subfix_exit_prompt_open = false
+    if dialog then pcall(function() dialog:Hide() end) end
+
+    if choice == "apply" then
+        -- 恢复主窗让用户看到写回状态；与手动点「更新时间线」完全同流程（先备份再写回）。
+        pcall(function() if win then win:Show() end end)
+        pcall(persist_timeline_update_backup)
+        local ok_update = pcall(function() update_timeline(win) end)
+        local still_dirty = false
+        pcall(function() still_dirty = subfix_has_unapplied_changes() end)
+        if not ok_update or still_dirty then
+            -- 写回失败/未完成：留在主窗把错误暴露给用户，不吞掉修改。
+            pcall(function() update_shared_status(win, "更新时间线未完成，修改仍保留；请检查后重试，或再次退出并选择「取消修改」") end)
+            return
+        end
+        force_quit_subfix()
+    elseif choice == "discard" then
+        -- 修改只存在于内存，时间线从未被触碰，直接退出即放弃。
+        force_quit_subfix()
+    else
+        -- 误触弹窗 X：恢复主窗，什么都不做。
+        pcall(function() if win then win:Show() end end)
+    end
+end
+
+-- 退出闸门：退出按钮与右上角 X 统一走这里。只负责「直退 or 开弹窗」，不阻塞事件循环。
+function request_subfix_exit()
+    if subfix_exit_prompt_open then return end
+    -- 后台任务进行中保持现状：立即终止（force_quit 内含取消 AI / kill curl 逻辑）。
+    local ok_busy, is_busy = pcall(subfix_exit_is_busy)
+    if ok_busy and is_busy then
+        force_quit_subfix()
+        return
+    end
+    local ok_dirty, has_changes = pcall(subfix_has_unapplied_changes)
+    if not ok_dirty or not has_changes then
+        force_quit_subfix()
+        return
+    end
+    local ok_dialog, dialog = pcall(ensure_subfix_unsaved_dialog)
+    if not ok_dialog or not dialog then
+        -- 弹窗构造失败不阻断退出（修改仅在内存，等价放弃）。
+        force_quit_subfix()
+        return
+    end
+    subfix_exit_prompt_open = true
+    -- X 点击不会自动隐藏主窗（Resolve 里 Close 只是通知，隐藏要自己做，
+    -- 与导出/配置等子弹窗一致）：弹窗期间隐藏主窗，形成事实模态。
+    pcall(function() if win then win:Hide() end end)
+    pcall(function() dialog:Show() end)
 end
 
 -- 强制退出：模拟 macOS Dock 右键 → 强制退出
@@ -21974,6 +19140,12 @@ end
 -- 注意：故意不加 local，避免占用 main chunk 的 200 local 名额
 function force_quit_subfix()
     pcall(function() print("[Hooper AI 2.0] 强制退出 SubFix") end)
+    -- 停掉外部播放头轮询进程，避免残留
+    pcall(function() stop_playhead_poller() end)
+    -- 停跟随定时器并删心跳文件
+    pcall(function() if playhead_follow_timer then playhead_follow_timer:Stop() end end)
+    pcall(function() if playhead_follow_select_timer then playhead_follow_select_timer:Stop() end end)
+    if playhead_follow_alive_file then pcall(function() os.remove(playhead_follow_alive_file) end) end
 
     -- 通知正在跑的 AI 流程取消（B 方案：execute_ai_request 嵌套 RunLoop 的 poll timer 会读这个）
     AI_CANCEL_REQUESTED = true
@@ -22013,16 +19185,24 @@ function force_quit_subfix()
         pcall(function() AIConfigPopWin:Hide() end)
         AIConfigPopWin = nil
     end
+    if subfix_unsaved_dialog then
+        pcall(function() subfix_unsaved_dialog:Hide() end)
+    end
+    subfix_exit_prompt_open = false
     -- 释放 pending review 缓存
     pcall(function()
         if type(pending_item_tc_map) == "table" then
             pending_item_tc_map = {}
         end
     end)
-    -- 隐藏主/迷你窗口
-    if mini_win then
-        pcall(function() mini_win:Hide() end)
-    end
+    -- 通知内嵌选区生成面板收起子弹窗/注销轮询
+    pcall(function()
+        local core = get_generate_selection_core()
+        if core and type(core.shutdown_embedded) == "function" then
+            core.shutdown_embedded()
+        end
+    end)
+    -- 隐藏主窗口（mini 启动窗已移除）
     if win then
         pcall(function() win:Hide() end)
     end
@@ -22036,6 +19216,9 @@ function force_quit_subfix()
             pcall(function() dispatcher:ExitLoop() end)
         end
     end
+    -- 退出前把 pending 日志落盘（P4），再执行既有的临时/日志清理
+    pcall(flush_workflow_log_file)
+    pcall(flush_workflow_log_view, true)
     -- 退出时清理脚本产生的临时/日志文件（关闭达芬奇后会自动删除）
     subfix_cleanup_subfix_logs()
 end
@@ -22043,73 +19226,13 @@ end
 -- 完整版关闭与强制退出事件同样延迟到窗口创建后注册。
 function bind_full_window_close_events()
 -- 窗口关闭时退出事件循环
-function win.On.HooperAI_v2_compact_narrow500_final.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_narrow500_final_h900.Close(ev)
-    handle_main_window_close()
-end
-
 function win.On.HooperAI_v2_compact_narrow500_final_h960.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_narrow500_fill.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_narrow500.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_stable.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_w500c.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_w500b.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_w500.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_final2.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_compact_final.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_uicompact3.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_uicompact2.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_uicompact.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2_uireset.Close(ev)
-    handle_main_window_close()
-end
-
-function win.On.HooperAI_v2.Close(ev)
     handle_main_window_close()
 end
 
 -- 强制退出按钮（仅主窗口；迷你窗口太窄不放，避免挤变形）
 function win.On.ForceQuitBtn.Clicked(ev)
-    force_quit_subfix()
+    request_subfix_exit()
 end
 end
 
@@ -22127,16 +19250,39 @@ ensure_full_window_initialized = function()
     }
 
     if itm.MainTabs then
-        itm.MainTabs:AddTab("精修工具")
-        itm.MainTabs:AddTab("AI 工作台")
+        itm.MainTabs:AddTab("① 选区识别")
+        itm.MainTabs:AddTab("② 精修工具")
+        itm.MainTabs:AddTab("③ AI 工作台")
         itm.MainTabs.CurrentIndex = 0
     end
-    if itm.TabStack then
-        switch_stack_page_index_only(win, "TabStack", 0)
-    end
+    -- 初始页：识别页占满、树与编辑区隐藏。
+    subfix_apply_tab_layout(0, win)
 
     apply_provider_config_to_ui(current_ai_provider_id, LoadConfig(current_ai_provider_id))
     apply_shared_config_to_ui(LoadSharedConfig())
+
+    -- AI 工作台两个下拉框必须在窗口创建后主动填充（构建期 ComboBox 不带选项）。
+    -- 任务 4 项的顺序与 AIFixBtn.Clicked 里 task_idx → task_type 的映射严格对应：
+    -- 0=完整纠错 / 1=的地得专项检测 / 2=中译英 / 3=简体转繁体。
+    local task_combo = win:Find("AITaskSelect")
+    if task_combo then
+        task_combo:AddItem("完整纠错")
+        task_combo:AddItem("的地得专项检测")
+        task_combo:AddItem("中译英")
+        task_combo:AddItem("简体转繁体")
+        pcall(function() task_combo.CurrentIndex = 0 end)
+    end
+    -- 引擎下拉按 AI_PROVIDER_DEFS 顺序列出，并选中上次使用的 provider。
+    -- 填充发生在 CurrentIndexChanged 事件处理函数注册之前，无需抑制事件；
+    -- 选中索引再用一次带抑制标志的同步兜底（此时标志尚未置为 initialized）。
+    local engine_combo = itm.PresetCombo
+    if engine_combo then
+        for _, provider_def in ipairs(AI_PROVIDER_DEFS) do
+            engine_combo:AddItem(tostring(provider_def.label or provider_def.id))
+        end
+        local saved_provider_index = get_provider_index_by_id(current_ai_provider_id)
+        pcall(function() engine_combo.CurrentIndex = saved_provider_index end)
+    end
 
     function win.On.PresetCombo.CurrentIndexChanged(ev)
         if not full_window_ai_controls_initialized then return end
@@ -22160,13 +19306,29 @@ ensure_full_window_initialized = function()
     end
 
     function win.On.MainTabs.CurrentChanged(ev)
-        if itm.TabStack then
-            switch_stack_page_index_only(win, "TabStack", ev and ev.Index or 0)
-        end
+        subfix_apply_tab_layout(ev and ev.Index or 0, win)
+    end
+
+    -- 任务/引擎下拉与引擎切换事件至此全部就绪：打开标志后，
+    -- PresetCombo 的 CurrentIndexChanged 与 sync_provider_combo_selection 才开始联动。
+    full_window_ai_controls_initialized = true
+
+    -- 未解锁引导页 / 空状态：一键回到第 ① 步；空态提供就地重试刷新。
+    function win.On.GotoRecognitionBtn.Clicked(ev)
+        subfix_goto_tab(0, win)
+    end
+    function win.On.GotoRecognitionFromEmptyBtn.Clicked(ev)
+        subfix_goto_tab(0, win)
+    end
+    function win.On.EmptyRefreshBtn.Clicked(ev)
+        refresh_subtitles(win, {skip_backup = true, show_loading_placeholder = true})
     end
 
     bind_full_window_events()
     bind_full_window_close_events()
+    -- 「① 选区识别」面板：描述符已在 create_full_content 时由 core 单例构造（wide），
+    -- 此处窗口/控件已就绪，绑定 controller 事件并首次刷新选区音频候选。
+    pcall(attach_generate_embedded_panel, win)
     local full_items = win:GetItems()
     if full_items and full_items.TargetTrackSpin then
         sync_target_track_control()
@@ -22174,7 +19336,6 @@ ensure_full_window_initialized = function()
     sync_track_control(win)
     sync_search_control(win)
     set_subtitle_loaded_state(is_subtitle_loaded, shared_status_text, win)
-    update_target_track_hint()
     update_shared_status(win, shared_status_text)
     return win
 end
@@ -22193,23 +19354,24 @@ print(string.format("[Hooper AI 2.0] [STARTUP] 备份系统初始化完成: +%d 
 
 current_ai_provider_id = LoadActiveProviderId()
 
-active_window = mini_win
-sync_track_control(mini_win)
-sync_search_control(mini_win)
-set_subtitle_loaded_state(false, nil, mini_win)
-update_target_track_hint()
-update_shared_status(mini_win, shared_status_text)
+-- mini「找个字幕」启动窗已移除：启动直接创建并显示合并主窗口（左字幕修改 + 右选区识别）。
+win = ensure_full_window_initialized()
+active_window = win
+update_shared_status(win, shared_status_text)
 
-print(string.format("[Hooper AI 2.0] [STARTUP] 即将 Show 极简版窗口: +%d ms", startup_elapsed_ms()))
+print(string.format("[Hooper AI 2.0] [STARTUP] 即将显示主窗口: +%d ms", startup_elapsed_ms()))
 _subfix_show_started_at = os.clock()  -- 用全局，避免触发 200 local 上限
 subfix_cleanup_subfix_logs()  -- 清理上次会话（崩溃/强关）遗留的临时文件
-mini_win:Show()
-print(string.format("[Hooper AI 2.0] [STARTUP] mini_win:Show() 用时: %d ms", math.floor(((os.clock() - _subfix_show_started_at) * 1000) + 0.5)))
-set_mini_subtitle_area_state(mini_win, false, "正在自动加载字幕…")
-update_shared_status(mini_win, "正在自动加载字幕...")
-set_load_status_label(false, "<font color='#FA8C16'>⏳ 正在自动加载</font>", mini_win)
+-- 三步工作台启动：首次自动刷新若发现轨道上已有字幕，则自动进入「② 精修工具」；
+-- 无字幕则停留在「① 选区识别」。
+subfix_startup_goto_refine = true
+win:Show()
+subfix_recalc_layout(win)
+print(string.format("[Hooper AI 2.0] [STARTUP] win:Show() 用时: %d ms", math.floor(((os.clock() - _subfix_show_started_at) * 1000) + 0.5)))
+update_shared_status(win, "正在自动加载字幕...")
 restart_ui_timer(startup_refresh_timer)
-print(string.format("[Hooper AI 2.0] 极简版窗口已显示，自动加载字幕已排队 (距脚本启动: +%d ms)。", startup_elapsed_ms()))
+restart_ui_timer(full_window_deferred_sync_timer)
+print(string.format("[Hooper AI 2.0] 主窗口已显示，自动加载字幕已排队 (距脚本启动: +%d ms)。", startup_elapsed_ms()))
 
 -- 必须进入事件循环
 if dispatcher and dispatcher.RunLoop then

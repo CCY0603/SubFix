@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Local alignment helper for SubFix.
+"""Local ASR / forced-alignment helper for SubFix.
 
-Outputs a small JSON payload with segment-level start/end/text. The default
-path force-aligns existing SubFix subtitle rows with stable-ts, while fixture
+Outputs small JSON payloads with segment-level start/end/text for the live
+qwen/v5 transcription, generation and forced-alignment pipelines. Fixture
 mode avoids heavyweight imports for tests.
 """
 
@@ -26,7 +26,6 @@ import urllib.error
 import urllib.request
 import uuid
 import wave
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -110,7 +109,6 @@ generate_textnorm = _LazyGenerateTextnorm()
 
 
 DEFAULT_MODEL = "small"
-DEFAULT_CTC_MODEL = "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
 HELPER_VERSION = "subfix-2026-07-13-candidate-arbitration-v5"
 TRANSCRIBE_BACKENDS = (
     "mimo_asr",
@@ -125,12 +123,13 @@ TRANSCRIBE_BACKENDS = (
 AUTO_TRANSCRIBE_BACKENDS = tuple(
     name for name in TRANSCRIBE_BACKENDS if name not in {"doubao_asr", "doubao_asr_v2"}
 )
-# NOTE: GENERATED_SUBTITLE_MAX_CHARS and friends below drive the legacy v3
-# rule-based splitter (split_generated_subtitle_text/_clause,
-# generate_subtitle_rows_from_segments). The user-facing "字幕长度"
-# (--max-chars) option only overrides the v4/v5 main segmentation path
-# (subfix_generate_v4.segment_canonical_units / _segmentation_length_parameters);
-# the v3 path intentionally keeps its own fixed constants untouched.
+# NOTE: GENERATED_SUBTITLE_MAX_CHARS and friends below drive the rule-based
+# splitter (split_generated_subtitle_text/_clause,
+# generate_subtitle_rows_from_segments) used by fixture generation. The
+# user-facing "字幕长度" (--max-chars) option only overrides the v4/v5 main
+# segmentation path (subfix_generate_v4.segment_canonical_units /
+# _segmentation_length_parameters); the rule-based splitter keeps its own
+# fixed constants untouched.
 GENERATED_SUBTITLE_MAX_CHARS = 18
 GENERATED_SUBTITLE_PREFERRED_MIN_CHARS = 8
 GENERATED_SUBTITLE_PREFERRED_MAX_CHARS = 14
@@ -172,8 +171,6 @@ V5_WRITEBACK_ENV = "SUBFIX_V5_WRITEBACK"
 GENERATED_SUBTITLE_MIN_DURATION_SECONDS = 0.55
 GENERATED_SUBTITLE_SECONDS_PER_CHAR = 0.22
 GENERATED_SUBTITLE_MAX_DURATION_SECONDS = 2.6
-GENERATE_SUBTITLES_BATCH_MAX_SECONDS = 45.0
-LIVE_SPEAKER_ACTIVE_MARGIN_DB = 6.0
 LIVE_SPEAKER_SWITCH_MARGIN_DB = 3.0
 LIVE_SPEAKER_SWITCH_HOLD_SECONDS = 0.12
 EXTERNAL_TRANSCRIBE_COMMAND_ENV = {
@@ -205,6 +202,9 @@ DOUBAO_ASR_DEFAULT_RESOURCE_ID = "volc.bigasr.auc_turbo"
 DOUBAO_ASR_TIMEOUT_SECONDS = 30.0
 DOUBAO_ASR_MAX_ATTEMPTS = 2
 DOUBAO_ASR_RETRY_BACKOFF_SECONDS = 0.5
+# 请求体 user.uid 是业务侧用户标识，绝不能放 API Key（会随请求体被网关日志
+# 记录、计费侧可见）。SubFix 不区分终端用户，使用固定非敏感占位即可。
+DOUBAO_ASR_CLIENT_UID = "subfix-client"
 # 待校准: 文档 demo 中响应头 X-Api-Status-Code 的成功值；响应体 JSON 内未见到顶层
 # code/message 字段（区别于旧版录音文件标准版接口）。
 DOUBAO_ASR_SUCCESS_STATUS_CODE = "20000000"
@@ -329,16 +329,6 @@ def apply_hotword_replacements_to_units(
             changed_count += replaced
         unit["text"] = text
     return changed_count
-
-
-def generate_subtitles_batch_max_seconds() -> float:
-    raw_value = os.getenv("SUBFIX_GENERATE_BATCH_MAX_SECONDS")
-    if raw_value:
-        try:
-            return max(1.0, float(raw_value))
-        except ValueError:
-            pass
-    return GENERATE_SUBTITLES_BATCH_MAX_SECONDS
 
 
 def v5_writeback_mode() -> str:
@@ -495,6 +485,9 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "speaker_score_db",
         "speaker_dominance_db",
         "speaker_decision",
+        "batch_id",
+        "track_order",
+        "item_index",
         "speech_island_id",
         "short_utterance_confident",
         "timing_anchor_source",
@@ -1070,56 +1063,6 @@ def split_generated_subtitle_chunks_by_word_gaps(chunks: list[str], words: list[
     return output
 
 
-def _subtitle_rows_interval(rows: list[dict[str, Any]]) -> tuple[int, int] | None:
-    valid_rows = [row for row in rows or [] if row.get("start_frame") is not None and row.get("end_frame") is not None]
-    if not valid_rows:
-        return None
-    return (
-        min(int(row["start_frame"]) for row in valid_rows),
-        max(int(row["end_frame"]) for row in valid_rows),
-    )
-
-
-def _subtract_frame_intervals(
-    interval: tuple[int, int],
-    covered: list[tuple[int, int]],
-) -> tuple[list[tuple[int, int]], bool]:
-    regions = [interval]
-    overlapped = False
-    for covered_start, covered_end in sorted(covered):
-        next_regions: list[tuple[int, int]] = []
-        for start, end in regions:
-            if covered_end <= start or covered_start >= end:
-                next_regions.append((start, end))
-                continue
-            overlapped = True
-            if start < covered_start:
-                next_regions.append((start, covered_start))
-            if covered_end < end:
-                next_regions.append((covered_end, end))
-        regions = next_regions
-    return [(start, end) for start, end in regions if end > start], overlapped
-
-
-def _merge_frame_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(intervals):
-        if not merged or start > merged[-1][1]:
-            merged.append((start, end))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-    return merged
-
-
-def _rows_inside_interval(rows: list[dict[str, Any]], interval: tuple[int, int]) -> list[dict[str, Any]]:
-    start, end = interval
-    return [
-        row
-        for row in rows or []
-        if int(row.get("start_frame") or 0) >= start and int(row.get("end_frame") or 0) <= end
-    ]
-
-
 def _map_sequence_boundary(matcher: difflib.SequenceMatcher, source_position: int, reverse: bool = False) -> int | None:
     for source_start, target_start, size in matcher.get_matching_blocks():
         if reverse:
@@ -1145,230 +1088,6 @@ def _segmentation_boundary_features(text: str, position: int) -> list[str]:
     if position >= 2 and position + 2 <= len(value):
         features.append(f"cross4={value[position - 2:position + 2]}")
     return features
-
-
-def _percentile(values: list[int], fraction: float, default: int) -> int:
-    if not values:
-        return default
-    ordered = sorted(int(value) for value in values)
-    index = int(round((len(ordered) - 1) * max(0.0, min(1.0, fraction))))
-    return ordered[index]
-
-
-def _build_segmentation_training_example(
-    plugin_rows: list[dict[str, Any]],
-    manual_rows: list[dict[str, Any]],
-    source_label: str,
-) -> dict[str, Any] | None:
-    plugin_chunks = [normalize_ctc_text(row.get("text") or "") for row in plugin_rows]
-    manual_chunks = [normalize_ctc_text(row.get("text") or "") for row in manual_rows]
-    plugin_chunks = [chunk for chunk in plugin_chunks if chunk]
-    manual_chunks = [chunk for chunk in manual_chunks if chunk]
-    source_text = "".join(plugin_chunks)
-    manual_text = "".join(manual_chunks)
-    if len(source_text) < 2 or len(manual_text) < 2:
-        return None
-
-    matcher = difflib.SequenceMatcher(None, source_text, manual_text, autojunk=False)
-    manual_boundaries: list[int] = []
-    cursor = 0
-    for chunk in manual_chunks[:-1]:
-        cursor += len(chunk)
-        manual_boundaries.append(cursor)
-
-    mapped_boundaries: list[int] = []
-    for boundary in manual_boundaries:
-        mapped = _map_sequence_boundary(matcher, boundary, reverse=True)
-        if mapped is not None and 0 < mapped < len(source_text):
-            mapped_boundaries.append(mapped)
-
-    if not mapped_boundaries and len(manual_chunks) > 1:
-        return None
-    return {
-        "source": source_label,
-        "source_text": source_text,
-        "manual_text": manual_text,
-        "manual_chunks": manual_chunks,
-        "mapped_boundaries": sorted(set(mapped_boundaries)),
-        "text_match_score": round(float(matcher.ratio()), 6),
-        "text_corrections": _extract_segmentation_text_corrections(source_text, manual_text),
-        "start_frame": min(int(row.get("start_frame") or 0) for row in plugin_rows),
-        "end_frame": max(int(row.get("end_frame") or 0) for row in plugin_rows),
-    }
-
-
-def _extract_segmentation_text_corrections(source_text: str, manual_text: str) -> list[dict[str, Any]]:
-    matcher = difflib.SequenceMatcher(None, source_text, manual_text, autojunk=False)
-    corrections: list[dict[str, Any]] = []
-    for tag, source_start, source_end, manual_start, manual_end in matcher.get_opcodes():
-        if tag != "replace":
-            continue
-        source = source_text[source_start:source_end]
-        replacement = manual_text[manual_start:manual_end]
-        if not source or not replacement or len(source) > 8 or len(replacement) > 12:
-            continue
-        left_context = source_text[max(0, source_start - 4):source_start]
-        right_context = source_text[source_end:source_end + 4]
-        if len(left_context) + len(right_context) < 4:
-            continue
-        corrections.append(
-            {
-                "source": source,
-                "replacement": replacement,
-                "left_context": left_context,
-                "right_context": right_context,
-            }
-        )
-    return corrections
-
-
-def _build_segmentation_mode_profile(payloads: list[dict[str, Any]]) -> dict[str, Any]:
-    ordered_payloads = sorted(
-        [payload for payload in payloads or [] if isinstance(payload, dict)],
-        key=lambda payload: str(payload.get("exported_at") or ""),
-        reverse=True,
-    )
-    covered_by_timeline: dict[str, list[tuple[int, int]]] = {}
-    examples: list[dict[str, Any]] = []
-    overridden_region_count = 0
-
-    for payload_index, payload in enumerate(ordered_payloads, start=1):
-        plugin_rows = list(payload.get("plugin_rows") or [])
-        manual_rows = list(payload.get("manual_rows") or [])
-        plugin_interval = _subtitle_rows_interval(plugin_rows)
-        manual_interval = _subtitle_rows_interval(manual_rows)
-        if not plugin_interval or not manual_interval:
-            continue
-        sample_interval = (
-            min(plugin_interval[0], manual_interval[0]),
-            max(plugin_interval[1], manual_interval[1]),
-        )
-        if sample_interval[1] <= sample_interval[0]:
-            continue
-        timeline_name = str(payload.get("timeline_name") or "")
-        regions, overlapped = _subtract_frame_intervals(
-            sample_interval,
-            covered_by_timeline.get(timeline_name, []),
-        )
-        if overlapped:
-            overridden_region_count += 1
-        source_path_value = str(payload.get("source_path") or "")
-        source_label = (
-            Path(source_path_value).name
-            if source_path_value
-            else str(payload.get("exported_at") or f"sample_{payload_index}")
-        )
-        for region_index, region in enumerate(regions, start=1):
-            region_plugin_rows = _rows_inside_interval(plugin_rows, region)
-            region_manual_rows = _rows_inside_interval(manual_rows, region)
-            if not region_plugin_rows or not region_manual_rows:
-                continue
-            example = _build_segmentation_training_example(
-                region_plugin_rows,
-                region_manual_rows,
-                f"{source_label}#{region_index}",
-            )
-            if example:
-                examples.append(example)
-        covered_by_timeline[timeline_name] = _merge_frame_intervals(
-            [*covered_by_timeline.get(timeline_name, []), sample_interval]
-        )
-
-    positive_counts: Counter[str] = Counter()
-    negative_counts: Counter[str] = Counter()
-    manual_lengths: list[int] = []
-    for example in examples:
-        source_text = str(example["source_text"])
-        boundaries = set(int(value) for value in example.get("mapped_boundaries") or [])
-        manual_lengths.extend(len(str(chunk)) for chunk in example.get("manual_chunks") or [] if chunk)
-        for position in range(1, len(source_text)):
-            target = positive_counts if position in boundaries else negative_counts
-            target.update(_segmentation_boundary_features(source_text, position))
-
-    total_positive = max(1, sum(positive_counts.values()))
-    total_negative = max(1, sum(negative_counts.values()))
-    feature_weights: dict[str, float] = {}
-    for feature in sorted(set(positive_counts) | set(negative_counts)):
-        positive_rate = (positive_counts[feature] + 0.5) / (total_positive + 1.0)
-        negative_rate = (negative_counts[feature] + 0.5) / (total_negative + 1.0)
-        feature_weights[feature] = round(max(-3.0, min(3.0, math.log(positive_rate / negative_rate))), 6)
-
-    correction_counts: Counter[tuple[str, str, str, str]] = Counter()
-    for example in examples:
-        for correction in example.get("text_corrections") or []:
-            correction_counts[
-                (
-                    str(correction.get("source") or ""),
-                    str(correction.get("replacement") or ""),
-                    str(correction.get("left_context") or ""),
-                    str(correction.get("right_context") or ""),
-                )
-            ] += 1
-    text_corrections = [
-        {
-            "source": source,
-            "replacement": replacement,
-            "left_context": left_context,
-            "right_context": right_context,
-            "support": support,
-        }
-        for (source, replacement, left_context, right_context), support in correction_counts.most_common()
-        if source and replacement
-    ]
-
-    return {
-        "length_model": {
-            "minimum": max(2, _percentile(manual_lengths, 0.05, 4)),
-            "p25": _percentile(manual_lengths, 0.25, 7),
-            "median": _percentile(manual_lengths, 0.5, 10),
-            "p75": _percentile(manual_lengths, 0.75, 14),
-            "p95": _percentile(manual_lengths, 0.95, 20),
-            "maximum": max(manual_lengths, default=GENERATED_SUBTITLE_MAX_CHARS),
-        },
-        "feature_weights": feature_weights,
-        "text_corrections": text_corrections,
-        "examples": examples,
-        "diagnostic": {
-            "input_payload_count": len(ordered_payloads),
-            "training_region_count": len(examples),
-            "overridden_region_count": overridden_region_count,
-            "positive_boundary_count": sum(len(example.get("mapped_boundaries") or []) for example in examples),
-            "manual_row_count": len(manual_lengths),
-            "text_correction_rule_count": len(text_corrections),
-        },
-    }
-
-
-def build_segmentation_profile_from_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
-    valid_payloads = [payload for payload in payloads or [] if isinstance(payload, dict)]
-    mode_payloads: dict[str, list[dict[str, Any]]] = {"narration": [], "live": []}
-    for payload in valid_payloads:
-        mode = str(payload.get("subtitle_mode") or "narration")
-        mode_payloads["live" if mode == "live" else "narration"].append(payload)
-    modes = {
-        mode: _build_segmentation_mode_profile(group)
-        for mode, group in mode_payloads.items()
-        if group
-    }
-    training_region_count = sum(
-        int(mode_profile.get("diagnostic", {}).get("training_region_count") or 0)
-        for mode_profile in modes.values()
-    )
-    manual_row_count = sum(
-        int(mode_profile.get("diagnostic", {}).get("manual_row_count") or 0)
-        for mode_profile in modes.values()
-    )
-    return {
-        "schema_version": SEGMENTATION_PROFILE_SCHEMA,
-        "modes": modes,
-        "diagnostic": {
-            "input_payload_count": len(valid_payloads),
-            "narration_payload_count": len(mode_payloads["narration"]),
-            "live_payload_count": len(mode_payloads["live"]),
-            "training_region_count": training_region_count,
-            "manual_row_count": manual_row_count,
-        },
-    }
 
 
 def segmentation_profile_for_mode(
@@ -1783,70 +1502,6 @@ def attach_speech_islands_to_rows(
     return attached
 
 
-def reconcile_live_subtitle_rows(
-    rows: list[dict[str, Any]],
-    fps: float,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    rate = max(1.0, float(fps or 30.0))
-    nearby_frames = max(1, int(math.ceil(0.35 * rate)))
-    accepted: list[dict[str, Any]] = []
-    duplicate_suppressed_count = 0
-    ambiguous_island_count = 0
-
-    def quality(row: dict[str, Any]) -> tuple[float, float, int, int]:
-        start = int(row.get("start_frame") or 0)
-        end = int(row.get("end_frame") or start + 1)
-        return (
-            float(row.get("speaker_dominance_db") or 0.0),
-            float(row.get("speaker_score_db") or 0.0),
-            len(normalize_ctc_text(row.get("text") or "")),
-            end - start,
-        )
-
-    for raw_row in sorted(
-        rows or [],
-        key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0)),
-    ):
-        row = dict(raw_row)
-        row_start = int(row.get("start_frame") or 0)
-        row_end = int(row.get("end_frame") or row_start + 1)
-        row_text = normalize_ctc_text(row.get("text") or "")
-        duplicate_index: int | None = None
-        overlapping_different_text = False
-        for index, existing in enumerate(accepted):
-            existing_start = int(existing.get("start_frame") or 0)
-            existing_end = int(existing.get("end_frame") or existing_start + 1)
-            intersection = max(0, min(row_end, existing_end) - max(row_start, existing_start))
-            minimum_duration = max(1, min(row_end - row_start, existing_end - existing_start))
-            overlap_ratio = intersection / minimum_duration
-            starts_nearby = abs(row_start - existing_start) <= nearby_frames
-            if intersection <= 0 or (overlap_ratio < 0.5 and not starts_nearby):
-                continue
-            existing_text = normalize_ctc_text(existing.get("text") or "")
-            similarity = difflib.SequenceMatcher(None, row_text, existing_text, autojunk=False).ratio()
-            if similarity >= 0.80:
-                duplicate_index = index
-                break
-            if intersection > 0 and row.get("speaker_track_index") != existing.get("speaker_track_index"):
-                overlapping_different_text = True
-        if duplicate_index is not None:
-            duplicate_suppressed_count += 1
-            if quality(row) > quality(accepted[duplicate_index]):
-                accepted[duplicate_index] = row
-            continue
-        if overlapping_different_text:
-            ambiguous_island_count += 1
-        accepted.append(row)
-
-    accepted.sort(key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0)))
-    for index, row in enumerate(accepted, start=1):
-        row["index"] = index
-    return accepted, {
-        "duplicate_suppressed_count": duplicate_suppressed_count,
-        "ambiguous_island_count": ambiguous_island_count,
-    }
-
-
 def stabilize_generated_subtitle_rows(
     rows: list[dict[str, Any]],
     fps: float,
@@ -2248,12 +1903,17 @@ def generate_subtitle_rows_from_segments(
         else:
             output_chunks = chunks
             text_correction_counts = [0] * len(chunks)
+        # zip(..., strict=True) 仅 Python 3.10+ 支持；显式等长校验兼容 3.8/3.9。
+        if len(chunks) != len(output_chunks) or len(chunks) != len(text_correction_counts) or len(chunks) != len(frame_ranges):
+            raise ValueError(
+                "ASR 文本校正结果长度不一致: chunks=%d output=%d corrections=%d ranges=%d"
+                % (len(chunks), len(output_chunks), len(text_correction_counts), len(frame_ranges))
+            )
         for chunk_index, (chunk, output_chunk, correction_count, (start_frame, end_frame)) in enumerate(zip(
             chunks,
             output_chunks,
             text_correction_counts,
             frame_ranges,
-            strict=True,
         )):
             output_text = strip_generated_subtitle_punctuation(output_chunk)
             if not output_text:
@@ -2310,400 +1970,6 @@ def generate_subtitle_rows_from_segments(
     return rows
 
 
-def build_live_speaker_turns(
-    activity_windows_by_track: dict[int, list[dict[str, Any]]],
-    fps: float,
-    active_margin_db: float = LIVE_SPEAKER_ACTIVE_MARGIN_DB,
-    switch_margin_db: float = LIVE_SPEAKER_SWITCH_MARGIN_DB,
-    switch_hold_seconds: float = LIVE_SPEAKER_SWITCH_HOLD_SECONDS,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    rate = max(1.0, float(fps or 30.0))
-    score_by_track: dict[int, dict[int, float]] = {}
-    first_frame: int | None = None
-    last_frame: int | None = None
-    for raw_track_index, windows in (activity_windows_by_track or {}).items():
-        track_index = int(raw_track_index)
-        frame_scores: dict[int, list[float]] = {}
-        for window in windows or []:
-            start_frame = int(math.floor(float(window.get("start_frame") or 0)))
-            end_frame = max(start_frame + 1, int(math.ceil(float(window.get("end_frame") or start_frame + 1))))
-            score = float(window.get("activity_db") or 0.0)
-            first_frame = start_frame if first_frame is None else min(first_frame, start_frame)
-            last_frame = end_frame if last_frame is None else max(last_frame, end_frame)
-            for frame in range(start_frame, end_frame):
-                frame_scores.setdefault(frame, []).append(score)
-        score_by_track[track_index] = {
-            frame: sum(values) / max(1, len(values))
-            for frame, values in frame_scores.items()
-        }
-
-    if first_frame is None or last_frame is None or not score_by_track:
-        return [], {
-            "speaker_turn_count": 0,
-            "speaker_switch_count": 0,
-            "ambiguous_window_count": 0,
-            "overlap_suppressed_count": 0,
-        }
-
-    hold_frames = max(1, int(math.ceil(float(switch_hold_seconds) * rate)))
-    current_track: int | None = None
-    current_start = first_frame
-    pending_track: int | None = None
-    pending_start: int | None = None
-    pending_frames = 0
-    ambiguous_count = 0
-    overlap_count = 0
-    turns: list[dict[str, Any]] = []
-
-    def finish_turn(end_frame: int) -> None:
-        if current_track is None or end_frame <= current_start:
-            return
-        values = [
-            score_by_track.get(current_track, {}).get(frame)
-            for frame in range(current_start, end_frame)
-        ]
-        valid_values = [float(value) for value in values if value is not None]
-        dominance_values: list[float] = []
-        for frame in range(current_start, end_frame):
-            current_value = score_by_track.get(current_track, {}).get(frame)
-            if current_value is None:
-                continue
-            other_values = [
-                scores.get(frame)
-                for track_index, scores in score_by_track.items()
-                if track_index != current_track and scores.get(frame) is not None
-            ]
-            if other_values:
-                dominance_values.append(float(current_value) - max(float(value) for value in other_values))
-        turns.append(
-            {
-                "start_frame": current_start,
-                "end_frame": end_frame,
-                "speaker_track_index": current_track,
-                "speaker_score_db": round(sum(valid_values) / max(1, len(valid_values)), 3),
-                "speaker_dominance_db": round(sum(dominance_values) / max(1, len(dominance_values)), 3),
-                "speaker_hold_frames": end_frame - current_start,
-                "speaker_decision": "initial" if not turns else "switch",
-            }
-        )
-
-    for frame in range(first_frame, last_frame):
-        frame_scores = sorted(
-            (
-                (track_index, scores.get(frame, float("-inf")))
-                for track_index, scores in score_by_track.items()
-            ),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-        active_scores = [item for item in frame_scores if item[1] >= active_margin_db]
-        candidate_track = active_scores[0][0] if active_scores else None
-        candidate_score = active_scores[0][1] if active_scores else float("-inf")
-        if len(active_scores) > 1:
-            overlap_count += 1
-            if candidate_score - active_scores[1][1] < switch_margin_db:
-                ambiguous_count += 1
-
-        if current_track is None:
-            if candidate_track is not None:
-                current_track = candidate_track
-                current_start = frame
-            continue
-
-        current_score = score_by_track.get(current_track, {}).get(frame, float("-inf"))
-        should_challenge = (
-            candidate_track is not None
-            and candidate_track != current_track
-            and (current_score < active_margin_db or candidate_score >= current_score + switch_margin_db)
-        )
-        if not should_challenge:
-            pending_track = None
-            pending_start = None
-            pending_frames = 0
-            continue
-
-        if pending_track != candidate_track:
-            pending_track = candidate_track
-            pending_start = frame
-            pending_frames = 1
-        else:
-            pending_frames += 1
-        if pending_frames < hold_frames:
-            continue
-
-        switch_frame = int(pending_start if pending_start is not None else frame)
-        finish_turn(switch_frame)
-        current_track = pending_track
-        current_start = switch_frame
-        pending_track = None
-        pending_start = None
-        pending_frames = 0
-
-    finish_turn(last_frame)
-    return turns, {
-        "speaker_turn_count": len(turns),
-        "speaker_switch_count": max(0, len(turns) - 1),
-        "ambiguous_window_count": ambiguous_count,
-        "overlap_suppressed_count": overlap_count,
-    }
-
-
-def live_speaker_turn_at_frame(
-    speaker_turns: list[dict[str, Any]],
-    frame: float,
-) -> dict[str, Any] | None:
-    for turn in speaker_turns or []:
-        if float(turn.get("start_frame") or 0) <= frame < float(turn.get("end_frame") or 0):
-            return turn
-    return None
-
-
-def join_live_asr_words(words: list[dict[str, Any]]) -> str:
-    output = ""
-    for word in words or []:
-        value = str(word.get("word") or word.get("text") or "")
-        if not value:
-            continue
-        if output and output[-1:].isascii() and output[-1:].isalnum() and value[:1].isascii() and value[:1].isalnum():
-            output += " "
-        output += value
-    return output.strip()
-
-
-def live_fallback_segments_for_track(
-    segments: list[dict[str, Any]],
-    track_index: int,
-    reason: str,
-) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    for raw_segment in segments or []:
-        segment = dict(raw_segment)
-        segment["speaker_track_index"] = int(track_index)
-        segment["speaker_decision"] = reason
-        segment.pop("speech_island_id", None)
-        segment.pop("speech_island_start", None)
-        segment.pop("speech_island_end", None)
-        output.append(segment)
-    return output
-
-
-def merge_live_vad_regions(
-    speech_regions: list[dict[str, Any]] | None,
-    hard_gap_seconds: float = GENERATED_SUBTITLE_VAD_ONLY_HARD_SILENCE_SECONDS,
-) -> list[dict[str, float]]:
-    merged: list[dict[str, float]] = []
-    for raw_region in sorted(speech_regions or [], key=lambda region: float(region.get("start") or 0.0)):
-        start = float(raw_region.get("start") or 0.0)
-        end = float(raw_region.get("end") or start)
-        if end <= start:
-            continue
-        if merged and start - merged[-1]["end"] < float(hard_gap_seconds):
-            merged[-1]["end"] = round(max(merged[-1]["end"], end), 3)
-        else:
-            merged.append({"start": round(start, 3), "end": round(end, 3)})
-    return merged
-
-
-def _filter_live_segments_for_track_legacy(
-    segments: list[dict[str, Any]],
-    track_index: int,
-    speaker_turns: list[dict[str, Any]],
-    fps: float,
-    timeline_start_frame: int,
-) -> tuple[list[dict[str, Any]], int, bool]:
-    if not segments:
-        return [], 0, False
-    if not speaker_turns or any(not segment.get("words") for segment in segments):
-        reason = "live_fallback_no_word_timing" if any(not segment.get("words") for segment in segments) else "live_fallback_no_activity"
-        return live_fallback_segments_for_track(segments, track_index, reason), 0, True
-
-    rate = max(1.0, float(fps or 30.0))
-    selected: list[dict[str, Any]] = []
-    rejected_count = 0
-    for segment in segments:
-        group: list[dict[str, Any]] = []
-        group_turn: dict[str, Any] | None = None
-
-        def flush_group() -> None:
-            nonlocal group, group_turn
-            if not group or group_turn is None:
-                group = []
-                group_turn = None
-                return
-            selected.append(
-                {
-                    "start": float(group[0].get("start") or 0.0),
-                    "end": float(group[-1].get("end") or group[0].get("start") or 0.0),
-                    "text": join_live_asr_words(group),
-                    "words": [dict(word) for word in group],
-                    "speaker_track_index": int(track_index),
-                    "speaker_score_db": float(group_turn.get("speaker_score_db") or 0.0),
-                    "speaker_decision": str(group_turn.get("speaker_decision") or "live_energy"),
-                }
-            )
-            group = []
-            group_turn = None
-
-        for word in segment.get("words") or []:
-            word_start = float(word.get("start") or 0.0)
-            word_end = float(word.get("end") or word_start)
-            midpoint = int(timeline_start_frame) + ((word_start + word_end) * 0.5 * rate)
-            turn = live_speaker_turn_at_frame(speaker_turns, midpoint)
-            if turn and int(turn.get("speaker_track_index") or 0) == int(track_index):
-                if group_turn is not None and turn is not group_turn:
-                    flush_group()
-                group_turn = turn
-                group.append(dict(word))
-            else:
-                rejected_count += 1
-                flush_group()
-        flush_group()
-
-    return [segment for segment in selected if segment.get("text")], rejected_count, False
-
-
-def filter_live_segments_for_track(
-    segments: list[dict[str, Any]],
-    track_index: int,
-    speaker_turns: list[dict[str, Any]],
-    fps: float,
-    timeline_start_frame: int,
-    speech_regions: list[dict[str, Any]] | None = None,
-    engine: str | None = None,
-) -> tuple[list[dict[str, Any]], int, bool]:
-    selected_engine = str(engine or os.getenv("SUBFIX_LIVE_ENGINE") or "islands_v2")
-    if selected_engine == "legacy" or not speech_regions:
-        return _filter_live_segments_for_track_legacy(
-            segments,
-            track_index,
-            speaker_turns,
-            fps,
-            timeline_start_frame,
-        )
-    if not segments:
-        return [], 0, False
-    if not speaker_turns or any(not segment.get("words") for segment in segments):
-        reason = "live_fallback_no_word_timing" if any(not segment.get("words") for segment in segments) else "live_fallback_no_activity"
-        return live_fallback_segments_for_track(segments, track_index, reason), 0, True
-
-    rate = max(1.0, float(fps or 30.0))
-    all_words = [dict(word) for segment in segments for word in segment.get("words") or []]
-    assigned_word_ids: set[int] = set()
-    selected: list[dict[str, Any]] = []
-    rejected_count = 0
-    hold_frames_required = max(1, int(math.ceil(LIVE_SPEAKER_SWITCH_HOLD_SECONDS * rate)))
-
-    speech_islands: list[dict[str, float]] = []
-    for region in merge_live_vad_regions(speech_regions):
-        region_start = float(region.get("start") or 0.0)
-        region_end = float(region.get("end") or region_start)
-        if region_end <= region_start:
-            continue
-        boundaries = [region_start, region_end]
-        for turn in speaker_turns:
-            if str(turn.get("speaker_decision") or "") != "switch":
-                continue
-            if int(turn.get("speaker_hold_frames") or 0) < hold_frames_required:
-                continue
-            if float(turn.get("speaker_dominance_db") or 0.0) < LIVE_SPEAKER_SWITCH_MARGIN_DB:
-                continue
-            boundary = (float(turn.get("start_frame") or timeline_start_frame) - int(timeline_start_frame)) / rate
-            if region_start < boundary < region_end:
-                boundaries.append(boundary)
-        boundaries = sorted(set(boundaries))
-        speech_islands.extend(
-            {"start": left, "end": right}
-            for left, right in zip(boundaries, boundaries[1:])
-            if right > left
-        )
-
-    for region in speech_islands:
-        region_start = float(region.get("start") or 0.0)
-        region_end = float(region.get("end") or region_start)
-        if region_end <= region_start:
-            continue
-        island_words: list[dict[str, Any]] = []
-        for word in all_words:
-            word_id = id(word)
-            if word_id in assigned_word_ids:
-                continue
-            word_start = float(word.get("start") or 0.0)
-            word_end = float(word.get("end") or word_start)
-            midpoint = (word_start + word_end) * 0.5
-            if region_start - 0.08 <= midpoint <= region_end + 0.08:
-                assigned_word_ids.add(word_id)
-                island_words.append(word)
-        if not island_words:
-            continue
-
-        votes: dict[int, float] = {}
-        score_totals: dict[int, float] = {}
-        dominance_totals: dict[int, float] = {}
-        hold_by_track: dict[int, int] = {}
-        for word in island_words:
-            word_start = float(word.get("start") or 0.0)
-            word_end = float(word.get("end") or word_start)
-            midpoint_frame = int(timeline_start_frame) + ((word_start + word_end) * 0.5 * rate)
-            turn = live_speaker_turn_at_frame(speaker_turns, midpoint_frame)
-            if not turn:
-                continue
-            owner = int(turn.get("speaker_track_index") or 0)
-            weight = max(0.02, word_end - word_start)
-            votes[owner] = votes.get(owner, 0.0) + weight
-            score_totals[owner] = score_totals.get(owner, 0.0) + float(turn.get("speaker_score_db") or 0.0) * weight
-            dominance_totals[owner] = dominance_totals.get(owner, 0.0) + float(turn.get("speaker_dominance_db") or 0.0) * weight
-            hold_by_track[owner] = max(
-                hold_by_track.get(owner, 0),
-                int(float(turn.get("end_frame") or midpoint_frame) - float(turn.get("start_frame") or midpoint_frame)),
-            )
-        if not votes:
-            rejected_count += len(island_words)
-            continue
-        owner = max(votes, key=lambda value: (votes[value], score_totals.get(value, 0.0)))
-        if owner != int(track_index):
-            rejected_count += len(island_words)
-            continue
-
-        owner_weight = max(1e-6, votes[owner])
-        speaker_score = score_totals.get(owner, 0.0) / owner_weight
-        speaker_dominance = dominance_totals.get(owner, 0.0) / owner_weight
-        island_duration = region_end - region_start
-        selected.append(
-            {
-                "start": float(island_words[0].get("start") or region_start),
-                "end": float(island_words[-1].get("end") or region_end),
-                "text": join_live_asr_words(island_words),
-                "words": island_words,
-                "speaker_track_index": int(track_index),
-                "speaker_score_db": round(speaker_score, 3),
-                "speaker_dominance_db": round(speaker_dominance, 3),
-                "speaker_hold_frames": int(hold_by_track.get(owner, 0)),
-                "speaker_decision": "speech_island_v2",
-                "speech_island_id": f"{int(track_index)}:{region_start:.3f}-{region_end:.3f}",
-                "speech_island_start": region_start,
-                "speech_island_end": region_end,
-                "short_utterance_confident": bool(
-                    island_duration >= 0.18
-                    and speaker_dominance >= LIVE_SPEAKER_SWITCH_MARGIN_DB
-                    and hold_by_track.get(owner, 0) >= hold_frames_required
-                ),
-            }
-        )
-
-    unassigned_count = len(all_words) - len(assigned_word_ids)
-    rejected_count += max(0, unassigned_count)
-    if not selected and all_words:
-        legacy_segments, legacy_rejected, _legacy_fallback = _filter_live_segments_for_track_legacy(
-            segments,
-            track_index,
-            speaker_turns,
-            fps,
-            timeline_start_frame,
-        )
-        return legacy_segments, legacy_rejected, True
-    return [segment for segment in selected if segment.get("text")], rejected_count, False
-
-
 def milliseconds_to_srt_time(milliseconds: int) -> str:
     value = max(0, int(milliseconds))
     hours = value // 3_600_000
@@ -2747,13 +2013,21 @@ def write_subtitle_rows_to_srt(path: Path, rows: list[dict[str, Any]], fps: floa
 
 
 def audio_duration_seconds(audio_path: Path) -> float:
+    """Return a WAV file's duration in seconds.
+
+    A readable but zero-frame WAV legitimately reports 0.0 (silent/empty
+    cut). Any file ``wave`` cannot open is a real pipeline failure here --
+    every caller passes audio this tool itself produced with ffmpeg -- so
+    such cases raise instead of silently returning 0.0 and causing
+    downstream zero-length subtitles or a bogus "audio too long" pass.
+    """
     try:
         with wave.open(str(audio_path), "rb") as handle:
             frames = handle.getnframes()
             rate = handle.getframerate() or 1
             return frames / float(rate)
-    except Exception:
-        return 0.0
+    except (wave.Error, EOFError, OSError) as exc:
+        raise RuntimeError(f"无法读取音频时长（文件缺失或已损坏）: {audio_path}") from exc
 
 
 def qwen3_language_name(language: str | None) -> str | None:
@@ -2938,47 +2212,6 @@ def load_generate_subtitles_batch_plan(batch_plan_json: str | None) -> list[dict
     return batches
 
 
-def expand_generate_subtitles_batches(
-    batches: list[dict[str, Any]],
-    max_seconds: float | None = None,
-) -> list[dict[str, Any]]:
-    expanded: list[dict[str, Any]] = []
-    window_seconds = max(1.0, float(max_seconds if max_seconds is not None else generate_subtitles_batch_max_seconds()))
-    for batch in batches or []:
-        source_start = float(batch.get("source_start") or 0.0)
-        source_end = batch.get("source_end")
-        source_end_float = float(source_end) if source_end is not None else None
-        if source_end_float is None or source_end_float - source_start <= window_seconds:
-            next_batch = dict(batch)
-            next_batch.setdefault("parent_batch_id", str(batch.get("batch_id") or len(expanded) + 1))
-            next_batch.setdefault("batch_part_index", 1)
-            next_batch.setdefault("batch_part_count", 1)
-            expanded.append(next_batch)
-            continue
-
-        batch_fps = float(batch.get("fps") or 30.0)
-        timeline_start_frame = int(batch.get("timeline_start_frame") or 0)
-        part_count = int(math.ceil((source_end_float - source_start) / window_seconds))
-        cursor = source_start
-        parent_batch_id = str(batch.get("batch_id") or len(expanded) + 1)
-        for part_index in range(1, part_count + 1):
-            part_start = cursor
-            part_end = min(source_end_float, source_start + (window_seconds * part_index))
-            if part_end <= part_start:
-                break
-            next_batch = dict(batch)
-            next_batch["parent_batch_id"] = parent_batch_id
-            next_batch["batch_id"] = f"{parent_batch_id}_part{part_index:02d}"
-            next_batch["batch_part_index"] = part_index
-            next_batch["batch_part_count"] = part_count
-            next_batch["source_start"] = part_start
-            next_batch["source_end"] = part_end
-            next_batch["timeline_start_frame"] = timeline_start_frame + int(round((part_start - source_start) * batch_fps))
-            expanded.append(next_batch)
-            cursor = part_end
-    return expanded
-
-
 def load_transcribe_windows(windows_json: str | None) -> list[dict[str, Any]]:
     if not windows_json:
         return []
@@ -3026,61 +2259,8 @@ def ctc_units_for_rows(rows: list[dict[str, Any]]) -> list[list[str]]:
     return units
 
 
-def rows_to_seed_segments(
-    rows: list[dict[str, Any]],
-    fps: float,
-    timeline_start_frame: int,
-    max_seconds: float | None = None,
-) -> list[dict[str, Any]]:
-    segments: list[dict[str, Any]] = []
-    previous_start: float | None = None
-    frame_tolerance = max(0.05, 2.0 / max(float(fps), 1.0))
-    for row in rows:
-        start = (float(row["start_frame"]) - timeline_start_frame) / fps
-        end = (float(row["end_frame"]) - timeline_start_frame) / fps
-        row_label = row.get("index", len(segments) + 1)
-        if start < -frame_tolerance:
-            raise RuntimeError(f"stable-ts seed 超出音频片段开头: 字幕 #{row_label}")
-        if end <= start:
-            raise RuntimeError(f"stable-ts seed 空时间段: 字幕 #{row_label}")
-        if previous_start is not None and start <= previous_start:
-            raise RuntimeError(f"stable-ts seed 非递增: 字幕 #{row_label}")
-        if max_seconds is not None and start > max_seconds + frame_tolerance:
-            raise RuntimeError(f"stable-ts seed 超出音频片段结尾: 字幕 #{row_label}")
-        if max_seconds is not None and end > max_seconds + frame_tolerance:
-            raise RuntimeError(f"stable-ts seed 超出音频片段结尾: 字幕 #{row_label}")
-        previous_start = start
-        segments.append({"start": round(start, 3), "end": round(end, 3), "text": row["text"]})
-    return segments
-
-
 def alignment_unit_count(text: str) -> int:
     return len(re.sub(r"\s+", "", str(text or "")))
-
-
-def result_to_payload(result: Any) -> dict[str, Any]:
-    if isinstance(result, dict):
-        return result
-    if hasattr(result, "to_dict"):
-        return result.to_dict()
-    if hasattr(result, "segments"):
-        segments = []
-        for segment in result.segments:
-            if isinstance(segment, dict):
-                segments.append(segment)
-            elif hasattr(segment, "to_dict"):
-                segments.append(segment.to_dict())
-            else:
-                segments.append(
-                    {
-                        "start": getattr(segment, "start", 0),
-                        "end": getattr(segment, "end", 0),
-                        "text": getattr(segment, "text", ""),
-                        "words": getattr(segment, "words", []),
-                    }
-                )
-        return {"segments": segments}
-    raise RuntimeError("stable-ts 对齐结果格式不可识别")
 
 
 def split_aligned_segments_by_rows(rows: list[dict[str, Any]], segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3109,7 +2289,9 @@ def split_aligned_segments_by_rows(rows: list[dict[str, Any]], segments: list[di
     consumed_target_units = 0
     consumed_word_units = 0
 
-    for row, units in zip(rows, row_units, strict=True):
+    if len(rows) != len(row_units):
+        raise ValueError("split_segments 行数不一致: rows=%d row_units=%d" % (len(rows), len(row_units)))
+    for row, units in zip(rows, row_units):
         start_index = min(word_index, len(timed_words) - 1)
         consumed_target_units += units
         target_word_units = max(consumed_word_units + 1, int(round(consumed_target_units * unit_ratio)))
@@ -3149,9 +2331,11 @@ def apply_alignment_to_rows(
     if len(segments) != len(rows):
         segments = split_aligned_segments_by_rows(rows, segments)
 
+    if len(rows) != len(segments):
+        raise ValueError("对齐段数与字幕行数不一致: rows=%d segments=%d" % (len(rows), len(segments)))
     aligned: list[dict[str, Any]] = []
     previous_start: int | None = None
-    for row, segment in zip(rows, segments, strict=True):
+    for row, segment in zip(rows, segments):
         segment_start = float(segment.get("start") or 0)
         segment_end = float(segment.get("end") or segment_start)
         if segment_end <= segment_start:
@@ -3248,13 +2432,6 @@ def pad_aligned_rows_display(
     return aligned_rows
 
 
-def normalize_aligned_segments_for_rows(raw_payload: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    segments = normalize_segments(raw_payload)
-    if len(segments) == len(rows):
-        return segments
-    return split_aligned_segments_by_rows(rows, segments)
-
-
 def percentile(values: list[float], ratio: float) -> float:
     if not values:
         return 0.0
@@ -3275,77 +2452,6 @@ def decode_pcm_samples(raw: bytes, sample_width: int, channels: int) -> list[flo
         ]
         samples.append(sum(channel_values) / (len(channel_values) * 32768.0))
     return samples
-
-
-def read_wav_mono_samples(wav_path: Path) -> tuple[list[float], int]:
-    with wave.open(str(wav_path), "rb") as handle:
-        sample_rate = handle.getframerate()
-        channels = handle.getnchannels()
-        sample_width = handle.getsampwidth()
-        raw = handle.readframes(handle.getnframes())
-    return decode_pcm_samples(raw, sample_width, channels), sample_rate
-
-
-def segments_from_ctc_char_segments(
-    rows: list[dict[str, Any]],
-    char_segments: list[dict[str, Any]],
-    row_units: list[list[str]] | None = None,
-    fps: float | None = None,
-    timeline_start_frame: int = 0,
-) -> list[dict[str, Any]]:
-    row_units = row_units if row_units is not None else ctc_units_for_rows(rows)
-    normalized_chars = []
-    for item in char_segments or []:
-        char_text = normalize_ctc_text(str(item.get("char") or item.get("text") or ""))
-        if not char_text:
-            continue
-        start = float(item.get("start") or 0.0)
-        end = float(item.get("end") or start)
-        score = float(item.get("score") or item.get("confidence") or 0.0)
-        for char in char_text:
-            normalized_chars.append({"char": char, "start": start, "end": end, "score": score})
-
-    required_units = sum(len(units) for units in row_units)
-    if len(normalized_chars) < required_units:
-        raise RuntimeError(f"CTC 字符数量不匹配: 字幕需要 {required_units} 字，结果 {len(normalized_chars)} 字")
-
-    segments: list[dict[str, Any]] = []
-    cursor = 0
-    for row, units in zip(rows, row_units, strict=True):
-        count = len(units)
-        row_chars = normalized_chars[cursor : cursor + count]
-        cursor += count
-        ctc_start_frame = None
-        ctc_end_frame = None
-        if not row_chars:
-            if count > 0 or fps is None:
-                raise RuntimeError(f"CTC 字符时间为空: 字幕 #{row.get('index', len(segments) + 1)}")
-            start = max(0.0, (float(row.get("start_frame") or 0) - float(timeline_start_frame or 0)) / max(float(fps), 1.0))
-            end = max(start + 0.001, (float(row.get("end_frame") or 0) - float(timeline_start_frame or 0)) / max(float(fps), 1.0))
-            confidence = 0.0
-            ctc_start_frame = int(round(float(row.get("start_frame") or 0)))
-            ctc_end_frame = int(round(float(row.get("end_frame") or ctc_start_frame + 1)))
-        else:
-            start = float(row_chars[0]["start"])
-            end = max(float(row_chars[-1]["end"]), start + 0.001)
-            confidence = sum(float(char.get("score") or 0.0) for char in row_chars) / max(1, len(row_chars))
-            if fps is not None:
-                ctc_start_frame = int(round(float(timeline_start_frame or 0) + start * float(fps)))
-                ctc_end_frame = int(round(float(timeline_start_frame or 0) + end * float(fps)))
-        segment = {
-            "index": row.get("index"),
-            "start": round(start, 3),
-            "end": round(end, 3),
-            "text": row.get("text") or "",
-            "ctc_confidence": round(confidence, 4),
-            "ctc_char_count": count,
-        }
-        if ctc_start_frame is not None:
-            segment["ctc_start_frame"] = ctc_start_frame
-        if ctc_end_frame is not None:
-            segment["ctc_end_frame"] = max(int(ctc_end_frame), int(ctc_start_frame or 0) + 1)
-        segments.append(segment)
-    return segments
 
 
 def qwen_timestamp_items_to_char_units(timestamp_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3536,7 +2642,9 @@ def qwen3_remap_timestamp_items_to_rows(
     segments: list[dict[str, Any]] = []
     cursor = 0
 
-    for row, target_units in zip(rows, row_units, strict=True):
+    if len(rows) != len(row_units):
+        raise ValueError("Qwen 重映射行单元数不一致: rows=%d row_units=%d" % (len(rows), len(row_units)))
+    for row, target_units in zip(rows, row_units):
         target_text = "".join(target_units)
         if not target_text:
             segments.append(
@@ -3592,118 +2700,6 @@ def qwen3_remap_timestamp_items_to_rows(
         cursor = end_index
     repair_rejected_row_timings(segments, fps, timeline_start_frame)
     return segments
-
-
-def ctc_token_id(tokenizer: Any, char: str) -> int:
-    token_id = tokenizer.convert_tokens_to_ids(char)
-    unk_id = getattr(tokenizer, "unk_token_id", None)
-    if token_id is not None and token_id != unk_id:
-        return int(token_id)
-    encoded = tokenizer(char, add_special_tokens=False)
-    input_ids = getattr(encoded, "input_ids", None)
-    if input_ids is None and isinstance(encoded, dict):
-        input_ids = encoded.get("input_ids")
-    if input_ids and len(input_ids) == 1 and input_ids[0] != unk_id:
-        return int(input_ids[0])
-    raise RuntimeError(f"CTC 模型词表不支持字符: {char}")
-
-
-def ctc_units_and_token_ids_for_tokenizer(
-    rows: list[dict[str, Any]],
-    tokenizer: Any,
-) -> tuple[list[list[str]], list[int], dict[str, int]]:
-    row_units: list[list[str]] = []
-    token_ids: list[int] = []
-    skipped_chars: dict[str, int] = {}
-    for row in rows:
-        units: list[str] = []
-        for char in normalize_ctc_text(str(row.get("text") or "")):
-            try:
-                token_id = ctc_token_id(tokenizer, char)
-            except RuntimeError:
-                skipped_chars[char] = skipped_chars.get(char, 0) + 1
-                continue
-            units.append(char)
-            token_ids.append(token_id)
-        row_units.append(units)
-    if not token_ids:
-        raise RuntimeError("没有可用于 CTC 文本对齐的模型词表支持字符")
-    return row_units, token_ids, skipped_chars
-
-
-def ctc_forced_align_char_segments(
-    emissions: Any,
-    token_ids: list[int],
-    transcript_chars: list[str],
-    blank_id: int,
-    seconds_per_frame: float,
-) -> list[dict[str, Any]]:
-    import torch  # type: ignore
-
-    if not token_ids:
-        raise RuntimeError("CTC 对齐文本为空")
-    if emissions.numel() == 0:
-        raise RuntimeError("CTC 模型未返回 emission")
-
-    emissions = emissions.cpu()
-    expanded_ids: list[int] = []
-    expanded_char_indices: list[int | None] = []
-    for index, token_id in enumerate(token_ids):
-        if index > 0 and token_ids[index - 1] == token_id:
-            expanded_ids.append(blank_id)
-            expanded_char_indices.append(None)
-        expanded_ids.append(token_id)
-        expanded_char_indices.append(index)
-
-    frame_count = int(emissions.size(0))
-    token_count = len(expanded_ids)
-    trellis = torch.full((frame_count + 1, token_count + 1), -float("inf"))
-    trellis[0, 0] = 0.0
-    for frame_index in range(frame_count):
-        trellis[frame_index + 1, 0] = trellis[frame_index, 0] + emissions[frame_index, blank_id]
-        for token_index, token_id in enumerate(expanded_ids, start=1):
-            stay = trellis[frame_index, token_index] + emissions[frame_index, blank_id]
-            change = trellis[frame_index, token_index - 1] + emissions[frame_index, token_id]
-            trellis[frame_index + 1, token_index] = torch.maximum(stay, change)
-
-    end_frame = int(torch.argmax(trellis[:, token_count]).item())
-    if end_frame <= 0:
-        end_frame = frame_count
-
-    points: list[dict[str, Any]] = []
-    token_index = token_count
-    frame_index = end_frame
-    while token_index > 0 and frame_index > 0:
-        token_id = expanded_ids[token_index - 1]
-        stay = trellis[frame_index - 1, token_index] + emissions[frame_index - 1, blank_id]
-        change = trellis[frame_index - 1, token_index - 1] + emissions[frame_index - 1, token_id]
-        if change > stay:
-            score = float(torch.exp(emissions[frame_index - 1, token_id]).item())
-            char_index = expanded_char_indices[token_index - 1]
-            if char_index is not None:
-                points.append({"token_index": char_index, "frame": frame_index - 1, "score": score})
-            token_index -= 1
-        frame_index -= 1
-
-    if token_index > 0:
-        raise RuntimeError("CTC 对齐失败: 无法回溯完整文本")
-
-    points.reverse()
-    char_segments = []
-    for point_index, point in enumerate(points):
-        frame = int(point["frame"])
-        next_frame = int(points[point_index + 1]["frame"]) if point_index + 1 < len(points) else frame + 1
-        start = frame * seconds_per_frame
-        end = max(start + seconds_per_frame, next_frame * seconds_per_frame)
-        char_segments.append(
-            {
-                "char": transcript_chars[point["token_index"]],
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "score": round(float(point["score"]), 4),
-            }
-        )
-    return char_segments
 
 
 def detect_speech_regions(
@@ -3792,100 +2788,6 @@ def detect_speech_regions(
     return merged, onsets, diagnostic
 
 
-def read_live_rms_windows(
-    wav_path: Path,
-    fps: float,
-    timeline_start_frame: int,
-    window_seconds: float = 0.01,
-    smoothing_seconds: float = 0.10,
-) -> list[dict[str, float]]:
-    with wave.open(str(wav_path), "rb") as handle:
-        sample_rate = handle.getframerate()
-        channels = handle.getnchannels()
-        sample_width = handle.getsampwidth()
-        raw = handle.readframes(handle.getnframes())
-
-    samples = decode_pcm_samples(raw, sample_width, channels)
-    window_size = max(1, int(sample_rate * window_seconds))
-    raw_windows: list[dict[str, float]] = []
-    for start in range(0, len(samples), window_size):
-        chunk = samples[start : start + window_size]
-        if not chunk:
-            continue
-        rms = math.sqrt(sum(sample * sample for sample in chunk) / len(chunk))
-        raw_windows.append(
-            {
-                "start_seconds": start / sample_rate,
-                "end_seconds": min(len(samples), start + len(chunk)) / sample_rate,
-                "rms": rms,
-            }
-        )
-
-    radius = max(0, int(round(smoothing_seconds / max(window_seconds, 0.001) / 2.0)))
-    prefix = [0.0]
-    for window in raw_windows:
-        prefix.append(prefix[-1] + float(window["rms"]))
-    rate = max(1.0, float(fps or 30.0))
-    output: list[dict[str, float]] = []
-    for index, window in enumerate(raw_windows):
-        left = max(0, index - radius)
-        right = min(len(raw_windows), index + radius + 1)
-        smoothed_rms = (prefix[right] - prefix[left]) / max(1, right - left)
-        output.append(
-            {
-                "start_frame": int(timeline_start_frame) + float(window["start_seconds"]) * rate,
-                "end_frame": int(timeline_start_frame) + float(window["end_seconds"]) * rate,
-                "rms": smoothed_rms,
-            }
-        )
-    return output
-
-
-def build_live_activity_windows(
-    work_items: list[dict[str, Any]],
-) -> tuple[dict[int, list[dict[str, Any]]], dict[str, Any]]:
-    raw_by_track: dict[int, list[dict[str, float]]] = {}
-    skipped_item_count = 0
-    for item in work_items or []:
-        cut_path = item.get("cut_path")
-        batch = item.get("batch") if isinstance(item.get("batch"), dict) else {}
-        track_index = int(batch.get("track_index") or 0)
-        if not cut_path or track_index <= 0 or not Path(cut_path).is_file():
-            skipped_item_count += 1
-            continue
-        windows = read_live_rms_windows(
-            Path(cut_path),
-            float(item.get("batch_fps") or batch.get("fps") or 30.0),
-            int(item.get("timeline_start_frame") or batch.get("timeline_start_frame") or 0),
-        )
-        raw_by_track.setdefault(track_index, []).extend(windows)
-
-    activity_by_track: dict[int, list[dict[str, Any]]] = {}
-    noise_floor_by_track: dict[str, float] = {}
-    for track_index, windows in raw_by_track.items():
-        rms_values = [float(window.get("rms") or 0.0) for window in windows]
-        noise_floor = max(1e-6, percentile(rms_values, 0.20))
-        noise_floor_by_track[str(track_index)] = round(noise_floor, 6)
-        normalized = []
-        for window in windows:
-            rms = max(1e-9, float(window.get("rms") or 0.0))
-            normalized.append(
-                {
-                    "start_frame": float(window.get("start_frame") or 0.0),
-                    "end_frame": float(window.get("end_frame") or 0.0),
-                    "activity_db": round(20.0 * math.log10(rms / noise_floor), 3),
-                }
-            )
-        activity_by_track[track_index] = normalized
-
-    return activity_by_track, {
-        "activity_track_count": len(activity_by_track),
-        "activity_item_count": sum(1 for item in work_items or [] if item.get("cut_path")),
-        "activity_skipped_item_count": skipped_item_count,
-        "activity_noise_floor_by_track": noise_floor_by_track,
-    }
-
-
 def is_executable_file(path: str) -> bool:
     return bool(path) and Path(path).is_file() and os.access(path, os.X_OK)
 
@@ -3947,9 +2849,34 @@ def cut_audio(
     if audio_channel_index is not None and audio_channel_index > 0:
         cmd.extend(["-filter:a", f"pan=mono|c0=c{audio_channel_index - 1}"])
     cmd.extend(["-ac", "1", "-ar", "16000", "-vn", str(output)])
+    # P7：切片超时兜底。正常 ffmpeg 切片远快于实时；按区间长度给 120-600 秒上限，
+    # 防止源文件损坏/网络盘假死时 ffmpeg 永久挂住、整条生成流程卡死。
+    if source_end is not None and source_end > source_start:
+        duration = float(source_end) - float(source_start)
+    else:
+        duration = 60.0
+    timeout_seconds = max(120, min(600, int(60 + 10 * duration)))
     # 必须显式按 UTF-8 解码：默认 locale 码页（GBK）遇到非 GBK 字节会让 subprocess 的
     # 读取线程直接崩溃（UnicodeDecodeError），父进程随之永久等待 → 进度卡死。
-    subprocess.run(cmd, check=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if source_end is not None:
+            range_text = f"{float(source_start):.3f}s-{float(source_end):.3f}s"
+        else:
+            range_text = f"从 {float(source_start):.3f}s 起"
+        raise RuntimeError(
+            f"音频切片超时（已等待 {timeout_seconds} 秒）：源文件 {audio.name}（{range_text}）；"
+            "可能是素材损坏或磁盘/网络盘繁忙，请检查该素材后重试"
+        ) from exc
 
 
 def transcribe_mlx_whisper(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
@@ -4329,7 +3256,7 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
     # 文档 demo 未展示 audio.format/audio.codec 字段，暂不填写，若真实响应要求
     # 音频格式声明，需要在这里补充（cut_audio 输出固定为 16k/mono/wav）。
     body = {
-        "user": {"uid": api_key},
+        "user": {"uid": DOUBAO_ASR_CLIENT_UID},
         "audio": {"data": base64.b64encode(audio_bytes).decode("ascii")},
         "request": {"model_name": "bigmodel", "show_utterances": True},
     }
@@ -4357,33 +3284,40 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
             try:
                 response_payload = json.loads(response_text) if response_text else {}
             except json.JSONDecodeError as exc:
-                raise RuntimeError(f"豆包 ASR 响应不是合法 JSON: {exc}") from exc
-            if not isinstance(response_payload, dict):
-                raise RuntimeError("豆包 ASR 响应 JSON 必须是对象")
-            silent_audio = status_code == DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE
-            if status_code and status_code != DOUBAO_ASR_SUCCESS_STATUS_CODE and not silent_audio:
-                message = str(response_payload.get("message") or response_text[:300])
-                last_error = RuntimeError(f"豆包 ASR 返回错误状态 {status_code}: {message}")
+                # 网关/代理偶发返回 HTML 纯文本而非 API JSON：当作可重试错误，
+                # 与错误状态码走同一条退避重试路径（两次尝试后再抛出）。
+                last_error = RuntimeError(
+                    f"豆包 ASR 响应不是合法 JSON（status={status_code or '-'}, log_id={log_id or '-'}）: "
+                    f"{exc}; 响应片段: {response_text[:200]}"
+                )
             else:
-                result = {} if silent_audio else response_payload.get("result")
-                text = str((result or {}).get("text") or "").strip()
-                segments, words = _doubao_asr_timestamp_payload(result)
-                return {
-                    "backend": "doubao_asr",
-                    "model": model,
-                    "language": language,
-                    "segments": segments,
-                    "words": words,
-                    "text": text,
-                    "diagnostic": {
-                        "resource_id": resource_id,
-                        "endpoint": endpoint,
-                        "status_code": status_code,
-                        "log_id": log_id,
-                        "attempt": attempt,
-                        "silent_audio": silent_audio,
-                    },
-                }
+                if not isinstance(response_payload, dict):
+                    last_error = RuntimeError("豆包 ASR 响应 JSON 必须是对象")
+                else:
+                    silent_audio = status_code == DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE
+                    if status_code and status_code != DOUBAO_ASR_SUCCESS_STATUS_CODE and not silent_audio:
+                        message = str(response_payload.get("message") or response_text[:300])
+                        last_error = RuntimeError(f"豆包 ASR 返回错误状态 {status_code}: {message}")
+                    else:
+                        result = {} if silent_audio else response_payload.get("result")
+                        text = str((result or {}).get("text") or "").strip()
+                        segments, words = _doubao_asr_timestamp_payload(result)
+                        return {
+                            "backend": "doubao_asr",
+                            "model": model,
+                            "language": language,
+                            "segments": segments,
+                            "words": words,
+                            "text": text,
+                            "diagnostic": {
+                                "resource_id": resource_id,
+                                "endpoint": endpoint,
+                                "status_code": status_code,
+                                "log_id": log_id,
+                                "attempt": attempt,
+                                "silent_audio": silent_audio,
+                            },
+                        }
         if attempt < DOUBAO_ASR_MAX_ATTEMPTS:
             time.sleep(DOUBAO_ASR_RETRY_BACKOFF_SECONDS * attempt)
 
@@ -4646,6 +3580,40 @@ def transcribe_v4_window_batch(
     return payloads, diagnostic
 
 
+def _split_external_command_template(command_template: str) -> list[str]:
+    """Split an opt-in external ASR command template into argv tokens.
+
+    POSIX systems use :func:`shlex.split` (single/double quote aware). On
+    Windows, ``shlex.quote`` output (POSIX single quotes) is meaningless and
+    ``shell=True`` invokes cmd.exe quoting rules, so we tokenize with
+    ``posix=False`` -- which keeps Windows backslashes literal -- and strip one
+    pair of enclosing quotes per token. The resulting argv is executed with
+    ``shell=False`` so substituted paths never need quoting and can no longer
+    alter the command structure.
+    """
+    if os.name == "nt":
+        tokens: list[str] = []
+        for token in shlex.split(command_template, posix=False):
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+                token = token[1:-1]
+            tokens.append(token)
+        return tokens
+    return shlex.split(command_template, posix=True)
+
+
+def _external_command_argv(command_template: str, values: dict[str, str]) -> list[str]:
+    try:
+        tokens = _split_external_command_template(command_template)
+        argv = [token.format_map(values) for token in tokens]
+    except (KeyError, IndexError, ValueError) as exc:
+        raise RuntimeError(
+            "外部 ASR 命令模板无效：仅支持 {audio}/{output}/{model}/{language} 占位符"
+        ) from exc
+    if not argv or any(not token for token in argv):
+        raise RuntimeError("外部 ASR 命令模板不能为空")
+    return argv
+
+
 def transcribe_external_backend(audio_path: Path, model: str, language: str | None, backend: str) -> dict[str, Any]:
     env_name = EXTERNAL_TRANSCRIBE_COMMAND_ENV.get(backend)
     command_template = os.getenv(env_name or "")
@@ -4654,15 +3622,18 @@ def transcribe_external_backend(audio_path: Path, model: str, language: str | No
 
     with tempfile.TemporaryDirectory(prefix=f"subfix_{backend}_") as tmp_dir:
         output_path = Path(tmp_dir) / "transcribe.json"
-        # External ASR commands are opt-in via env vars; quote substituted paths
-        # so a media filename cannot change the shell command structure.
-        command = command_template.format(
-            audio=shlex.quote(str(audio_path)),
-            output=shlex.quote(str(output_path)),
-            model=shlex.quote(str(model)),
-            language=shlex.quote(str(language or "auto")),
+        # argv 数组 + shell=False：路径不经过 shell 解释，Windows 下也不会因
+        # POSIX 单引号规则失效（原先 shlex.quote + shell=True 在 Windows 必坏）。
+        argv = _external_command_argv(
+            command_template,
+            {
+                "audio": str(audio_path),
+                "output": str(output_path),
+                "model": str(model),
+                "language": str(language or "auto"),
+            },
         )
-        result = subprocess.run(command, shell=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
+        result = subprocess.run(argv, shell=False, text=True, encoding="utf-8", errors="replace", capture_output=True)
         if result.returncode != 0:
             error_text = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(f"{backend} 执行失败: {error_text}")
@@ -4771,20 +3742,6 @@ def align_v4_retry_audio(
             "end": max(0.001, audio_duration_seconds(audio_path)),
         }
     ]
-
-
-def should_try_qwen_batch_backend(backend: str) -> bool:
-    enabled = str(os.getenv("SUBFIX_ENABLE_QWEN_BATCH") or "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
-        return False
-    if os.getenv("SUBFIX_DISABLE_QWEN_BATCH"):
-        return False
-    if backend == "qwen3_asr":
-        return True
-    if backend != "auto":
-        return False
-    mimo_env = EXTERNAL_TRANSCRIBE_COMMAND_ENV.get("mimo_asr")
-    return not bool(mimo_env and os.getenv(mimo_env))
 
 
 def qwen_generate_batch_size() -> int:
@@ -5006,411 +3963,6 @@ def run_transcribe_windows(
     }
 
 
-def run_generate_subtitles_batch_plan_v3(
-    batches: list[dict[str, Any]],
-    args: argparse.Namespace,
-    progress_path: Path | None,
-    fixture_payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    # NOTE: legacy v3 path; intentionally does not read args.max_chars (see
-    # generate_subtitle_rows_from_segments / GENERATED_SUBTITLE_MAX_CHARS note
-    # above). Only the v4/v5 path honours --max-chars.
-    if not batches:
-        raise RuntimeError("缺少 generate_subtitles batch plan")
-    source_batch_count = len(batches)
-    batches = expand_generate_subtitles_batches(batches)
-    subtitle_mode = str(getattr(args, "subtitle_mode", "narration") or "narration")
-    if subtitle_mode not in {"narration", "live"}:
-        subtitle_mode = "narration"
-    configured_hotword_entries = load_hotword_entries(getattr(args, "hotwords_json", None))
-    hotword_entries = configured_hotword_entries[:HOTWORD_MAX_ENTRIES]
-    hotword_context = build_hotword_context(hotword_entries)
-    args.hotword_context = hotword_context
-    ffmpeg_path = resolve_ffmpeg(args.ffmpeg)
-    segmentation_profile = load_segmentation_profile(getattr(args, "segmentation_profile", None))
-    active_segmentation_profile = segmentation_profile_for_mode(segmentation_profile, subtitle_mode)
-    total_batches = len(batches)
-    progress_total = generate_batch_progress_total(total_batches)
-    output_batches: list[dict[str, Any]] = []
-    subtitle_rows: list[dict[str, Any]] = []
-    backend = ""
-    model = ""
-    fallback_errors: list[str] = []
-    diagnostic: dict[str, Any] = {
-        "mode": "fixture" if fixture_payload is not None else args.mode,
-        "requested_mode": args.mode,
-        "ffmpeg": ffmpeg_path,
-        "source_batch_count": source_batch_count,
-        "batch_count": total_batches,
-        "batch_max_seconds": generate_subtitles_batch_max_seconds(),
-        "requested_backend": args.backend,
-        "subtitle_mode": subtitle_mode,
-        "live_engine": str(os.getenv("SUBFIX_LIVE_ENGINE") or "islands_v2"),
-        "qwen_batch_used": False,
-        "qwen_batch_size": 0,
-        "hotword_enabled": bool(getattr(args, "hotwords_json", None)),
-        "hotword_entry_count": len(configured_hotword_entries),
-        "hotword_injected_count": len(hotword_entries),
-        "hotword_replacement_count": 0,
-        "hotword_context_supported": True,
-        "speaker_turn_count": 0,
-        "speaker_switch_count": 0,
-        "bleed_rejected_count": 0,
-        "ambiguous_window_count": 0,
-        "overlap_suppressed_count": 0,
-        "live_fallback_no_word_timing": False,
-        "speech_island_count": 0,
-        "confirmed_silence_count": 0,
-        "vad_only_gap_count": 0,
-        "segmentation_profile_used": bool(active_segmentation_profile),
-        "segmentation_profile_path": str((segmentation_profile or {}).get("_path") or ""),
-        "segmentation_profile_schema": str((segmentation_profile or {}).get("schema_version") or ""),
-    }
-
-    with tempfile.TemporaryDirectory(prefix="subfix_generate_batches_") as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        work_items: list[dict[str, Any]] = []
-        for batch_index, batch in enumerate(batches, start=1):
-            batch_id = str(batch.get("batch_id") or batch_index)
-            batch_fps = float(batch.get("fps") or args.fps or 30.0)
-            timeline_start_frame = int(batch.get("timeline_start_frame") or 0)
-            write_progress(
-                progress_path,
-                "prepare_subtitle_batch",
-                f"准备 {batch_index}/{total_batches}",
-                batch_index=batch_index,
-                total_batches=total_batches,
-                progress_index=batch_index,
-                progress_total=progress_total,
-                batch_id=batch_id,
-            )
-            try:
-                if fixture_payload is not None:
-                    cut_path = None
-                    raw_payload: dict[str, Any] | None = dict(fixture_payload)
-                    cut_audio_bytes = 0
-                    onset_diagnostic: dict[str, Any] = {}
-                    speech_regions = list(raw_payload.get("speech_regions") or [])
-                else:
-                    audio_path = Path(str(batch.get("audio") or ""))
-                    if not audio_path.exists():
-                        raise RuntimeError(f"audio file not found: {audio_path}")
-                    cut_path = tmp_path / f"generate_batch_{batch_index:04d}.wav"
-                    cut_audio(
-                        ffmpeg_path,
-                        audio_path,
-                        cut_path,
-                        float(batch.get("source_start") or 0.0),
-                        batch.get("source_end"),
-                        int(batch["audio_channel_index"]) if batch.get("audio_channel_index") else None,
-                    )
-                    cut_audio_bytes = cut_path.stat().st_size if cut_path.exists() else 0
-                    speech_regions, _speech_onsets, onset_diagnostic = detect_speech_regions(cut_path)
-                    diagnostic["vad_only_gap_count"] = int(diagnostic.get("vad_only_gap_count") or 0) + sum(
-                        1
-                        for left_region, right_region in zip(speech_regions, speech_regions[1:])
-                        if float(right_region.get("start") or 0.0) - float(left_region.get("end") or 0.0)
-                        >= GENERATED_SUBTITLE_HARD_SILENCE_SECONDS
-                    )
-                    raw_payload = None
-                work_items.append(
-                    {
-                        "batch_index": batch_index,
-                        "batch": batch,
-                        "batch_id": batch_id,
-                        "batch_fps": batch_fps,
-                        "timeline_start_frame": timeline_start_frame,
-                        "cut_path": cut_path,
-                        "cut_audio_bytes": cut_audio_bytes,
-                        "onset_diagnostic": onset_diagnostic,
-                        "speech_regions": speech_regions,
-                        "raw_payload": raw_payload,
-                    }
-                )
-            except Exception as exc:
-                output_batches.append(
-                    {
-                        "ok": False,
-                        "batch_id": batch_id,
-                        "parent_batch_id": str(batch.get("parent_batch_id") or batch_id),
-                        "batch_part_index": int(batch.get("batch_part_index") or 1),
-                        "batch_part_count": int(batch.get("batch_part_count") or 1),
-                        "track_order": int(batch.get("track_order") or 0),
-                        "track_index": int(batch.get("track_index") or 0),
-                        "track_name": str(batch.get("track_name") or ""),
-                        "item_index": int(batch.get("item_index") or 0),
-                        "audio": str(batch.get("audio") or ""),
-                        "source_start": float(batch.get("source_start") or 0.0),
-                        "source_end": batch.get("source_end"),
-                        "error": str(exc),
-                        "segments": [],
-                        "subtitle_rows": [],
-                    }
-                )
-
-        speaker_turns: list[dict[str, Any]] = []
-        if subtitle_mode == "live":
-            activity_by_track, activity_diagnostic = build_live_activity_windows(work_items)
-            speaker_turns, speaker_diagnostic = build_live_speaker_turns(
-                activity_by_track,
-                float(args.fps or (work_items[0].get("batch_fps") if work_items else 30.0) or 30.0),
-            )
-            diagnostic.update(activity_diagnostic)
-            diagnostic.update(speaker_diagnostic)
-            if len(activity_by_track) < 2 or not speaker_turns:
-                diagnostic["live_fallback_no_activity"] = True
-
-        # Qwen accepts a list of audio inputs; batch after cutting so the model and forced aligner schedule windows together.
-        if fixture_payload is None and work_items and should_try_qwen_batch_backend(str(args.backend or "auto")):
-            qwen_batch_size = qwen_generate_batch_size()
-            qwen_chunks = [work_items[index : index + qwen_batch_size] for index in range(0, len(work_items), qwen_batch_size)]
-            diagnostic["qwen_batch_size"] = qwen_batch_size
-            diagnostic["qwen_batch_call_count"] = len(qwen_chunks)
-            diagnostic["qwen_batch_failed_call_count"] = 0
-            for chunk_index, chunk_items in enumerate(qwen_chunks, start=1):
-                first_window = int(chunk_items[0]["batch_index"])
-                last_window = int(chunk_items[-1]["batch_index"])
-                try:
-                    write_progress(
-                        progress_path,
-                        "generate_subtitle_batch",
-                        f"批量识别 {chunk_index}/{len(qwen_chunks)}｜窗口 {first_window}-{last_window}/{total_batches}",
-                        batch_index=last_window,
-                        total_batches=total_batches,
-                        progress_index=total_batches + last_window,
-                        progress_total=progress_total,
-                        batch_id="qwen_batch",
-                        qwen_batch_index=chunk_index,
-                        qwen_batch_count=len(qwen_chunks),
-                    )
-                    qwen_audio_paths = [item["cut_path"] for item in chunk_items if item.get("cut_path")]
-                    qwen_payloads = (
-                        transcribe_qwen3_asr_batch(
-                            qwen_audio_paths, args.model, args.language, context=hotword_context
-                        )
-                        if hotword_context
-                        else transcribe_qwen3_asr_batch(qwen_audio_paths, args.model, args.language)
-                    )
-                    if len(qwen_payloads) != len(chunk_items):
-                        raise RuntimeError(f"Qwen batch payload mismatch: {len(qwen_payloads)} != {len(chunk_items)}")
-                    for item, raw_payload in zip(chunk_items, qwen_payloads):
-                        item["raw_payload"] = raw_payload
-                    diagnostic["qwen_batch_used"] = True
-                except Exception as exc:
-                    diagnostic["qwen_batch_failed_call_count"] = int(diagnostic.get("qwen_batch_failed_call_count") or 0) + 1
-                    failed_errors = diagnostic.setdefault("qwen_batch_errors", [])
-                    if isinstance(failed_errors, list):
-                        failed_errors.append(str(exc))
-                    for item in chunk_items:
-                        item["raw_payload"] = None
-
-        for item in work_items:
-            batch_index = int(item["batch_index"])
-            batch = item["batch"]
-            batch_id = str(item["batch_id"])
-            batch_fps = float(item["batch_fps"])
-            timeline_start_frame = int(item["timeline_start_frame"])
-            try:
-                raw_payload = item.get("raw_payload")
-                if raw_payload is None:
-                    write_progress(
-                        progress_path,
-                        "generate_subtitle_batch",
-                        f"识别 {batch_index}/{total_batches}",
-                        batch_index=batch_index,
-                        total_batches=total_batches,
-                        progress_index=total_batches + batch_index,
-                        progress_total=progress_total,
-                        batch_id=batch_id,
-                    )
-                    raw_payload = (
-                        transcribe_with_backend(
-                            item["cut_path"], args.model, args.language, args.backend, context=hotword_context
-                        )
-                        if hotword_context
-                        else transcribe_with_backend(item["cut_path"], args.model, args.language, args.backend)
-                    )
-
-                segments = normalize_segments(raw_payload)
-                live_fallback = False
-                rejected_word_count = 0
-                if subtitle_mode == "live":
-                    segments, rejected_word_count, live_fallback = filter_live_segments_for_track(
-                        segments,
-                        int(batch.get("track_index") or 0),
-                        speaker_turns,
-                        batch_fps,
-                        timeline_start_frame,
-                        speech_regions=item.get("speech_regions") or [],
-                        engine=str(os.getenv("SUBFIX_LIVE_ENGINE") or "islands_v2"),
-                    )
-                    diagnostic["bleed_rejected_count"] = int(diagnostic.get("bleed_rejected_count") or 0) + rejected_word_count
-                    if live_fallback:
-                        diagnostic["live_fallback_no_word_timing"] = True
-                    diagnostic["speech_island_count"] = int(diagnostic.get("speech_island_count") or 0) + sum(
-                        1 for segment in segments if segment.get("speech_island_id")
-                    )
-                rows = generate_subtitle_rows_from_segments(
-                    segments,
-                    batch_fps,
-                    timeline_start_frame,
-                    segmentation_profile=segmentation_profile,
-                    speech_regions=item.get("speech_regions") or [],
-                    subtitle_mode=subtitle_mode,
-                )
-                diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
-                    rows, hotword_entries
-                )
-                if str((raw_payload.get("diagnostic") or {}).get("hotword_context_status") or "") == "unsupported":
-                    diagnostic["hotword_context_supported"] = False
-                for row in rows:
-                    row["batch_id"] = batch_id
-                    row["track_order"] = int(batch.get("track_order") or 0)
-                    row["track_index"] = int(batch.get("track_index") or 0)
-                    row["item_index"] = int(batch.get("item_index") or 0)
-                batch_backend = str(raw_payload.get("backend") or ("fixture" if fixture_payload is not None else ""))
-                batch_model = str(raw_payload.get("model") or args.model)
-                backend = backend or batch_backend
-                model = model or batch_model
-                if raw_payload.get("fallback_errors"):
-                    fallback_errors = list(raw_payload.get("fallback_errors") or [])
-                batch_output = {
-                    "ok": True,
-                    "batch_id": batch_id,
-                    "parent_batch_id": str(batch.get("parent_batch_id") or batch_id),
-                    "batch_part_index": int(batch.get("batch_part_index") or 1),
-                    "batch_part_count": int(batch.get("batch_part_count") or 1),
-                    "track_order": int(batch.get("track_order") or 0),
-                    "track_index": int(batch.get("track_index") or 0),
-                    "track_name": str(batch.get("track_name") or ""),
-                    "item_index": int(batch.get("item_index") or 0),
-                    "audio": str(batch.get("audio") or ""),
-                    "source_start": float(batch.get("source_start") or 0.0),
-                    "source_end": batch.get("source_end"),
-                    "timeline_start_frame": timeline_start_frame,
-                    "fps": batch_fps,
-                    "backend": batch_backend,
-                    "model": batch_model,
-                    "segments": segments,
-                    "subtitle_rows": rows,
-                    "text": str(raw_payload.get("text") or "").strip(),
-                    "diagnostic": {
-                        "cut_audio_bytes": int(item.get("cut_audio_bytes") or 0),
-                        "raw_segment_count": len(raw_payload.get("segments") or []),
-                        "segment_count": len(segments),
-                        "generated_subtitle_count": len(rows),
-                        "generated_subtitles_used_word_timing": any(segment.get("words") for segment in segments),
-                        "subtitle_mode": subtitle_mode,
-                        "bleed_rejected_count": rejected_word_count,
-                        "live_fallback_no_word_timing": live_fallback,
-                        "segmentation_profile_used": bool(active_segmentation_profile),
-                        "learned_segmentation_row_count": sum(
-                            1 for row in rows if row.get("segmentation_decision") == "learned_dp"
-                        ),
-                        "learned_text_correction_count": sum(
-                            int(row.get("text_correction_count") or 0) for row in rows
-                        ),
-                        "forced_silence_break_row_count": sum(
-                            1 for row in rows if row.get("forced_silence_break") is True
-                        ),
-                        **(item.get("onset_diagnostic") or {}),
-                    },
-                }
-                output_batches.append(batch_output)
-                subtitle_rows.extend(rows)
-            except Exception as exc:
-                output_batches.append(
-                    {
-                        "ok": False,
-                        "batch_id": batch_id,
-                        "parent_batch_id": str(batch.get("parent_batch_id") or batch_id),
-                        "batch_part_index": int(batch.get("batch_part_index") or 1),
-                        "batch_part_count": int(batch.get("batch_part_count") or 1),
-                        "track_order": int(batch.get("track_order") or 0),
-                        "track_index": int(batch.get("track_index") or 0),
-                        "track_name": str(batch.get("track_name") or ""),
-                        "item_index": int(batch.get("item_index") or 0),
-                        "audio": str(batch.get("audio") or ""),
-                        "source_start": float(batch.get("source_start") or 0.0),
-                        "source_end": batch.get("source_end"),
-                        "error": str(exc),
-                        "segments": [],
-                        "subtitle_rows": [],
-                    }
-                )
-
-    failed_batches = [batch for batch in output_batches if batch.get("ok") is not True]
-    if failed_batches:
-        failed_ids = ", ".join(str(batch.get("batch_id") or "?") for batch in failed_batches)
-        raise RuntimeError(f"generate_subtitles_batch 失败: {failed_ids}: {failed_batches[0].get('error')}")
-
-    if subtitle_mode == "live" and str(os.getenv("SUBFIX_LIVE_ENGINE") or "islands_v2") != "legacy":
-        island_rows = [row for row in subtitle_rows if row.get("speech_island_id")]
-        legacy_rows = [row for row in subtitle_rows if not row.get("speech_island_id")]
-        island_rows, reconciliation_diagnostic = reconcile_live_subtitle_rows(
-            island_rows,
-            float(args.fps or 30.0),
-        )
-        island_rows, stabilization_diagnostic = stabilize_generated_subtitle_rows(
-            island_rows,
-            float(args.fps or 30.0),
-            subtitle_mode="live",
-        )
-        subtitle_rows = [*island_rows, *legacy_rows]
-        stabilization_diagnostic["legacy_passthrough_row_count"] = len(legacy_rows)
-        stabilization_diagnostic["duplicate_suppressed_count"] = (
-            int(stabilization_diagnostic.get("duplicate_suppressed_count") or 0)
-            + int(reconciliation_diagnostic.get("duplicate_suppressed_count") or 0)
-        )
-        stabilization_diagnostic["ambiguous_island_count"] = int(
-            reconciliation_diagnostic.get("ambiguous_island_count") or 0
-        )
-        diagnostic.update(stabilization_diagnostic)
-    subtitle_rows.sort(key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0)))
-    for index, row in enumerate(subtitle_rows, start=1):
-        row["index"] = index
-    if fallback_errors:
-        diagnostic["fallback_errors"] = fallback_errors
-    diagnostic["successful_batch_count"] = len(output_batches)
-    diagnostic["failed_batch_count"] = 0
-    diagnostic["generated_subtitle_count"] = len(subtitle_rows)
-    diagnostic["learned_segmentation_row_count"] = sum(
-        1 for row in subtitle_rows if row.get("segmentation_decision") == "learned_dp"
-    )
-    diagnostic["learned_text_correction_count"] = sum(
-        int(row.get("text_correction_count") or 0) for row in subtitle_rows
-    )
-    diagnostic["forced_silence_break_row_count"] = sum(
-        1 for row in subtitle_rows if row.get("forced_silence_break") is True
-    )
-    diagnostic["confirmed_silence_count"] = int(
-        math.ceil(int(diagnostic.get("forced_silence_break_row_count") or 0) / 2.0)
-    )
-    diagnostic["vad_only_gap_count"] = max(
-        0,
-        int(diagnostic.get("vad_only_gap_count") or 0) - int(diagnostic.get("confirmed_silence_count") or 0),
-    )
-    write_progress(
-        progress_path,
-        "write_output",
-        "正在写入批量生成字幕结果",
-        batch_index=total_batches,
-        total_batches=total_batches,
-        progress_index=total_batches * 2 + 1,
-        progress_total=progress_total,
-    )
-    return {
-        "ok": True,
-        "backend": backend or ("fixture" if fixture_payload is not None else ""),
-        "model": model or args.model,
-        "segments": [],
-        "subtitle_rows": subtitle_rows,
-        "batches": output_batches,
-        "text": "\n".join(str(batch.get("text") or "") for batch in output_batches if str(batch.get("text") or "")),
-        "diagnostic": diagnostic,
-    }
-
-
 def select_adaptive_subtitle_candidates(
     units: list[dict[str, Any]],
     fps: float,
@@ -5615,6 +4167,10 @@ def run_generate_subtitles_batch_plan_v4(
                     "fps": batch_fps,
                     "track_index": int(batch.get("track_index") or 0),
                     "batch_id": str(batch.get("batch_id") or batch_index),
+                    # Lua 仲裁按 track_order/track_index/item_index 三元组归并，
+                    # 缺省会导致 v4 合轨后的字幕行无法对应回 Resolve 条目。
+                    "track_order": int(batch.get("track_order") or 0),
+                    "item_index": int(batch.get("item_index") or 0),
                 }
             )
 
@@ -5624,7 +4180,16 @@ def run_generate_subtitles_batch_plan_v4(
         )
         diagnostic.update(prepare_diagnostic)
         windows = [
-            {**window, "track_index": int(track["track_index"]), "fps": float(track["fps"])}
+            {
+                **window,
+                "track_index": int(track["track_index"]),
+                "fps": float(track["fps"]),
+                # 行级 batch_id 与最终 output_batches 的轨道批次 id 保持一致，
+                # Lua merge 时同一行/批次能直接对上。
+                "batch_id": f"{engine_label}_track_{int(track['track_index'])}",
+                "track_order": int(track.get("track_order") or 0),
+                "item_index": int(track.get("item_index") or 0),
+            }
             for track in prepared_tracks
             for window in track.get("windows") or []
         ]
@@ -5791,13 +4356,23 @@ def run_generate_subtitles_batch_plan_v4(
                     "candidate_kind": "local_retry",
                     "retry_region_index": retry_index,
                     "retry_reason": str(region.get("reason") or "ambiguous_region"),
+                    # 重试窗口继承所属轨道的来源元数据，保证重试产出的 unit
+                    # 与主窗口一样能回填到断句行。
+                    "batch_id": f"{engine_label}_track_{track_index}",
+                    "track_order": int(track.get("track_order") or 0),
+                    "item_index": int(track.get("item_index") or 0),
                 }
                 windows.append(retry_window)
                 raw_payloads.append(retry_payload)
+                try:
+                    retry_duration: float | None = audio_duration_seconds(retry_path)
+                except RuntimeError:
+                    # 诊断字段绝不能反噬主流程：读取失败时记 None 而非伪装成 0 秒。
+                    retry_duration = None
                 recovery_diagnostics.append(
                     {
                         "asr_recovery": "local_retry",
-                        "speech_seconds": audio_duration_seconds(retry_path),
+                        "speech_seconds": retry_duration,
                     }
                 )
         if hotword_context:
@@ -5966,6 +4541,10 @@ def run_generate_subtitles_batch_plan_v4(
                 unit["raw_alignment_coverage"] = raw_coverage
                 unit["alignment_repaired_unit_count"] = repaired_count
                 unit["unit_count"] = len(aligned_units)
+                # 来源批次/轨道/条目随 unit 透传，供断句行回填 Lua 仲裁字段。
+                unit["batch_id"] = str(window.get("batch_id") or "")
+                unit["track_order"] = int(window.get("track_order") or 0)
+                unit["item_index"] = int(window.get("item_index") or 0)
             if (
                 v5_mode
                 and window.get("candidate_kind") != "local_retry"
@@ -6091,6 +4670,9 @@ def run_generate_subtitles_batch_plan_v4(
                     unit["raw_alignment_coverage"] = float(retry_align_diagnostic.get("raw_alignment_coverage") or 0.0)
                     unit["alignment_repaired_unit_count"] = int(retry_align_diagnostic.get("alignment_repaired_unit_count") or 0)
                     unit["unit_count"] = len(retry_units)
+                    unit["batch_id"] = f"{engine_label}_track_{track_index}"
+                    unit["track_order"] = int(track.get("track_order") or 0)
+                    unit["item_index"] = int(track.get("item_index") or 0)
                 diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
                     retry_units, hotword_entries
                 )
@@ -6295,7 +4877,7 @@ def run_generate_subtitles_batch_plan_v4(
         subtitle_rows, textnorm_diagnostic = generate_textnorm.normalize_subtitle_rows(subtitle_rows)
         diagnostic["textnorm_changed_row_count"] = textnorm_diagnostic["textnorm_changed_row_count"]
         if v5_mode and v5_writeback == "live" and subtitle_rows:
-            refined_rows: list[dict[str, Any]] = []
+            refined_rows = []
             refinement_diagnostic = {
                 "audio_refinement_mode": v5_writeback,
                 "audio_refined_row_count": 0,
@@ -6449,184 +5031,6 @@ def run_generate_subtitles_batch_plan(
     return run_generate_subtitles_batch_plan_v5(batches, args, progress_path, fixture_payload=fixture_payload)
 
 
-def align_text_rows(
-    audio_path: Path,
-    rows: list[dict[str, Any]],
-    model_name: str,
-    language: str,
-) -> dict[str, Any]:
-    try:
-        import stable_whisper  # type: ignore
-    except Exception as exc:  # pragma: no cover - depends on local setup
-        raise RuntimeError("stable-ts 环境未安装，请先运行 setup_asr_env.sh 安装 stable-ts[mlx]") from exc
-
-    alignment_text = build_alignment_text(rows)
-    if not alignment_text:
-        raise RuntimeError("没有可用于 stable-ts 文本对齐的字幕文本")
-
-    try:
-        model = stable_whisper.load_mlx_whisper(model_name)
-    except Exception as exc:  # pragma: no cover - depends on local setup/model cache
-        raise RuntimeError(f"stable-ts MLX 模型加载失败: {exc}") from exc
-
-    try:
-        result = model.align(
-            str(audio_path),
-            alignment_text,
-            language=language or "zh",
-            original_split=True,
-            regroup=False,
-            verbose=False,
-        )
-    except Exception as exc:  # pragma: no cover - depends on local setup/model cache
-        raise RuntimeError(f"stable-ts 文本对齐失败: {exc}") from exc
-
-    return result_to_payload(result)
-
-
-def wav_duration_seconds(audio_path: Path) -> float:
-    with wave.open(str(audio_path), "rb") as handle:
-        frames = handle.getnframes()
-        rate = handle.getframerate()
-    return frames / float(rate or 16000)
-
-
-def whisperx_align_text_rows(
-    audio_path: Path,
-    rows: list[dict[str, Any]],
-    language: str,
-    device: str = "cpu",
-) -> dict[str, Any]:
-    try:
-        import whisperx  # type: ignore
-    except Exception as exc:  # pragma: no cover - depends on local setup
-        raise RuntimeError("WhisperX 环境未安装，请先运行 setup_asr_env.sh 安装 whisperx") from exc
-
-    alignment_text = build_alignment_text(rows).replace("\n", " ").strip()
-    if not alignment_text:
-        raise RuntimeError("没有可用于 WhisperX 文本对齐的字幕文本")
-
-    duration = wav_duration_seconds(audio_path)
-    try:
-        audio = whisperx.load_audio(str(audio_path))
-        model_a, metadata = whisperx.load_align_model(language_code=language or "zh", device=device)
-        result = whisperx.align(
-            [{"start": 0.0, "end": duration, "text": alignment_text}],
-            model_a,
-            metadata,
-            audio,
-            device,
-            return_char_alignments=True,
-        )
-    except Exception as exc:  # pragma: no cover - depends on local setup/model cache
-        raise RuntimeError(f"WhisperX 文本对齐失败: {exc}") from exc
-
-    payload = result_to_payload(result)
-    if payload.get("word_segments") and not payload.get("segments"):
-        payload["segments"] = [{"start": 0.0, "end": duration, "text": alignment_text, "words": payload["word_segments"]}]
-    elif payload.get("word_segments") and payload.get("segments"):
-        for segment in payload["segments"]:
-            if isinstance(segment, dict) and not segment.get("words"):
-                segment["words"] = payload["word_segments"]
-                break
-    return payload
-
-
-def load_ctc_model_bundle(model_name: str, progress_path: Path | None = None, **progress_extra: Any) -> dict[str, Any]:
-    try:
-        import torch  # type: ignore
-        from transformers import AutoModelForCTC, AutoProcessor  # type: ignore
-    except Exception as exc:  # pragma: no cover - depends on local setup
-        raise RuntimeError("CTC 环境未安装，请先运行 setup_asr_env.sh 安装 torch/transformers") from exc
-
-    selected_model = model_name if model_name and model_name != DEFAULT_MODEL else DEFAULT_CTC_MODEL
-    try:
-        write_progress(progress_path, "load_ctc_model", f"正在加载 CTC 模型: {selected_model}", **progress_extra)
-        processor = AutoProcessor.from_pretrained(selected_model)
-        model = AutoModelForCTC.from_pretrained(selected_model)
-        model.eval()
-    except Exception as exc:  # pragma: no cover - depends on local setup/model cache
-        raise RuntimeError(f"CTC 模型加载失败: {exc}") from exc
-    return {"torch": torch, "processor": processor, "model": model, "selected_model": selected_model}
-
-
-def ctc_align_text_rows_with_bundle(
-    audio_path: Path,
-    rows: list[dict[str, Any]],
-    bundle: dict[str, Any],
-    language: str,
-    fps: float | None = None,
-    timeline_start_frame: int = 0,
-    progress_path: Path | None = None,
-    **progress_extra: Any,
-) -> dict[str, Any]:
-    processor = bundle["processor"]
-    model = bundle["model"]
-    torch = bundle["torch"]
-    selected_model = str(bundle.get("selected_model") or DEFAULT_CTC_MODEL)
-    try:
-        samples, sample_rate = read_wav_mono_samples(audio_path)
-        write_progress(progress_path, "run_ctc_model", "正在执行 CTC 推理", **progress_extra)
-        inputs = processor(samples, sampling_rate=sample_rate, return_tensors="pt", padding=False)
-        with torch.no_grad():
-            logits = model(**inputs).logits[0]
-        emissions = torch.log_softmax(logits, dim=-1)
-    except Exception as exc:  # pragma: no cover - depends on local setup/model cache
-        raise RuntimeError(f"CTC 推理失败: {exc}") from exc
-
-    tokenizer = getattr(processor, "tokenizer", processor)
-    blank_id = getattr(tokenizer, "pad_token_id", None)
-    if blank_id is None:
-        blank_id = 0
-    row_units, token_ids, skipped_chars = ctc_units_and_token_ids_for_tokenizer(rows, tokenizer)
-    transcript_chars = [char for units in row_units for char in units]
-    duration = len(samples) / float(sample_rate or 16000)
-    seconds_per_frame = duration / max(1, int(emissions.size(0)))
-    write_progress(progress_path, "forced_align", "正在生成逐字强制对齐结果", **progress_extra)
-    char_segments = ctc_forced_align_char_segments(emissions, token_ids, transcript_chars, int(blank_id), seconds_per_frame)
-    row_segments = segments_from_ctc_char_segments(
-        rows,
-        char_segments,
-        row_units=row_units,
-        fps=fps,
-        timeline_start_frame=timeline_start_frame,
-    )
-    return {
-        "segments": row_segments,
-        "char_segments": char_segments,
-        "text": "".join(transcript_chars),
-        "diagnostic": {
-            "ctc_model": selected_model,
-            "ctc_char_count": len(transcript_chars),
-            "ctc_frame_count": int(emissions.size(0)),
-            "ctc_language": language or "zh",
-            "ctc_skipped_char_count": sum(skipped_chars.values()),
-            "ctc_skipped_unique_chars": sorted(skipped_chars)[:20],
-        },
-    }
-
-
-def ctc_align_text_rows(
-    audio_path: Path,
-    rows: list[dict[str, Any]],
-    model_name: str,
-    language: str,
-    fps: float | None = None,
-    timeline_start_frame: int = 0,
-    progress_path: Path | None = None,
-) -> dict[str, Any]:
-    bundle = load_ctc_model_bundle(model_name, progress_path)
-    return ctc_align_text_rows_with_bundle(
-        audio_path,
-        rows,
-        bundle,
-        language,
-        fps=fps,
-        timeline_start_frame=timeline_start_frame,
-        progress_path=progress_path,
-    )
-
-
 def qwen3_support_roots() -> list[Path]:
     module_dir = Path(__file__).resolve().parent
     roots = [
@@ -6732,14 +5136,20 @@ def qwen3_cpp_forced_align_text_rows(
     result = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", capture_output=True)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
+        output_path.unlink(missing_ok=True)
         raise RuntimeError(f"Qwen3 forced align 执行失败: {detail or result.returncode}")
     if not output_path.exists():
         raise RuntimeError(f"Qwen3 forced align 未生成输出 JSON: {output_path}")
 
+    # 输出 JSON 仅用于进程间回传：解析（无论成功或失败）后立即删除，
+    # 避免在 subfix_qwen_align_outputs 里持续堆积含识别文本的临时文件。
     try:
-        qwen_payload = json.loads(output_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"Qwen3 forced align 输出 JSON 非法: {exc}") from exc
+        try:
+            qwen_payload = json.loads(output_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Qwen3 forced align 输出 JSON 非法: {exc}") from exc
+    finally:
+        output_path.unlink(missing_ok=True)
 
     timestamp_items = qwen3_timestamp_words(qwen_payload)
     if not timestamp_items:
@@ -6765,7 +5175,9 @@ def qwen3_cpp_forced_align_text_rows(
         timeline_start_frame,
         allow_non_monotonic=True,
     )
-    for aligned_row, segment in zip(aligned_rows, row_segments, strict=True):
+    if len(aligned_rows) != len(row_segments):
+        raise ValueError("对齐结果行数不一致: aligned=%d segments=%d" % (len(aligned_rows), len(row_segments)))
+    for aligned_row, segment in zip(aligned_rows, row_segments):
         aligned_row["stable_ts_start_frame"] = aligned_row["start_frame"]
         aligned_row["ctc_start_frame"] = int(segment["ctc_start_frame"])
         aligned_row["ctc_end_frame"] = int(segment["ctc_end_frame"])
@@ -6793,6 +5205,71 @@ def qwen3_cpp_forced_align_text_rows(
     }
 
 
+def clamp_first_row_to_speech_onset(
+    aligned_rows: list[dict[str, Any]],
+    audio_path: Path,
+    fps: float,
+    timeline_start_frame: int,
+) -> dict[str, Any] | None:
+    """把首行字幕起点夹紧到真实语音起点，修开头长静音误对齐。
+
+    Qwen3ForcedAligner 面对选区开头数秒静音时，可能把文稿首行的首字时间戳压到
+    音频 0 点（整条字幕从选区第一帧就显示），而人声其实在数秒后才进入。
+    用能量 VAD（detect_speech_regions，与 cpp 批量路径同款）找第一个与首行
+    时间区间重叠的语音区；若对齐起点比该语音区起点还早出明显一段，就把首行
+    起点推到语音起点前保留少量字头提前量。只修首行、且要求大偏移才动手，
+    避免误伤“开头本来就有轻声说话”的素材。
+    """
+    if not aligned_rows:
+        return None
+    try:
+        regions, _onsets, vad_diag = detect_speech_regions(Path(audio_path))
+    except Exception:
+        return None
+    if not regions:
+        return None
+
+    first = aligned_rows[0]
+    try:
+        first_start = float(first.get("start") or 0.0)
+        first_end = float(first.get("end") or first_start)
+    except (TypeError, ValueError):
+        return None
+
+    # 只认与首行时间区间重叠（含 0.35s 邻接容差，覆盖字尾轻声未被 VAD 收进区域）
+    # 的第一个语音区，避免把首行推给与其无关的开头噪声。
+    matched_region: dict[str, float] | None = None
+    for region in regions:
+        if float(region["end"]) >= first_start - 0.35 and float(region["start"]) <= first_end + 0.35:
+            matched_region = region
+            break
+    if matched_region is None:
+        return None
+
+    onset = float(matched_region["start"])
+    gap_seconds = 0.25   # 对齐起点比语音早 250ms 以上才判定为“吃进了静音”
+    lead_seconds = 0.08  # 夹紧后仍保留 80ms 字头提前量（显示层还会再提前几帧）
+    if first_start + gap_seconds < onset:
+        new_start = max(0.0, onset - lead_seconds)
+        rate = max(1.0, float(fps or 30.0))
+        tl = int(timeline_start_frame or 0)
+        new_start_frame = int(round(tl + new_start * rate))
+        first["start"] = round(new_start, 3)
+        first["start_frame"] = new_start_frame
+        # end/end_frame 维持对齐结果（首行结尾在语音区内，本来就对）。
+        if "ctc_start_frame" in first:
+            first["ctc_start_frame"] = new_start_frame
+        first["onset_clamped"] = True
+        return {
+            "first_row_onset_clamped": True,
+            "aligned_first_start": round(first_start, 3),
+            "speech_onset": round(onset, 3),
+            "clamped_start": round(new_start, 3),
+            "vad": vad_diag,
+        }
+    return None
+
+
 def qwen3_py_forced_align_text_rows(
     audio_path: Path,
     rows: list[dict[str, Any]],
@@ -6815,8 +5292,10 @@ def qwen3_py_forced_align_text_rows(
     row_segments = qwen3_remap_timestamp_items_to_rows(
         rows, items, fps=fps, timeline_start_frame=timeline_start_frame
     )
+    if len(rows) != len(row_segments):
+        raise ValueError("Qwen3 forced align 结果行数不一致: rows=%d segments=%d" % (len(rows), len(row_segments)))
     aligned_rows: list[dict[str, Any]] = []
-    for row, segment in zip(rows, row_segments, strict=True):
+    for row, segment in zip(rows, row_segments):
         segment_start = float(segment.get("start") or 0.0)
         segment_end = float(segment.get("end") or segment_start)
         start_frame = int(round(timeline_start_frame + segment_start * fps))
@@ -6843,219 +5322,20 @@ def qwen3_py_forced_align_text_rows(
             if key in segment:
                 aligned_row[key] = segment[key]
         aligned_rows.append(aligned_row)
+    onset_diag = clamp_first_row_to_speech_onset(aligned_rows, Path(audio_path), fps, timeline_start_frame)
     pad_aligned_rows_display(aligned_rows, fps, timeline_start_frame)
+    diagnostic: dict[str, Any] = {
+        "align_engine": "qwen3_py",
+        "row_count": len(rows),
+        "aligned_count": len(aligned_rows),
+    }
+    if onset_diag:
+        diagnostic.update(onset_diag)
     return {
         "backend": "qwen3_forced_aligner_py",
         "model": os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or _local_forced_aligner_model() or QWEN3_FORCED_ALIGNER_MODEL,
         "aligned_rows": aligned_rows,
         "text": alignment_text,
-        "diagnostic": {
-            "align_engine": "qwen3_py",
-            "row_count": len(rows),
-            "aligned_count": len(aligned_rows),
-        },
-    }
-
-
-def align_existing_subtitle_rows(
-    audio_path: Path,
-    rows: list[dict[str, Any]],
-    model_name: str,
-    language: str,
-    fps: float,
-    timeline_start_frame: int,
-    max_seconds: float | None = None,
-) -> dict[str, Any]:
-    try:
-        import stable_whisper  # type: ignore
-    except Exception as exc:  # pragma: no cover - depends on local setup
-        raise RuntimeError("stable-ts 环境未安装，请先运行 setup_asr_env.sh 安装 stable-ts[mlx]") from exc
-
-    seed_segments = rows_to_seed_segments(rows, fps, timeline_start_frame, max_seconds=max_seconds)
-    if not seed_segments:
-        raise RuntimeError("没有可用于 stable-ts 对齐的字幕文本")
-
-    try:
-        model = stable_whisper.load_mlx_whisper(model_name)
-    except Exception as exc:  # pragma: no cover - depends on local setup/model cache
-        raise RuntimeError(f"stable-ts MLX 模型加载失败: {exc}") from exc
-
-    try:
-        result = model.align_words(
-            str(audio_path),
-            seed_segments,
-            language=language or "zh",
-            regroup=False,
-            normalize_text=True,
-            verbose=False,
-        )
-    except Exception as exc:  # pragma: no cover - depends on local setup/model cache
-        raise RuntimeError(f"stable-ts 对齐失败: {exc}") from exc
-
-    return result_to_payload(result)
-
-
-def aligned_payload_for_ctc_rows(
-    raw_payload: dict[str, Any],
-    rows: list[dict[str, Any]],
-    fps: float,
-    timeline_start_frame: int,
-) -> dict[str, Any]:
-    raw_segments = normalize_aligned_segments_for_rows(raw_payload, rows)
-    aligned_rows = apply_alignment_to_rows(
-        rows,
-        raw_segments,
-        fps,
-        timeline_start_frame,
-        allow_non_monotonic=True,
-    )
-    for aligned_row, segment in zip(aligned_rows, raw_segments, strict=True):
-        if "ctc_confidence" in segment:
-            aligned_row["ctc_confidence"] = segment["ctc_confidence"]
-        if "ctc_char_count" in segment:
-            aligned_row["ctc_char_count"] = segment["ctc_char_count"]
-    return {
-        "segments": raw_segments,
-        "aligned_rows": aligned_rows,
-        "text": str(raw_payload.get("text") or "").strip(),
-    }
-
-
-def run_ctc_batch_plan(
-    batches: list[dict[str, Any]],
-    args: argparse.Namespace,
-    progress_path: Path | None,
-) -> dict[str, Any]:
-    if not batches:
-        raise RuntimeError("缺少 CTC batch plan")
-
-    total_batches = len(batches)
-    output_batches: list[dict[str, Any]] = []
-    diagnostic: dict[str, Any] = {
-        "mode": "fixture" if args.fixture_json else "ctc_align_text_batches",
-        "requested_mode": args.mode,
-        "batch_count": total_batches,
-        "requested_ffmpeg": args.ffmpeg,
-    }
-
-    fixture_payload = json.loads(Path(args.fixture_json).read_text(encoding="utf-8")) if args.fixture_json else None
-    ffmpeg_path = resolve_ffmpeg(args.ffmpeg) if not fixture_payload else None
-    bundle = None
-    if not fixture_payload:
-        bundle = load_ctc_model_bundle(
-            args.model,
-            progress_path,
-            batch_index=0,
-            total_batches=total_batches,
-        )
-        diagnostic["ffmpeg"] = ffmpeg_path
-
-    with tempfile.TemporaryDirectory(prefix="subfix_asr_batches_") as tmp_dir:
-        tmp_root = Path(tmp_dir)
-        for batch_index, batch in enumerate(batches, start=1):
-            batch_id = str(batch.get("batch_id") or batch_index)
-            rows = batch["rows"]
-            batch_fps = float(batch.get("fps") or args.fps or 30.0)
-            timeline_start_frame = int(batch.get("timeline_start_frame") or 0)
-            try:
-                write_progress(
-                    progress_path,
-                    "cut_audio" if not fixture_payload else "write_output",
-                    f"正在处理第 {batch_index}/{total_batches} 批",
-                    batch_index=batch_index,
-                    total_batches=total_batches,
-                )
-                if fixture_payload:
-                    speech_regions = fixture_payload.get("speech_regions") or []
-                    speech_onsets = fixture_payload.get("speech_onsets") or [
-                        region.get("start")
-                        for region in speech_regions
-                        if isinstance(region, dict)
-                    ]
-                    raw_payload = dict(fixture_payload)
-                else:
-                    cut_path = tmp_root / f"batch_{batch_index}.wav"
-                    audio_path = Path(str(batch.get("audio") or ""))
-                    if not audio_path.exists():
-                        raise RuntimeError("audio file not found")
-                    cut_audio(
-                        str(ffmpeg_path),
-                        audio_path,
-                        cut_path,
-                        float(batch.get("source_start") or 0.0),
-                        batch.get("source_end"),
-                        int(batch.get("audio_channel_index")) if batch.get("audio_channel_index") else None,
-                    )
-                    write_progress(
-                        progress_path,
-                        "detect_speech",
-                        "正在检测音频起点",
-                        batch_index=batch_index,
-                        total_batches=total_batches,
-                    )
-                    speech_regions, speech_onsets, onset_diagnostic = detect_speech_regions(cut_path)
-                    raw_payload = ctc_align_text_rows_with_bundle(
-                        cut_path,
-                        rows,
-                        bundle,
-                        args.language or "zh",
-                        batch_fps,
-                        timeline_start_frame,
-                        progress_path,
-                        batch_index=batch_index,
-                        total_batches=total_batches,
-                    )
-                    raw_payload = dict(raw_payload)
-                    raw_payload.setdefault("diagnostic", {}).update(onset_diagnostic)
-
-                aligned_payload = aligned_payload_for_ctc_rows(
-                    raw_payload,
-                    rows,
-                    batch_fps,
-                    timeline_start_frame,
-                )
-                batch_diagnostic = dict(raw_payload.get("diagnostic") or {})
-                batch_diagnostic["row_count"] = len(rows)
-                batch_diagnostic["aligned_count"] = len(aligned_payload["aligned_rows"])
-                output_batches.append(
-                    {
-                        "batch_id": batch_id,
-                        "ok": True,
-                        "aligned_rows": aligned_payload["aligned_rows"],
-                        "segments": aligned_payload["segments"],
-                        "speech_onsets": speech_onsets,
-                        "speech_regions": speech_regions,
-                        "text": aligned_payload["text"],
-                        "diagnostic": batch_diagnostic,
-                    }
-                )
-            except Exception as exc:
-                output_batches.append(
-                    {
-                        "batch_id": batch_id,
-                        "ok": False,
-                        "aligned_rows": [],
-                        "segments": [],
-                        "speech_onsets": [],
-                        "speech_regions": [],
-                        "error": str(exc),
-                        "diagnostic": {"row_count": len(rows)},
-                    }
-                )
-
-    diagnostic["successful_batch_count"] = sum(1 for batch in output_batches if batch.get("ok") is True)
-    diagnostic["failed_batch_count"] = total_batches - diagnostic["successful_batch_count"]
-    write_progress(
-        progress_path,
-        "done",
-        "批量 CTC helper 已完成",
-        batch_index=total_batches,
-        total_batches=total_batches,
-    )
-    return {
-        "ok": diagnostic["failed_batch_count"] == 0,
-        "model": args.model,
-        "batches": output_batches,
         "diagnostic": diagnostic,
     }
 
@@ -7182,6 +5462,12 @@ def run_qwen_forced_align_batch_plan(
                 )
 
     diagnostic["qwen_output_path"] = ",".join(qwen_output_paths)
+    # 每批的 JSON 已在解析后即删；此处仅在输出目录为空时移除本工具创建的目录，
+    # 绝不 rmtree（目录里若有用户/旧版本残留文件则原样保留）。
+    try:
+        qwen_output_dir.rmdir()
+    except OSError:
+        pass
     diagnostic["successful_batch_count"] = sum(1 for batch in output_batches if batch.get("ok") is True)
     diagnostic["failed_batch_count"] = total_batches - diagnostic["successful_batch_count"]
     failed_batch_errors = [
@@ -7317,10 +5603,11 @@ def run_script_match_align(
             ]
             subprocess.run(cmd, check=True, text=True, encoding="utf-8", errors="replace", capture_output=True)
 
-        try:
-            duration = audio_duration_seconds(combined_path)
-        except Exception:
-            duration = 0.0
+        # combined.wav 由上面的 ffmpeg 刚产出；读不出时长说明管线真出错，
+        # 必须显式报错，不能再静默吞成 0 秒继续生成塌缩字幕。
+        duration = audio_duration_seconds(combined_path)
+        if duration <= 0:
+            raise RuntimeError("文稿匹配选区音频时长为 0，无法对齐，请检查选区是否包含音频")
         if duration > SCRIPT_MATCH_MAX_SECONDS:
             raise RuntimeError(
                 f"文稿匹配选区过长（约 {duration:.0f}s，上限 {SCRIPT_MATCH_MAX_SECONDS:.0f}s），请缩小 In/Out 选区后重试"
@@ -7356,7 +5643,50 @@ def run_script_match_align(
     return payload
 
 
+def sweep_stale_temp_dirs(root=None, now=None, max_age_days=7):
+    """清理系统 TEMP 下本产品残留的旧临时目录。
+
+    只删除同时满足以下条件的条目：位于 TEMP 根目录、名字以小写 "subfix_" 开头、
+    是非符号链接的目录、mtime 早于 max_age_days 天前。
+    新目录、非目录文件、其他大小写前缀（如 SubFixDumps）一律不动；任何异常不外抛。
+    返回实际删除的目录数量。
+    """
+    try:
+        if root is None:
+            root = tempfile.gettempdir()
+        if now is None:
+            now = time.time()
+        cutoff = now - float(max_age_days) * 86400.0
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return 0
+        removed = 0
+        for name in names:
+            if not name.startswith("subfix_"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                if (
+                    os.path.isdir(path)
+                    and not os.path.islink(path)
+                    and os.path.getmtime(path) < cutoff
+                ):
+                    shutil.rmtree(path, ignore_errors=True)
+                    if not os.path.exists(path):
+                        removed += 1
+            except OSError:
+                continue
+        return removed
+    except Exception:
+        return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        sweep_stale_temp_dirs()
+    except Exception:
+        pass
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio")
     parser.add_argument("--output", required=True)
@@ -7543,35 +5873,6 @@ def main(argv: list[str] | None = None) -> int:
                     ],
                 }
             rows = load_rows(args.rows_json)
-            if args.mode in {"align", "align_text", "whisperx_align_text", "ctc_align_text"} and rows:
-                if args.mode == "ctc_align_text" and raw_payload.get("char_segments"):
-                    raw_segments = segments_from_ctc_char_segments(
-                        rows,
-                        raw_payload.get("char_segments") or [],
-                        fps=args.fps,
-                        timeline_start_frame=args.timeline_start_frame,
-                    )
-                else:
-                    raw_segments = normalize_aligned_segments_for_rows(raw_payload, rows)
-                raw_payload = dict(raw_payload)
-                raw_payload["segments"] = raw_segments
-                raw_payload["aligned_rows"] = apply_alignment_to_rows(
-                    rows,
-                    raw_segments,
-                    args.fps,
-                    args.timeline_start_frame,
-                    allow_non_monotonic=args.mode in {"align_text", "whisperx_align_text", "ctc_align_text"},
-                )
-                if args.mode == "ctc_align_text":
-                    for aligned_row, segment in zip(raw_payload["aligned_rows"], raw_segments, strict=True):
-                        if "ctc_confidence" in segment:
-                            aligned_row["ctc_confidence"] = segment["ctc_confidence"]
-                        if "ctc_char_count" in segment:
-                            aligned_row["ctc_char_count"] = segment["ctc_char_count"]
-                        if "ctc_end_frame" in segment:
-                            aligned_row["ctc_end_frame"] = segment["ctc_end_frame"]
-                diagnostic["row_count"] = len(rows)
-                diagnostic["aligned_count"] = len(raw_payload["aligned_rows"])
             speech_regions = raw_payload.get("speech_regions") or []
             speech_onsets = raw_payload.get("speech_onsets") or [region.get("start") for region in speech_regions if isinstance(region, dict)]
             if args.mode == "generate_subtitles":
@@ -7637,91 +5938,7 @@ def main(argv: list[str] | None = None) -> int:
                 write_progress(progress_path, "detect_speech", "正在检测音频起点")
                 speech_regions, speech_onsets, onset_diagnostic = detect_speech_regions(cut_path)
                 diagnostic.update(onset_diagnostic)
-                if args.mode == "align":
-                    raw_payload = align_existing_subtitle_rows(
-                        cut_path,
-                        rows,
-                        args.model,
-                        args.language or "zh",
-                        args.fps,
-                        args.timeline_start_frame,
-                        (args.source_end - args.source_start) if args.source_end is not None and args.source_end > args.source_start else None,
-                    )
-                    raw_segments = normalize_aligned_segments_for_rows(raw_payload, rows)
-                    aligned_rows = apply_alignment_to_rows(rows, raw_segments, args.fps, args.timeline_start_frame)
-                    raw_payload = dict(raw_payload)
-                    raw_payload["segments"] = raw_segments
-                    raw_payload["aligned_rows"] = aligned_rows
-                    diagnostic["row_count"] = len(rows)
-                    diagnostic["aligned_count"] = len(aligned_rows)
-                elif args.mode == "align_text":
-                    raw_payload = align_text_rows(
-                        cut_path,
-                        rows,
-                        args.model,
-                        args.language or "zh",
-                    )
-                    raw_segments = normalize_aligned_segments_for_rows(raw_payload, rows)
-                    aligned_rows = apply_alignment_to_rows(
-                        rows,
-                        raw_segments,
-                        args.fps,
-                        args.timeline_start_frame,
-                        allow_non_monotonic=True,
-                    )
-                    raw_payload = dict(raw_payload)
-                    raw_payload["segments"] = raw_segments
-                    raw_payload["aligned_rows"] = aligned_rows
-                    diagnostic["row_count"] = len(rows)
-                    diagnostic["aligned_count"] = len(aligned_rows)
-                elif args.mode == "whisperx_align_text":
-                    raw_payload = whisperx_align_text_rows(
-                        cut_path,
-                        rows,
-                        args.language or "zh",
-                    )
-                    raw_segments = normalize_aligned_segments_for_rows(raw_payload, rows)
-                    aligned_rows = apply_alignment_to_rows(
-                        rows,
-                        raw_segments,
-                        args.fps,
-                        args.timeline_start_frame,
-                        allow_non_monotonic=True,
-                    )
-                    raw_payload = dict(raw_payload)
-                    raw_payload["segments"] = raw_segments
-                    raw_payload["aligned_rows"] = aligned_rows
-                    diagnostic["row_count"] = len(rows)
-                    diagnostic["aligned_count"] = len(aligned_rows)
-                elif args.mode == "ctc_align_text":
-                    raw_payload = ctc_align_text_rows(
-                        cut_path,
-                        rows,
-                        args.model,
-                        args.language or "zh",
-                        args.fps,
-                        args.timeline_start_frame,
-                        progress_path,
-                    )
-                    raw_segments = normalize_aligned_segments_for_rows(raw_payload, rows)
-                    aligned_rows = apply_alignment_to_rows(
-                        rows,
-                        raw_segments,
-                        args.fps,
-                        args.timeline_start_frame,
-                        allow_non_monotonic=True,
-                    )
-                    for aligned_row, segment in zip(aligned_rows, raw_segments, strict=True):
-                        if "ctc_confidence" in segment:
-                            aligned_row["ctc_confidence"] = segment["ctc_confidence"]
-                        if "ctc_char_count" in segment:
-                            aligned_row["ctc_char_count"] = segment["ctc_char_count"]
-                    raw_payload = dict(raw_payload)
-                    raw_payload["segments"] = raw_segments
-                    raw_payload["aligned_rows"] = aligned_rows
-                    diagnostic["row_count"] = len(rows)
-                    diagnostic["aligned_count"] = len(aligned_rows)
-                elif args.mode == "onsets":
+                if args.mode == "onsets":
                     raw_payload = {"segments": [], "aligned_rows": [], "text": ""}
                 else:
                     raw_payload = transcribe_with_backend(cut_path, args.model, args.language, args.backend)

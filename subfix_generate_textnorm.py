@@ -14,7 +14,9 @@
 2. 电话/编号式读法（「幺」「一」等单字数字连续出现 >= 3 个）是**独立的第二触发条件**，
    不依赖后面是否跟量词——「幺八幺八黄金眼」中「黄金眼」并非量词，但四个单字数字连续
    出现 4 次仍应转换为「1818」。该规则只处理纯个位数字符（不含十/百/千/万等位值字），
-   避免与量词触发机制冲突。
+   避免与量词触发机制冲突。例外：若该连续 run 紧邻白名单量词/单位（如「三四五条」
+   「七八九条」「三四五六条」），则电话规则整体让位给量词主机制（由其概数安全阀保留
+   原文），绝不允许回溯成半截转换（如「345六条」）。
 3. 成语/习语黑名单（一模一样、十分、一起、一下、一直、万一）只作为**补充保险**：在两条
    触发规则跑之前，把命中的黑名单短语整体做不可逆占位符屏蔽，跑完规则后再还原成原文——
    即便未来触发规则出现意外的边界条件，这些短语也绝对不会被动到。黑名单不是数字转换的
@@ -26,7 +28,8 @@
    a) 模糊量词紧邻数字串之前（几、多、来、余、上、约、近，含「好几」——因为紧邻字符
       是「几」）时不转换，如「几万块钱」「好几十块钱」，避免把约数当精确数字处理。
    b) 数字串中出现两个相邻的个位数字符（一二三四五六七八九）视为概数连写（二三十、
-      三四十、七八个），不转换。
+      三四十、七八个、三四五条、七八九条），不转换；纯个位数字 run 紧邻量词时，
+      电话/编号规则也会让位，避免「三四五条」被抢先转成「345条」。
    c) 数字串解析结果为 0 但原文并非「零/〇」时，视为解析失败（如光秃秃的「万」被
       误判成 0），保留原文，避免「万块钱」被转换成「0块钱」。
 """
@@ -135,11 +138,14 @@ _UNIT_VALUE: Dict[str, int] = {
 }
 
 
-def _build_quantifier_pattern() -> re.Pattern:
-    alternatives = "|".join(
+def _quantifier_alternatives() -> str:
+    return "|".join(
         re.escape(word) for word in sorted(QUANTIFIER_WHITELIST, key=len, reverse=True)
     )
-    return re.compile(f"[{_NUMERAL_CHARS}]+(?=(?:{alternatives}))")
+
+
+def _build_quantifier_pattern() -> re.Pattern:
+    return re.compile(f"[{_NUMERAL_CHARS}]+(?=(?:{_quantifier_alternatives()}))")
 
 
 def _build_ascii_pattern() -> re.Pattern:
@@ -152,7 +158,19 @@ def _build_ascii_pattern() -> re.Pattern:
     )
 
 
-_PHONE_RUN_PATTERN = re.compile(f"[{_PHONE_DIGIT_CHARS}]{{3,}}")
+def _build_phone_run_pattern() -> re.Pattern:
+    # 两个尾部约束缺一不可：
+    # 1) ``(?![位数字符])`` 锁定匹配必须吃满整个连续 run，避免「三四五六条」被
+    #    回溯成「三四五」+「六条」之类的半截转换；
+    # 2) ``(?!白名单量词)`` 让紧邻量词的纯个位数字 run（三四五条、七八九条）
+    #    交给量词主机制处理——主机制的概数安全阀会保留原文，电话规则不得抢先
+    #    把概数转成 345/789。
+    return re.compile(
+        f"[{_PHONE_DIGIT_CHARS}]{{3,}}(?![{_PHONE_DIGIT_CHARS}])(?!(?:{_quantifier_alternatives()}))"
+    )
+
+
+_PHONE_RUN_PATTERN = _build_phone_run_pattern()
 _QUANTIFIER_TRIGGER_PATTERN = _build_quantifier_pattern()
 _ASCII_TOKEN_PATTERN = _build_ascii_pattern()
 

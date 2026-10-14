@@ -33,7 +33,6 @@ fi
 
 for required in \
   "$SCRIPT_DIR/SubFix.lua" \
-  "$SCRIPT_DIR/生成选区字幕.lua" \
   "$SCRIPT_DIR/.subfix_support/subfix_generate_selection_core.lua" \
   "$SCRIPT_DIR/.subfix_support/subfix_update.py" \
   "$SCRIPT_DIR/.subfix_support/subfix_qwen_local_manager.py" \
@@ -69,7 +68,6 @@ rm -f "$ZIP_PATH"
 mkdir -p "$SUPPORT_PAYLOAD" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix" "$PKG_SCRIPTS_DIR" "$RELEASE_DIR"
 
 cp "$SCRIPT_DIR/SubFix.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua"
-cp "$SCRIPT_DIR/生成选区字幕.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/生成选区字幕.lua"
 for helper in subfix_generate_selection_core.lua subfix_update.py subfix_qwen_local_manager.py subfix_process_group.py segmentation_profile.json segmentation_profile_v3.json segmentation_profile_v4.json; do
   cp "$SCRIPT_DIR/.subfix_support/$helper" "$SUPPORT_PAYLOAD/$helper"
 done
@@ -89,7 +87,7 @@ cp "$FFMPEG_STAGE_DIR/FFmpeg-LGPL-2.1.txt" "$SUPPORT_PAYLOAD/licenses/FFmpeg-LGP
 cp "$FFMPEG_STAGE_DIR/FFmpeg-LGPL-2.1.txt" "$RELEASE_DIR/第三方许可/FFmpeg-LGPL-2.1.txt"
 cp "$FFMPEG_STAGE_DIR/FFmpeg-BUILD-INFO.txt" "$RELEASE_DIR/第三方许可/FFmpeg-BUILD-INFO.txt"
 cp "$FFMPEG_STAGE_DIR/ffmpeg-9.0.tar.xz" "$RELEASE_DIR/第三方许可/ffmpeg-9.0.tar.xz"
-chmod 755 "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/生成选区字幕.lua" \
+chmod 755 "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua" \
   "$SUPPORT_PAYLOAD/setup_asr_env.sh" "$SUPPORT_PAYLOAD/subfix_asr_transcribe.py" "$SUPPORT_PAYLOAD/subfix_qwen_local_manager.py" "$SUPPORT_PAYLOAD/subfix_process_group.py" "$SUPPORT_PAYLOAD/bin/qwen3-asr-cli" "$SUPPORT_PAYLOAD/bin/ffmpeg"
 
 cat > "$PKG_SCRIPTS_DIR/preinstall" <<'EOF'
@@ -105,6 +103,12 @@ cp "$USER_INSTALL_SCRIPT" "$PKG_SCRIPTS_DIR/postinstall"
 chmod 755 "$PKG_SCRIPTS_DIR/postinstall"
 
 PYTHONDONTWRITEBYTECODE=1 "$RUNTIME_DIR/bin/python3" "$SCRIPT_DIR/scripts/check_release_privacy.py" "$PAYLOAD_DIR"
+# 用户菜单只允许 SubFix/SubFix.lua 一个入口；独立「生成选区字幕」菜单已退役。
+menu_lua_count="$(find "$PAYLOAD_DIR/$INSTALL_PATH/SubFix" -maxdepth 1 -type f -name '*.lua' | wc -l | tr -d '[:space:]')"
+if [[ "$menu_lua_count" != "1" || ! -f "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua" ]]; then
+  echo "❌ 用户菜单载荷必须只含 SubFix/SubFix.lua 一个 Lua 入口（实际 $menu_lua_count 个）。" >&2
+  exit 1
+fi
 pkgbuild --root "$PAYLOAD_DIR" --scripts "$PKG_SCRIPTS_DIR" --identifier com.mediastorm.subfix.beta \
   --version "$VERSION" --install-location / --quiet "$PKG_PATH"
 

@@ -40,5 +40,6 @@ SubFix-2.0-更新说明.md
 .subfix_support/calibration_samples/
 tests/fixtures/
 docs/superpowers/
+*.bak
 *.bak-*
 *.log

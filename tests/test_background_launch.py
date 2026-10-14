@@ -3,6 +3,7 @@
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BackgroundLaunchTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("/bin/sh"), "POSIX /bin/sh is required")
     def test_launcher_releases_host_pipes_before_worker_finishes(self):
         source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text()
         runner = source.split("local function run_background_command_with_progress(", 1)[1]

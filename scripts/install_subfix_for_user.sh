@@ -71,6 +71,16 @@ done
 ditto "$SYSTEM_UTILITY/SubFix" "$USER_UTILITY/SubFix"
 ditto "$SYSTEM_SUPPORT" "$USER_SUPPORT"
 
+# 独立「生成选区字幕」菜单已退役（现并入唯一的 SubFix/SubFix.lua 主窗口）。
+# ditto 是合并复制，用户目录里上一版残留的旧入口必须显式删除。
+for legacy_path in \
+  "$USER_UTILITY/SubFix/生成选区字幕.lua" \
+  "$USER_UTILITY/SubFix/SubFix_GenerateSelectionSubtitles.lua" \
+  "$USER_UTILITY/SubFix_GenerateSelectionSubtitles.lua" \
+  "$USER_UTILITY/SubFix.lua"; do
+  [[ -e "$legacy_path" || -L "$legacy_path" ]] && rm -f -- "$legacy_path"
+done
+
 chown -R "$CONSOLE_USER":staff "$USER_UTILITY/SubFix" "$USER_SUPPORT/runtime" "$USER_SUPPORT/bin"
 [[ -d "$USER_SUPPORT/licenses" ]] && chown -R "$CONSOLE_USER":staff "$USER_SUPPORT/licenses"
 chown "$CONSOLE_USER":staff "$USER_SUPPORT"

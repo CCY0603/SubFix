@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>SubFix · Quiet Pro 视觉稿</title>
+<style>
+  :root{
+    --bg:#16181C; --surface:#1F2229; --surface-2:#242830; --hover:#2A2E37; --selected:#2E333D;
+    --input:#12141A; --border:#333842; --border-soft:#2A2E37;
+    --text:#E6E9EF; --text-dim:#9099A8; --text-faint:#6B7280;
+    --accent:#FF6A00; --accent-soft:rgba(255,106,0,.14); --on-accent:#14161A;
+    --radius:6px; --font:"Microsoft YaHei UI","Segoe UI",system-ui,sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:#0E0F12;font-family:var(--font);display:flex;justify-content:center;padding:28px 12px;min-height:100vh;}
+  .window{width:1240px;max-width:100%;background:var(--bg);border-radius:10px;overflow:hidden;
+    box-shadow:0 24px 70px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.05);color:var(--text);}
+
+  /* 原生标题栏（诚实模拟，无法修改） */
+  .titlebar{height:32px;background:#F3F4F6;display:flex;align-items:center;justify-content:space-between;padding:0 4px 0 12px;}
+  .titlebar .t{color:#1F2937;font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px;}
+  .titlebar .dot{width:14px;height:14px;border-radius:3px;background:linear-gradient(135deg,#FF8C33,#E86200);}
+  .win-btns{display:flex;}
+  .win-btns span{width:44px;height:32px;display:flex;align-items:center;justify-content:center;color:#4B5563;font-size:13px;}
+  .win-bts span:hover{background:#E5E7EB;}
+  .win-btns .close:hover{background:#E81123;color:#fff;}
+
+  .app{padding:14px 18px 12px;}
+
+  /* 顶栏 */
+  .topbar{display:flex;align-items:center;gap:8px;}
+  .lbl{font-size:13px;color:var(--text-dim);}
+  .stepper{display:flex;align-items:center;}
+  .stepper .num{width:40px;height:30px;background:var(--input);border:1px solid var(--border);border-radius:var(--radius) 0 0 var(--radius);
+    display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--text);}
+  .stepper .arrows{display:flex;flex-direction:column;border:1px solid var(--border);border-left:none;border-radius:0 var(--radius) var(--radius) 0;overflow:hidden;}
+  .stepper .arrows i{width:22px;height:14px;background:var(--surface);display:flex;align-items:center;justify-content:center;
+    color:var(--text-dim);font-style:normal;font-size:9px;cursor:pointer;}
+  .stepper .arrows i:hover{background:var(--hover);color:var(--text);}
+  .spacer{flex:1;}
+
+  /* 按钮 */
+  .btn{height:30px;padding:0 16px;border-radius:var(--radius);font-size:13px;font-family:var(--font);
+    display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;border:1px solid transparent;
+    background:transparent;color:var(--text);transition:background .12s,border-color .12s;white-space:nowrap;}
+  .btn:hover{background:var(--hover);}
+  .btn.ghost{border-color:var(--border-soft);background:rgba(255,255,255,.02);color:var(--text);}
+  .btn.ghost:hover{background:var(--hover);border-color:#3D4350;}
+  .btn.primary{background:var(--accent);color:var(--on-accent);font-weight:600;}
+  .btn.primary:hover{background:#FF7D1F;}
+  .btn.accent-outline{border-color:var(--accent);color:var(--accent);background:var(--accent-soft);font-weight:600;}
+  .btn.accent-outline:hover{background:rgba(255,106,0,.22);}
+  .btn.tight{padding:0 10px;color:var(--text-dim);}
+  .btn.small{height:28px;font-size:12px;}
+  .btn.block{width:100%;}
+  .btn.lg{height:38px;font-size:14px;}
+
+  /* 搜索 */
+  .search{margin-top:12px;height:34px;background:var(--input);border:1px solid var(--border);border-radius:var(--radius);
+    display:flex;align-items:center;padding:0 12px;color:var(--text-faint);font-size:13px;}
+
+  /* Tabs：安静的下划线分段 */
+  .tabs{display:flex;gap:4px;margin-top:14px;border-bottom:1px solid var(--border-soft);}
+  .tab{flex:1;height:38px;display:flex;align-items:center;justify-content:center;gap:8px;font-size:14px;
+    color:var(--text-faint);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .12s;}
+  .tab:hover{color:var(--text-dim);}
+  .tab.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600;}
+  .tab .idx{font-size:12px;color:inherit;opacity:.8;}
+
+  /* 通用 */
+  .section-title{font-size:12px;color:var(--text-dim);font-weight:600;letter-spacing:.5px;}
+  .meta{font-size:12px;color:var(--text-faint);}
+  .row{display:flex;align-items:center;gap:10px;}
+  .field-label{font-size:13px;color:var(--text-dim);width:46px;flex:none;}
+
+  /* 分段控件（选项，非动作） */
+  .segmented{display:flex;background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);padding:3px;gap:2px;flex:1;}
+  .segmented .seg{flex:1;height:28px;display:flex;align-items:center;justify-content:center;border-radius:4px;
+    font-size:13px;color:var(--text-dim);cursor:pointer;transition:background .12s,color .12s;}
+  .segmented .seg:hover{color:var(--text);}
+  .segmented .seg.on{background:var(--selected);color:var(--text);font-weight:600;box-shadow:inset 0 0 0 1px rgba(255,255,255,.05);}
+
+  /* 列表 */
+  .tracks{background:var(--input);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;margin-top:8px;}
+  .track{height:40px;display:flex;align-items:center;padding:0 14px;font-size:14px;color:var(--text-dim);cursor:pointer;
+    border-left:3px solid transparent;}
+  .track:hover{background:var(--hover);color:var(--text);}
+  .track.on{background:var(--selected);color:var(--text);border-left-color:var(--accent);font-weight:600;}
+
+  /* 输入/下拉 */
+  .input{height:32px;background:var(--input);border:1px solid var(--border);border-radius:var(--radius);
+    display:flex;align-items:center;padding:0 12px;font-size:13px;color:var(--text);flex:1;}
+  .input.placeholder{color:var(--text-faint);}
+  .input select,.input{width:100%;}
+  .combo{justify-content:space-between;}
+  .combo::after{content:"▾";color:var(--text-faint);font-size:11px;}
+
+  /* 字幕树 */
+  .tree{background:var(--input);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;}
+  .tree .cols{display:flex;background:var(--surface);font-size:12px;color:var(--text-faint);
+    border-bottom:1px solid var(--border-soft);}
+  .tree .cols div{padding:7px 10px;}
+  .trow{display:flex;align-items:center;gap:10px;padding:9px 12px;font-size:13px;cursor:pointer;
+    border-left:3px solid transparent;color:var(--text);}
+  .trow:hover{background:var(--hover);}
+  .trow .tc{color:var(--text-faint);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;}
+  .trow .sep{color:#3F4652;}
+  .trow .ttl{color:#C7CCD6;}
+  .trow.on{background:var(--selected);border-left-color:var(--accent);}
+  .trow.on .ttl{color:#fff;}
+  .trow.on .tc{color:var(--text-dim);}
+
+  /* 底栏 */
+  .bottom{margin-top:12px;padding-top:12px;border-top:1px solid var(--border-soft);display:flex;flex-direction:column;gap:10px;}
+  .bottom .line{display:flex;gap:10px;align-items:center;}
+  .status{margin-top:10px;font-size:12px;color:var(--text-faint);display:flex;align-items:center;gap:7px;}
+  .status .live{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px var(--accent);}
+
+  .grid-tools{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+  .page{display:none;}
+  .page.show{display:block;}
+  .stack{margin-top:14px;display:flex;flex-direction:column;gap:12px;}
+  .opt-row{display:flex;align-items:center;gap:14px;}
+  .opt-row .cell{flex:1;display:flex;align-items:center;gap:10px;}
+  .hint{font-size:12px;color:var(--text-faint);}
+  .mb8{margin-bottom:8px;}
+  .edit-head{font-size:12px;color:var(--text-dim);}
+  .editbox{background:var(--input);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px;font-size:14px;color:var(--text);min-height:42px;}
+  .ai-form{display:flex;flex-direction:column;gap:10px;}
+  .ai-form .row .field-label{width:46px;}
+  .badge{font-size:11px;color:var(--text-dim);border:1px solid var(--border);border-radius:4px;padding:2px 8px;}
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="titlebar">
+    <div class="t"><span class="dot"></span>SubFix 字幕工作台</div>
+    <div class="win-btns"><span>—</span><span>▢</span><span class="close">✕</span></div>
+  </div>
+
+  <div class="app">
+    <!-- 顶栏 -->
+    <div class="topbar">
+      <span class="lbl">字幕轨</span>
+      <div class="stepper"><div class="num">1</div><div class="arrows"><i>▲</i><i>▼</i></div></div>
+      <button class="btn ghost">刷新字幕</button>
+      <button class="btn ghost">检查更新</button>
+      <button class="btn ghost">导出</button>
+      <div class="spacer"></div>
+      <button class="btn tight">退出</button>
+    </div>
+
+    <div class="search">搜索字幕内容（双击跳转）</div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <div class="tab active" data-tab="p1"><span class="idx">①</span>选区识别</div>
+      <div class="tab" data-tab="p2"><span class="idx">②</span>精修工具</div>
+      <div class="tab" data-tab="p3"><span class="idx">③</span>AI 工作台</div>
+    </div>
+
+    <!-- ========== 页 1：选区识别 ========== -->
+    <div class="page show" id="p1">
+      <div class="stack">
+        <div class="row" style="justify-content:space-between;">
+          <span class="section-title">选区识别</span>
+          <button class="btn small ghost">重新检测选区</button>
+        </div>
+        <div>
+          <span class="section-title">选择用于识别的音频轨道</span>
+          <div class="tracks">
+            <div class="track on">A1&nbsp;&nbsp;音频 1</div>
+            <div class="track">A2&nbsp;&nbsp;音频 2</div>
+            <div class="track">A3&nbsp;&nbsp;音频 3</div>
+            <div class="track">A4&nbsp;&nbsp;音频 4</div>
+          </div>
+          <div class="hint" style="margin-top:6px;">按住 Ctrl / Shift 可多选音频轨</div>
+        </div>
+
+        <div>
+          <div class="section-title mb8">生成选项</div>
+          <div class="opt-row">
+            <div class="cell">
+              <span class="field-label">长度</span>
+              <div class="segmented"><div class="seg on">标准（≤25字）</div><div class="seg">短视频（≤10字）</div></div>
+            </div>
+            <div class="cell">
+              <span class="field-label">模型</span>
+              <div class="segmented"><div class="seg on">Qwen（本地）</div><div class="seg">豆包（云端）</div></div>
+            </div>
+          </div>
+          <div class="opt-row" style="margin-top:10px;">
+            <div class="cell"><span class="field-label">热词</span>
+              <button class="btn ghost block" style="justify-content:space-between;padding:0 12px;">
+                <span style="color:var(--text-dim);">热词：关 · 0 条</span><span style="color:var(--text-dim);">管理…</span></button>
+            </div>
+            <div class="cell"><span class="field-label">文稿</span>
+              <button class="btn ghost block" style="justify-content:space-between;padding:0 12px;">
+                <span style="color:var(--text-dim);">启用文稿匹配</span><span style="color:var(--text-dim);">文稿…</span></button>
+            </div>
+          </div>
+          <div class="row" style="margin-top:10px;justify-content:space-between;">
+            <span class="hint">关闭：使用识别模型生成字幕</span>
+            <span class="hint">In/Out (Out only)：0 – 5266</span>
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:center;">
+          <button class="btn primary" style="width:200px;height:34px;">开始生成</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== 页 2：精修工具 ========== -->
+    <div class="page" id="p2">
+      <div class="stack">
+        <div class="grid-tools">
+          <button class="btn ghost">规整字幕长度</button>
+          <button class="btn ghost">中文数字互转</button>
+          <button class="btn ghost">修改英文排版</button>
+          <button class="btn ghost">最终交付检查</button>
+          <button class="btn ghost">敏感词替换</button>
+          <button class="btn ghost">清空空行</button>
+          <button class="btn ghost" style="visibility:hidden;">占位</button>
+          <button class="btn ghost">提取纯文本</button>
+        </div>
+
+        <div class="row">
+          <span class="field-label">查找：</span>
+          <div class="input placeholder">例如：错别字</div>
+          <span class="field-label" style="width:auto;">替换为：</span>
+          <div class="input placeholder">&nbsp;</div>
+          <button class="btn accent-outline">执行批量替换</button>
+        </div>
+
+        <div class="tree">
+          <div class="cols"><div style="width:28px;">1</div><div style="width:28px;">2</div></div>
+          <div class="trow"><span class="tc">[43] 00:02:50:16 → 00:02:54:14</span><span class="sep">|</span><span class="ttl">工作室累计产出 57 项创新成果</span></div>
+          <div class="trow"><span class="tc">[44] 00:02:54:16 → 00:02:57:23</span><span class="sep">|</span><span class="ttl">其中 8 项获国家实用新型专利</span></div>
+          <div class="trow"><span class="tc">[45] 00:02:57:23 → 00:03:03:11</span><span class="sep">|</span><span class="ttl">目前正与中国移动研究院联合攻关 6G 无源感知技术</span></div>
+          <div class="trow"><span class="tc">[46] 00:03:03:11 → 00:03:05:02</span><span class="sep">|</span><span class="ttl">扎根燕赵大地</span></div>
+          <div class="trow on"><span class="tc">[47] 00:03:05:02 → 00:03:07:17</span><span class="sep">|</span><span class="ttl">让通信技术更有温度</span></div>
+          <div class="trow"><span class="tc">[48] 00:03:08:16 → 00:03:11:24</span><span class="sep">|</span><span class="ttl">联盟将依托京津冀科技人才高地</span></div>
+        </div>
+
+        <div>
+          <div class="edit-head mb8">编辑字幕 #47（00:03:05:02 → 00:03:07:17）</div>
+          <div class="editbox mb8">让通信技术更有温度</div>
+          <div class="row">
+            <button class="btn ghost block">还原</button>
+            <button class="btn ghost block">拆分</button>
+            <button class="btn primary block">保存修改</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== 页 3：AI 工作台 ========== -->
+    <div class="page" id="p3">
+      <div class="stack">
+        <div class="ai-form">
+          <div class="row"><span class="field-label">任务：</span><div class="input combo">完整纠错</div></div>
+          <div class="row"><span class="field-label">引擎：</span><div class="input combo">SiliconFlow</div></div>
+          <div class="row">
+            <button class="btn ghost block">配置</button>
+            <button class="btn primary block lg">开始 AI 处理</button>
+          </div>
+        </div>
+
+        <div class="tree">
+          <div class="cols"><div style="width:28px;">1</div><div style="width:28px;">2</div></div>
+          <div class="trow"><span class="tc">[43] 00:02:50:16 → 00:02:54:14</span><span class="sep">|</span><span class="ttl">工作室累计产出 57 项创新成果</span></div>
+          <div class="trow"><span class="tc">[44] 00:02:54:16 → 00:02:57:23</span><span class="sep">|</span><span class="ttl">其中 8 项获国家实用新型专利</span></div>
+          <div class="trow on"><span class="tc">[47] 00:03:05:02 → 00:03:07:17</span><span class="sep">|</span><span class="ttl">让通信技术更有温度</span></div>
+          <div class="trow"><span class="tc">[48] 00:03:08:16 → 00:03:11:24</span><span class="sep">|</span><span class="ttl">联盟将依托京津冀科技人才高地</span></div>
+        </div>
+
+        <div>
+          <div class="edit-head mb8">编辑字幕 #47（00:03:05:02 → 00:03:07:17）</div>
+          <div class="editbox mb8">让通信技术更有温度</div>
+          <div class="row">
+            <button class="btn ghost block">还原</button>
+            <button class="btn ghost block">拆分</button>
+            <button class="btn primary block">保存修改</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 常驻底栏（三页一致，视觉降权） -->
+    <div class="bottom">
+      <div class="line">
+        <button class="btn ghost" title="打开备份文件夹">备份</button>
+        <div class="input combo" style="flex:1;color:var(--text-faint);">选择历史备份…</div>
+        <button class="btn ghost">撤回</button>
+        <button class="btn ghost">清空</button>
+      </div>
+      <div class="line">
+        <span class="lbl">更新到轨</span>
+        <div class="stepper"><div class="num">1</div><div class="arrows"><i>▲</i><i>▼</i></div></div>
+        <button class="btn primary lg" style="flex:1;">更新时间线</button>
+      </div>
+      <div class="status"><span class="live"></span>自动跟随：当前字幕 #47</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(x=>x.classList.remove('show'));
+    t.classList.add('active');
+    document.getElementById(t.dataset.tab).classList.add('show');
+  }));
+</script>
+</body>
+</html>

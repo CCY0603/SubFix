@@ -1,4 +1,4 @@
-# Setup the SubFix ASR virtual environment on Windows (replaces setup_asr_env.sh).
+﻿# Setup the SubFix ASR virtual environment on Windows (replaces setup_asr_env.sh).
 # 在 Windows 上创建 SubFix 的 ASR 虚拟环境（替代 macOS 的 setup_asr_env.sh）。
 #
 # 该脚本通常位于 .subfix_support\ 下，因此默认把 venv 建在同级 .subfix_asr_env，

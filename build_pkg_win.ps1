@@ -1,4 +1,4 @@
-﻿# Build the distributable Windows package for SubFix (replaces build_pkg.sh / build_subfix_test_package.sh).
+# Build the distributable Windows package for SubFix (replaces build_pkg.sh / build_subfix_test_package.sh).
 # 生成 SubFix 的 Windows 可分发包（替代 macOS 的 pkgbuild/ditto 流程）。
 #
 # 与 macOS 版本不同：Windows 没有 .pkg 与公证流程，这里产出可直接解压部署的 ZIP，
@@ -32,7 +32,7 @@ $BuildRoot = Join-Path $ScriptDir 'build\subfix-win'
 
 $PkgName = 'SubFix'
 $SourceFile = Join-Path $SourceDir 'SubFix.lua'
-$GeneratorFile = Join-Path $SourceDir '生成选区字幕.lua'
+# 独立的「生成选区字幕.lua」仅保留在仓库内作为手动调试入口，不再打入发布包。
 $GenerateCore = Join-Path $SourceDir '.subfix_support\subfix_generate_selection_core.lua'
 $UpdateHelper = Join-Path $SourceDir '.subfix_support\subfix_update.py'
 $QwenManager = Join-Path $SourceDir '.subfix_support\subfix_qwen_local_manager.py'
@@ -46,7 +46,7 @@ $Profile = Join-Path $SourceDir '.subfix_support\segmentation_profile.json'
 $ProfileV3 = Join-Path $SourceDir '.subfix_support\segmentation_profile_v3.json'
 $ProfileV4 = Join-Path $SourceDir '.subfix_support\segmentation_profile_v4.json'
 
-$Required = @($SourceFile, $GeneratorFile, $GenerateCore, $UpdateHelper, $QwenManager, $ProcessGroup, $AsrHelper, $GenV4, $GenV5, $GenTextnorm, $SetupEnv, $Profile, $ProfileV3, $ProfileV4)
+$Required = @($SourceFile, $GenerateCore, $UpdateHelper, $QwenManager, $ProcessGroup, $AsrHelper, $GenV4, $GenV5, $GenTextnorm, $SetupEnv, $Profile, $ProfileV3, $ProfileV4)
 foreach ($F in $Required) {
     if (-not (Test-Path $F)) {
         Write-Error "缺少发行文件：$F"
@@ -63,7 +63,6 @@ New-Item -ItemType Directory -Force -Path (Join-Path $ReleaseDir '.subfix_suppor
 
 Write-Host "拷贝源文件 ..."
 Copy-Item $SourceFile (Join-Path $ReleaseDir 'SubFix\SubFix.lua')
-Copy-Item $GeneratorFile (Join-Path $ReleaseDir 'SubFix\生成选区字幕.lua')
 $CoreSupport = Join-Path $ReleaseDir '.subfix_support'
 foreach ($H in @($GenerateCore, $UpdateHelper, $QwenManager, $ProcessGroup, $Profile, $ProfileV3, $ProfileV4)) {
     Copy-Item $H $CoreSupport
@@ -125,10 +124,31 @@ if ($AlignerModel -and (Test-Path $AlignerModel)) {
     Copy-Item $AlignerModel (Join-Path $CoreSupport 'models\qwen3-forced-aligner-0.6b-f16.gguf') -Force
 }
 
+# ---- 剔除调试符号文件（.pdb）：随整树拷入的外部 runtime/二进制可能携带，运行不需要且体积大 ----
+$PdbFiles = @(Get-ChildItem $CoreSupport -Recurse -File -Filter '*.pdb' -ErrorAction SilentlyContinue)
+if ($PdbFiles.Count -gt 0) {
+    $PdbBytes = ($PdbFiles | Measure-Object -Property Length -Sum).Sum
+    $PdbMB = [math]::Round($PdbBytes / 1MB, 2)
+    $PdbFiles | Remove-Item -Force
+    Write-Host "已剔除 $($PdbFiles.Count) 个 .pdb 调试符号文件（$PdbMB MB）"
+}
+
+# 用户菜单只允许存在 SubFix\SubFix.lua 这一个 Lua 入口。
+$MenuLua = @(Get-ChildItem (Join-Path $ReleaseDir 'SubFix') -Filter '*.lua' -File)
+if ($MenuLua.Count -ne 1 -or $MenuLua[0].Name -ne 'SubFix.lua') {
+    Write-Error "发布载荷的用户菜单必须只含 SubFix\SubFix.lua 一个入口，实际：$($MenuLua.Name -join ', ')"
+    exit 1
+}
+if (Test-Path (Join-Path $ReleaseDir 'SubFix\生成选区字幕.lua')) {
+    Write-Error "发布载荷不得包含已退役的独立菜单 SubFix\生成选区字幕.lua"
+    exit 1
+}
+
 # ---- 安装 / 卸载程序 ----
 Copy-Item (Join-Path $ScriptDir 'install_subfix.ps1') $ReleaseDir
 Copy-Item (Join-Path $ScriptDir 'install_subfix.bat') $ReleaseDir
 Copy-Item (Join-Path $ScriptDir 'uninstall_subfix.ps1') $ReleaseDir
+Copy-Item (Join-Path $ScriptDir 'uninstall_subfix.bat') $ReleaseDir
 
 # ---- 生成 ZIP ----
 $ZipPath = Join-Path $ReleaseRoot "$ReleaseName.zip"
@@ -143,7 +163,6 @@ Write-Host "已生成分发 ZIP：$ZipPath"
 Write-Host ""
 Write-Host "分发目录包含："
 Write-Host "  - 安装程序：install_subfix.ps1 / install_subfix.bat"
-Write-Host "  - 卸载程序：uninstall_subfix.ps1"
-Write-Host "  - 主入口：SubFix\SubFix.lua"
-Write-Host "  - 生成入口：SubFix\生成选区字幕.lua"
+Write-Host "  - 卸载程序：uninstall_subfix.ps1 / uninstall_subfix.bat"
+Write-Host "  - 唯一用户菜单入口：SubFix\SubFix.lua"
 Write-Host "  - 支持文件：.subfix_support\"

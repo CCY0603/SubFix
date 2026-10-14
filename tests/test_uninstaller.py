@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -8,6 +9,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@unittest.skipUnless(sys.platform == "darwin", "macOS uninstaller requires bash, osascript and codesign")
 class UninstallerTests(unittest.TestCase):
     def test_confirmed_removal_is_limited_to_subfix(self):
         with tempfile.TemporaryDirectory() as folder:

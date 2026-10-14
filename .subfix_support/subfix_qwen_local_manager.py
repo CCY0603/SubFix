@@ -31,7 +31,6 @@ def _base_python(root: Path) -> Path:
 from pathlib import Path
 import re
 import subprocess
-import sys
 import threading
 import time
 from typing import Callable
@@ -114,6 +113,30 @@ class SubFixQwenPaths:
         return self.data_root / "locks" / "qwen-local-install.lock"
 
 
+def _win_lock_holder_alive(marker_path: Path) -> bool:
+    """读取 Windows 占位锁里的持有者 PID，判断进程是否仍存活。
+
+    旧实现用纯 O_EXCL 标记文件：安装器被 taskkill /F 或崩溃后标记永不删除，
+    之后所有安装都会永久报"安装正在进行中"。读不到/无法解析 PID 的标记
+    （旧版残留或损坏）同样按陈旧锁处理。
+    """
+    try:
+        pid = int((marker_path.read_text(encoding="utf-8") or "0").strip() or "0")
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
 @contextmanager
 def exclusive_install_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,9 +150,17 @@ def exclusive_install_lock(lock_path: Path):
             else:
                 try:
                     fd = os.open(str(win_lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                    os.close(fd)
                 except FileExistsError:
-                    raise BlockingIOError()
+                    # 锁存在：持有者还活着才是真正的并发安装；已死则接管陈旧标记。
+                    if _win_lock_holder_alive(win_lock_path):
+                        raise BlockingIOError()
+                    try:
+                        win_lock_path.unlink(missing_ok=True)
+                        fd = os.open(str(win_lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    except OSError:
+                        raise BlockingIOError()
+                with os.fdopen(fd, "w", encoding="utf-8") as marker:
+                    marker.write(str(os.getpid()))
         except BlockingIOError as exc:
             raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
         acquired = True
