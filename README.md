@@ -1,4 +1,4 @@
-# SubFix v3.3.1
+# SubFix v3.3.2
 
 DaVinci Resolve 字幕插件。口播、现场、单段和批量字幕生成统一使用 v5。
 
@@ -9,6 +9,13 @@ DaVinci Resolve 字幕插件。口播、现场、单段和批量字幕生成统�
 
 
 
+
+### v3.3.2（2026-10-30）
+
+**问题修复**
+
+- 文稿匹配长素材（约 2–10 分钟）尾部字幕对齐：Qwen3 强制对齐器在长音频尾部会出现时间戳坍缩（末尾若干字 token 零时长、卡在同一时刻），原逻辑用「按字数比例机械重排」兜底，导致后段字幕时间与音频脱节、挤在一起。
+- 新增「尾部坍缩切片重对齐」：对尾部连续被拒段单独切片（含锚点句上下文）重跑 Qwen3 强制对齐，用大模型相对时序替换机械分配；`clamp_last_row_to_speech_end` 收紧 `speech_end` 外推、尾部改相对时长缩放、成功时跳过二次重排。退化判定增强（零时长 / 重复终 / 压缩型退化均识别）。失败时静默回退原逻辑，不劣于现状。
 
 ### v3.3.1（2026-10-14）
 
@@ -67,7 +74,7 @@ Windows 与 macOS 的下载、AI 纠错、本地 Qwen 识别、更新功能使�
 
 本快照包含插件运行代码和安装包构建脚本。私人字幕、项目样本、开发记录和依赖这些样本的内部测试不在公开快照中。旧副本和平台缓存需要单独处理，不能保证已下载的资料被收回。
 
-完整构建使用 `build_subfix_test_package.sh`，需要设置 `ALIGNER_MODEL` 为 Qwen 强制对齐 GGUF 模型路径，`QWEN_BUILD` 为编译好的 qwen3-asr.cpp 运行时目录，并设置 `VERSION=3.3.1`。脚本内置 Python 与 FFmpeg 下载、校验和打包流程。`build_pkg.sh` 仅生成轻量包。Windows 版构建使用 `build_pkg_win.ps1`（产出可解压部署的 ZIP，并附带 `install_subfix.ps1` / `uninstall_subfix.ps1`），通过 `-PythonRuntimeUrl`、`-QwenBuild`、`-FfmpegDir`、`-AlignerModel` 提供 Windows 平台专属二进制。
+完整构建使用 `build_subfix_test_package.sh`，需要设置 `ALIGNER_MODEL` 为 Qwen 强制对齐 GGUF 模型路径，`QWEN_BUILD` 为编译好的 qwen3-asr.cpp 运行时目录，并设置 `VERSION=3.3.2`。脚本内置 Python 与 FFmpeg 下载、校验和打包流程。`build_pkg.sh` 仅生成轻量包。Windows 版构建使用 `build_pkg_win.ps1`（产出可解压部署的 ZIP，并附带 `install_subfix.ps1` / `uninstall_subfix.ps1`），通过 `-PythonRuntimeUrl`、`-QwenBuild`、`-FfmpegDir`、`-AlignerModel` 提供 Windows 平台专属二进制。
 
 v5 复用了 `subfix_generate_v4.py` 中的基础算法；文件名不代表仍可选择旧引擎。公开配置不包含原始训练字幕，保留运行所需的模型权重。
 

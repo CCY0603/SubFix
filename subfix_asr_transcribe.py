@@ -13,6 +13,13 @@ import base64
 import difflib
 import importlib.util
 import json
+
+# MARKER: record which file is actually loaded
+try:
+    with open(r"C:\Users\10840\subfix_py_marker.txt", "w", encoding="utf-8") as _mf:
+        _mf.write("loaded from: " + str(__file__) + "\n")
+except Exception:
+    pass
 import math
 import os
 import re
@@ -2415,8 +2422,10 @@ def pad_aligned_rows_display(
         new_ef = ef + tail_frames
         row["start_frame"] = new_sf
         row["end_frame"] = new_ef
-        row["start"] = round((new_sf - tl) / rate, 3)
-        row["end"] = round(max(new_sf + 0.001, (new_ef - tl) / rate), 3)
+        new_start_sec = (new_sf - tl) / rate
+        new_end_sec = (new_ef - tl) / rate
+        row["start"] = round(new_start_sec, 3)
+        row["end"] = round(max(new_start_sec + 0.001, new_end_sec), 3)
 
     n = len(aligned_rows)
     for i in range(n - 1):
@@ -2426,7 +2435,9 @@ def pad_aligned_rows_display(
         except (TypeError, ValueError):
             continue
         if cur_end >= nxt_start:
-            cur_end = max(nxt_start - 1, int(round(float(aligned_rows[i].get("start_frame") or 0))))
+            sf_i = int(round(float(aligned_rows[i].get("start_frame") or 0)))
+            # 至少保留 1 帧时长，避免 end_frame==start_frame 被下游当作无效行丢弃。
+            cur_end = max(nxt_start - 1, sf_i + 1)
             aligned_rows[i]["end_frame"] = cur_end
             aligned_rows[i]["end"] = round((cur_end - tl) / rate, 3)
     return aligned_rows
@@ -2560,6 +2571,11 @@ def repair_rejected_row_timings(
     segments: list[dict[str, Any]],
     fps: float,
     timeline_start_frame: int,
+    collapse_timestamp: float | None = None,
+    speech_end: float | None = None,
+    speech_onset: float | None = None,
+    speech_regions: list[dict[str, float]] | None = None,
+    first_rejected_start: float | None = None,
 ) -> None:
     """把被拒（回退到“名义占位槽”）的行重排到相邻已对齐行之间的空隙里。
 
@@ -2568,6 +2584,10 @@ def repair_rejected_row_timings(
       * 被拒行按行号插到已对齐行中间，造成时间倒挂（起止时间小于前一行）。
     这里改为：按“连续被拒行段”处理，用整体语速估算时长，把该段紧贴
     下一已对齐行的起点放入空隙，从而消除大段空白与倒挂。
+    对于尾部被拒段，若已知真实语音终点 speech_end，则用它作为右边界，
+    确保尾部字幕能延伸到语音结束，而非仅凭语速估算提前收尾。
+    对于开头被拒段，若已知真实语音起点 speech_onset，则用它作为左锚点
+    并左对齐排布，避免首行被塞到第二行前面而晚于实际语音数秒。
     """
     n = len(segments)
     if n == 0:
@@ -2585,9 +2605,22 @@ def repair_rejected_row_timings(
     ok_index = [i for i in range(n) if accepted[i]]
     total_chars = sum(max(1, int(segments[i].get("ctc_char_count") or 1)) for i in ok_index)
     total_speech = sum(max(0.0, fnum(i, "end") - fnum(i, "start")) for i in ok_index)
-    rate = (total_chars / total_speech) if (total_speech > 1e-6 and total_chars > 0) else 4.0
-    if not (1.0 <= rate <= 20.0):
-        rate = 4.0
+    # 语速估算：优先用 accepted 行的时间跨度（首行起点到末行终点），避免各行时长
+    # 之和因间隙/重叠产生偏差；跨度无效时回退到时和，仍无效则用 4.0。
+    rate = 4.0
+    if total_chars > 0:
+        first_ok = ok_index[0]
+        last_ok = ok_index[-1]
+        span = max(0.0, fnum(last_ok, "end") - fnum(first_ok, "start"))
+        span_rate = (total_chars / span) if span > 1e-6 else 0.0
+        sum_rate = (total_chars / total_speech) if total_speech > 1e-6 else 0.0
+        candidates = [r for r in (span_rate, sum_rate) if 1.0 <= r <= 20.0]
+        if candidates:
+            rate = sorted(candidates)[len(candidates) // 2]
+        elif 1.0 <= sum_rate <= 20.0:
+            rate = sum_rate
+        elif 1.0 <= span_rate <= 20.0:
+            rate = span_rate
 
     gap = 0.08
     min_dur = 0.6
@@ -2604,30 +2637,143 @@ def repair_rejected_row_timings(
         chars = [max(1, int(segments[k].get("ctc_char_count") or 1)) for k in run]
         chars_sum = float(sum(chars))
 
+        is_leading = run_start == 0
+        is_tail = run_end + 1 >= n
         left = fnum(run_start - 1, "end") if run_start > 0 else 0.0
-        right = fnum(run_end + 1, "start") if run_end + 1 < n else left + chars_sum / rate + gap
+        prev_end = left if run_start > 0 else 0.0
+        # 开头被拒段：若已知真实语音起点，用它作为左锚点，避免首行被塞到
+        # 第二行前面而晚于实际语音数秒。
+        if is_leading and speech_onset is not None and speech_onset > left:
+            left = speech_onset
+        # 尾部被拒段：用坍缩点作为左锚点。
+        # ASR 坍缩点是强制对齐器停止分配逐字时间戳的位置，代表被拒段语音的实际起点。
+        # 首行被拒行的首字 ASR 时间戳（first_rejected_start）在坍缩区附近已退化
+        # （单字时长异常偏大），不可靠，仅在无坍缩点时作为回退。
+        if is_tail and collapse_timestamp is not None and collapse_timestamp > left:
+            if collapse_timestamp - left <= 3.0:
+                left = collapse_timestamp
+            else:
+                left = left + 0.25
+        elif is_tail and first_rejected_start is not None and first_rejected_start > left:
+            left = first_rejected_start
+        right = fnum(run_end + 1, "start") if not is_tail else left + chars_sum / rate + gap
+        # 尾部被拒段：用真实语音终点作为右边界
+        if is_tail and speech_end is not None:
+            right = speech_end
 
         est = chars_sum / rate
         window = right - left - gap
-        if window <= 0.0:
+        # 尾部被拒段：按 VAD 语音区分布文字，跳过静音间隙。
+        # 均匀铺满整个窗口会把字幕放到静音区、压缩语音区字幕，导致全部不对齐。
+        use_vad_distribution = False
+        if is_tail and window > 0.0 and speech_regions:
+            tail_regions = []
+            for region in speech_regions:
+                rs = max(left, float(region["start"]))
+                re = min(right, float(region["end"]))
+                if re - rs > 0.05:
+                    tail_regions.append((rs, re))
+            # 合并间隙 < 0.5s 的相邻语音区，减少 VAD 误判（短暂音量下降）导致的虚假间隙
+            merged: list[tuple[float, float]] = []
+            for rs, re in sorted(tail_regions):
+                if merged and rs - merged[-1][1] <= 0.5:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], re))
+                else:
+                    merged.append((rs, re))
+            total_speech = sum(re - rs for rs, re in merged)
+            if total_speech > 1.0 and len(merged) >= 1:
+                use_vad_distribution = True
+
+        if use_vad_distribution:
+            total = total_speech
+        elif window <= 0.0:
             total = max(min_dur * len(run), est)
         elif est > window:
+            total = window
+        elif is_tail and window > 0.0:
             total = window
         else:
             total = max(est, min(min_dur * len(run), window))
 
-        cursor = max(0.0, right - gap - total)
-        for k, c in zip(run, chars):
-            duration = total * (c / chars_sum)
-            seg_start = cursor
-            seg_end = max(cursor + 0.05, cursor + duration)
-            segment = segments[k]
-            segment["start"] = round(seg_start, 3)
-            segment["end"] = round(seg_end, 3)
-            start_frame = int(round(timeline_start_frame + seg_start * fps))
-            segment["ctc_start_frame"] = start_frame
-            segment["ctc_end_frame"] = max(int(round(timeline_start_frame + seg_end * fps)), start_frame + 1)
-            cursor = seg_end
+        # DEBUG: log repair tail run
+        if is_tail:
+            try:
+                with open(os.path.expanduser("~\\subfix_remap_debug.log"), "a", encoding="utf-8") as _dlf:
+                    _dlf.write(f"[repair_tail] run={run_start}-{run_end} chars_sum={chars_sum:.0f} "
+                               f"rate={rate:.3f} est={est:.3f} left={left:.3f} right={right:.3f} "
+                               f"window={window:.3f} total={total:.3f} vad={'yes' if use_vad_distribution else 'no'} "
+                               f"regions={len(merged) if use_vad_distribution else 0} "
+                               f"first_rej_start={first_rejected_start} collapse={collapse_timestamp}\n")
+                    if use_vad_distribution:
+                        for _ri, (_rs, _re) in enumerate(merged):
+                            _dlf.write(f"  [vad_region {_ri}] {_rs:.3f}-{_re:.3f} dur={_re-_rs:.3f}\n")
+            except Exception:
+                pass
+
+        # 分布被拒行
+        if use_vad_distribution:
+            # 阶段1：把行按字数比例分配到各 VAD 语音区
+            region_rows: list[list[int]] = [[] for _ in merged]  # 每个区放哪些 run 索引
+            run_idx = 0
+            chars_remaining = chars_sum
+            for region_idx in range(len(merged)):
+                rs, re = merged[region_idx]
+                region_dur = re - rs
+                region_chars = chars_sum * (region_dur / total_speech)
+                region_chars_consumed = 0.0
+                # 最后一个区：把剩余所有行都放进去，避免末尾留白
+                if region_idx == len(merged) - 1:
+                    while run_idx < len(run):
+                        region_rows[region_idx].append(run_idx)
+                        run_idx += 1
+                    break
+                while run_idx < len(run) and region_chars_consumed < region_chars:
+                    region_rows[region_idx].append(run_idx)
+                    region_chars_consumed += chars[run_idx]
+                    chars_remaining -= chars[run_idx]
+                    run_idx += 1
+
+            # 阶段2：每个区内按实际字数均匀铺满整个区域时长
+            for region_idx in range(len(merged)):
+                rs, re = merged[region_idx]
+                region_dur = re - rs
+                idxs = region_rows[region_idx]
+                if not idxs:
+                    continue
+                actual_chars = sum(chars[i] for i in idxs)
+                region_cursor = rs
+                for pos, idx in enumerate(idxs):
+                    k = run[idx]
+                    c = chars[idx]
+                    # 按实际字数比例分配时长，确保填满整个区域
+                    duration = region_dur * (c / max(actual_chars, 0.001))
+                    seg_start = max(region_cursor, rs)
+                    # 最后一行延伸到区域末尾，不留白
+                    if pos == len(idxs) - 1:
+                        seg_end = re
+                    else:
+                        seg_end = min(max(seg_start + 0.05, seg_start + duration), re)
+                    segment = segments[k]
+                    segment["start"] = round(seg_start, 3)
+                    segment["end"] = round(seg_end, 3)
+                    start_frame = int(round(timeline_start_frame + seg_start * fps))
+                    segment["ctc_start_frame"] = start_frame
+                    segment["ctc_end_frame"] = max(int(round(timeline_start_frame + seg_end * fps)), start_frame + 1)
+                    region_cursor = seg_end
+        else:
+            # 原有均匀分布逻辑（开头段/中间段/无语音区信息的尾部）
+            cursor = left
+            for k, c in zip(run, chars):
+                duration = total * (c / chars_sum)
+                seg_start = cursor
+                seg_end = max(cursor + 0.05, cursor + duration)
+                segment = segments[k]
+                segment["start"] = round(seg_start, 3)
+                segment["end"] = round(seg_end, 3)
+                start_frame = int(round(timeline_start_frame + seg_start * fps))
+                segment["ctc_start_frame"] = start_frame
+                segment["ctc_end_frame"] = max(int(round(timeline_start_frame + seg_end * fps)), start_frame + 1)
+                cursor = seg_end
 
 
 def qwen3_remap_timestamp_items_to_rows(
@@ -2636,11 +2782,53 @@ def qwen3_remap_timestamp_items_to_rows(
     fps: float,
     timeline_start_frame: int,
     min_score: float = QWEN_ROW_REMAP_MIN_SCORE,
+    speech_end: float | None = None,
+    speech_onset: float | None = None,
+    speech_regions: list[dict[str, float]] | None = None,
 ) -> list[dict[str, Any]]:
     units = qwen_timestamp_items_to_char_units(timestamp_items)
     row_units = ctc_units_for_rows(rows)
     segments: list[dict[str, Any]] = []
+    # 检测 ASR 时间戳坍缩点：数组末尾连续退化的 unit 视为强制对齐失败。
+    # 退化判定（三者任一即算退化，且必须从末尾连续）：
+    #   1) 严格零时长（end - start <= 0.001）；
+    #   2) 与后一个 unit 共用同一终点（时间戳“卡住”不再前进）；
+    #   3) 时长远小于全段中位时长（压缩型退化，并非真正的零时长）。
+    # 中间短暂的零时长 unit 是正常停顿，不算坍缩。span 延伸进尾部坍缩区的行一律拒绝，
+    # 交由 repair_rejected_row_timings 按语速重排（或尾部切片重对齐）。
+    collapse_idx = None
+    if units:
+        _durs = [max(0.0, float(u.get("end", 0)) - float(u.get("start", 0))) for u in units]
+        _median_dur = percentile(_durs, 0.5) if _durs else 0.0
+        _short_thresh = max(0.001, 0.2 * _median_dur) if _median_dur > 0 else 0.001
+        _tail_run = 0
+        for _i in range(len(units) - 1, -1, -1):
+            _u = units[_i]
+            _dur = _durs[_i]
+            _degenerate = _dur <= 0.001
+            if not _degenerate and _i < len(units) - 1:
+                _prev = units[_i + 1]
+                if abs(float(_u.get("end", 0)) - float(_prev.get("end", 0))) <= 0.001:
+                    _degenerate = True
+            if not _degenerate and _median_dur > 0 and _dur < _short_thresh:
+                _degenerate = True
+            if _degenerate:
+                _tail_run += 1
+            else:
+                break
+        if _tail_run >= 3:
+            collapse_idx = len(units) - _tail_run
+    # DEBUG: dump last 40 units timestamps once
+    try:
+        with open(r"C:\Users\10840\subfix_remap_debug.log", "a", encoding="utf-8") as _f:
+            _f.write("=== units tail (last 40 of %d), collapse_idx=%s ===\n" % (len(units), collapse_idx))
+            for _i in range(max(0, len(units) - 40), len(units)):
+                _u = units[_i]
+                _f.write("  [%d] %.3f-%.3f %s\n" % (_i, float(_u.get("start", 0)), float(_u.get("end", 0)), str(_u.get("text", ""))[:10]))
+    except Exception:
+        pass
     cursor = 0
+    first_rejected_start: float | None = None
 
     if len(rows) != len(row_units):
         raise ValueError("Qwen 重映射行单元数不一致: rows=%d row_units=%d" % (len(rows), len(row_units)))
@@ -2651,7 +2839,9 @@ def qwen3_remap_timestamp_items_to_rows(
                 preserved_row_segment(row, fps, timeline_start_frame, "rejected_empty_text", 0.0, "", target_text)
             )
             continue
-        if not units:
+        if not units or cursor >= len(units):
+            # 音频时间戳已耗尽，后续文稿行无法对齐，标记为拒绝，由 repair_rejected_row_timings
+            # 按语速估算并排到最后一条已对齐行之后，避免在尾部几个 unit 上反复假匹配导致全部挤在同一帧。
             segments.append(
                 preserved_row_segment(row, fps, timeline_start_frame, "rejected_no_timestamp", 0.0, "", target_text)
             )
@@ -2661,8 +2851,44 @@ def qwen3_remap_timestamp_items_to_rows(
         candidate_text = str(best.get("text") or "") if best else ""
         score = float(best.get("score") or 0.0) if best else 0.0
         length_diff = int(best["length_diff"]) if best and "length_diff" in best else len(target_text)
-        accepted = bool(best) and score >= min_score and length_diff <= row_remap_length_tolerance(len(target_text))
+        end_index = int(best["end_index"]) if best else 0
+        # DEBUG: dump per-row remap trace + matched unit timestamps to hardcoded path
+        try:
+            with open(r"C:\Users\10840\subfix_remap_debug.log", "a", encoding="utf-8") as _f:
+                _si = int(best.get("start_index", -1)) if best else -1
+                _u0 = units[_si] if best and 0 <= _si < len(units) else {}
+                _u1 = units[end_index - 1] if best and 0 < end_index <= len(units) else {}
+                _f.write("row=%s cursor=%s len_units=%s start=%s end=%s score=%.4f diff=%s u0=(%.3f,%.3f) uN=(%.3f,%.3f) text=%s\n" % (
+                    row.get("index"), cursor, len(units), _si, end_index, score, length_diff,
+                    float(_u0.get("start", 0)), float(_u0.get("end", 0)),
+                    float(_u1.get("start", 0)), float(_u1.get("end", 0)),
+                    target_text[:20]))
+        except Exception:
+            pass
+        # 必须向前推进（end_index > cursor）才接受；否则会在已消费的尾部 unit 上反复匹配，
+        # 导致多行拿到相同时间戳而挤在一起。
+        # 同时要求匹配 span 的实际时长 >= 50ms 且未延伸进 ASR 时间戳坍缩区：当 ASR 强制对齐
+        # 在音频尾部退化（大量 unit 共享同一时间戳、零时长）时，该行会被拒绝，交由
+        # repair_rejected_row_timings 按整体语速估算并排到上一已对齐行之后。
+        span_dur = 0.0
+        if best:
+            _si2 = int(best["start_index"])
+            _ei2 = int(best["end_index"])
+            if 0 <= _si2 < len(units) and 0 < _ei2 <= len(units) and _ei2 > _si2:
+                span_dur = float(units[_ei2 - 1].get("end", 0)) - float(units[_si2].get("start", 0))
+        in_collapse = collapse_idx is not None and best and int(best["end_index"]) > collapse_idx
+        accepted = (bool(best) and score >= min_score
+                    and length_diff <= row_remap_length_tolerance(len(target_text))
+                    and end_index > cursor
+                    and span_dur >= 0.05
+                    and not in_collapse)
         if not accepted:
+            # 记录首个被拒行的 ASR 起点（若有匹配），供 repair 用作尾部左锚点。
+            # 坍缩点不是被拒文字的实际起点，首行被拒行的首字时间戳才是。
+            if first_rejected_start is None and best is not None:
+                _si = int(best.get("start_index", -1))
+                if 0 <= _si < len(units):
+                    first_rejected_start = float(units[_si].get("start", 0))
             segments.append(
                 preserved_row_segment(row, fps, timeline_start_frame, "rejected_low_score", score, candidate_text, target_text)
             )
@@ -2698,7 +2924,8 @@ def qwen3_remap_timestamp_items_to_rows(
             }
         )
         cursor = end_index
-    repair_rejected_row_timings(segments, fps, timeline_start_frame)
+    collapse_ts = float(units[collapse_idx].get("start", 0)) if collapse_idx is not None and 0 <= collapse_idx < len(units) else None
+    repair_rejected_row_timings(segments, fps, timeline_start_frame, collapse_timestamp=collapse_ts, speech_end=speech_end, speech_onset=speech_onset, speech_regions=speech_regions, first_rejected_start=first_rejected_start)
     return segments
 
 
@@ -2734,6 +2961,19 @@ def detect_speech_regions(
     rms_off_threshold = max(0.0003, noise_floor * 2.0)
     peak_on_threshold = max(0.0015, peak_floor * 3.0)
     peak_off_threshold = max(0.0008, peak_floor * 2.0)
+
+    # 语音占比过高（>80%）时，20 百分位噪声底会落在语音区间内，导致阈值虚高、
+    # 检测不到任何语音区。此时改用最大 RMS/peak 的一小部分作为兜底阈值。
+    max_rms = max(rms_values) if rms_values else 0.0
+    max_peak = max(peak_values) if peak_values else 0.0
+    if max_rms > 0.0 and rms_on_threshold > 0.4 * max_rms:
+        fallback = max(0.0005, 0.04 * max_rms)
+        rms_on_threshold = fallback
+        rms_off_threshold = max(0.0003, fallback * 0.66)
+    if max_peak > 0.0 and peak_on_threshold > 0.4 * max_peak:
+        fallback = max(0.0015, 0.04 * max_peak)
+        peak_on_threshold = fallback
+        peak_off_threshold = max(0.0008, fallback * 0.66)
 
     regions: list[dict[str, float]] = []
     active_start: float | None = None
@@ -5267,7 +5507,249 @@ def clamp_first_row_to_speech_onset(
             "clamped_start": round(new_start, 3),
             "vad": vad_diag,
         }
+    # 反向：首行起点明显晚于首个语音区起点（文稿首行本该是第一句话，
+    # 但对齐器把它排到了第二句话之后），把首行拉回到首个语音起点。
+    # 只在偏移足够大（>0.3s）时才动手，避免正常的句间停顿被误判。
+    first_onset = float(regions[0]["start"])
+    pull_gap_seconds = 0.3
+    if first_start > first_onset + pull_gap_seconds:
+        new_start = max(0.0, first_onset - lead_seconds)
+        rate = max(1.0, float(fps or 30.0))
+        tl = int(timeline_start_frame or 0)
+        new_start_frame = int(round(tl + new_start * rate))
+        first["start"] = round(new_start, 3)
+        first["start_frame"] = new_start_frame
+        if "ctc_start_frame" in first:
+            first["ctc_start_frame"] = new_start_frame
+        first["onset_clamped"] = True
+        return {
+            "first_row_onset_clamped": True,
+            "first_row_pulled_earlier": True,
+            "aligned_first_start": round(first_start, 3),
+            "speech_onset": round(first_onset, 3),
+            "clamped_start": round(new_start, 3),
+            "vad": vad_diag,
+        }
     return None
+
+
+def clamp_last_row_to_speech_end(
+    aligned_rows: list[dict[str, Any]],
+    audio_path: Path,
+    fps: float,
+    timeline_start_frame: int,
+    skip_redistribute: bool = False,
+) -> dict[str, Any] | None:
+    """把尾部字幕重排到真实语音终点，修结尾整段字幕提前结束。
+
+    Qwen3ForcedAligner 在音频尾部可能把末几行的时间戳整体压缩（多行挤在
+    语音结尾之前的一小段），导致最后数条字幕在人声还没说完时就全部结束。
+    仅拉长末行结尾会把末行拉成异常长条，反而更不对。正确做法是：用 VAD 取
+    真实语音终点，找出尾部被压缩的行（ASR 时长明显短于按语速估算的时长），
+    把这些行按字数比例重新铺开到语音终点。只在末行终点比语音终点早 1s 以上
+    时才动手，避免误伤“结尾本来就有静音/音乐”的素材。
+    """
+    if not aligned_rows:
+        return None
+    try:
+        regions, _onsets, vad_diag = detect_speech_regions(Path(audio_path))
+    except Exception:
+        return None
+    if not regions:
+        return None
+
+    last = aligned_rows[-1]
+    try:
+        last_start = float(last.get("start") or 0.0)
+        last_end = float(last.get("end") or last_start)
+    except (TypeError, ValueError):
+        return None
+
+    # 找与末行区间重叠的最后一个语音区
+    matched_region: dict[str, float] | None = None
+    for region in reversed(regions):
+        if float(region["start"]) <= last_end + 0.35 and float(region["end"]) >= last_start - 0.35:
+            matched_region = region
+            break
+    if matched_region is None:
+        return None
+
+    # 用最后一个语音区的终点作为 speech_end，而不是仅用与末行重叠的语音区。
+    # 原因：被拒行尾部可能没有覆盖到最后一个语音区（如 ASR 坍缩导致尾部行偏短），
+    # 此时只看重叠区会遗漏后面仍有人声的语音区。
+    # 但要注意：片尾音乐/环境音常被 VAD 误判为语音区。仅当最后一个语音区与重叠区
+    # （真实语音匹配区）基本连续（间隔 <= 阈值）时才外推到它；否则认为那是片尾噪声，
+    # speech_end 留在真实语音重叠区终点，避免把尾部字幕窗口拉到静音/音乐区导致整体错位。
+    _speech_end_gap_thr = float(os.getenv("SUBFIX_SCRIPT_MATCH_SPEECH_END_MAX_GAP", "1.5"))
+    speech_end = float(matched_region["end"])
+    last_region_end = float(regions[-1]["end"])
+    if last_region_end > speech_end:
+        _last_region_gap = float(regions[-1]["start"]) - speech_end
+        if _last_region_gap <= _speech_end_gap_thr:
+            speech_end = last_region_end
+    # DEBUG: log clamp_last_row state
+    try:
+        with open(os.path.expanduser("~\\subfix_remap_debug.log"), "a", encoding="utf-8") as _dlf:
+            _dlf.write(f"[clamp_last] last_start={last_start:.3f} last_end={last_end:.3f} "
+                       f"matched_region=({matched_region['start']:.3f},{matched_region['end']:.3f}) "
+                       f"speech_end={speech_end:.3f} regions={len(regions)} "
+                       f"last_region=({regions[-1]['start']:.3f},{regions[-1]['end']:.3f})\n")
+    except Exception:
+        pass
+    # 末行终点比语音结束早 1s 以上才判定为"尾部压缩"
+    gap_seconds = 1.0
+    tail_seconds = 0.08
+    if last_end + gap_seconds >= speech_end:
+        try:
+            with open(os.path.expanduser("~\\subfix_remap_debug.log"), "a", encoding="utf-8") as _dlf:
+                _dlf.write(f"[clamp_last] NO_TRIGGER: last_end+gap={last_end + gap_seconds:.3f} >= speech_end={speech_end:.3f}\n")
+        except Exception:
+            pass
+        return None
+
+    rate = max(1.0, float(fps or 30.0))
+    tl = int(timeline_start_frame or 0)
+
+    # 用所有行估算整体语速（字/秒），用于判断哪些行被压缩
+    total_chars = 0
+    total_speech = 0.0
+    for row in aligned_rows:
+        try:
+            s = float(row.get("start") or 0.0)
+            e = float(row.get("end") or s)
+            text = str(row.get("text") or "")
+            total_chars += max(1, len(text))
+            total_speech += max(0.0, e - s)
+        except (TypeError, ValueError):
+            continue
+    speech_rate = (total_chars / total_speech) if total_speech > 1e-6 else 4.0
+    if not (1.0 <= speech_rate <= 20.0):
+        speech_rate = 4.0
+
+    # 从末行向前找被压缩的行：ASR 时长 < 50% 按语速估算的时长
+    # 找到第一个未被压缩的行就停止，避免误伤对齐正确的行
+    compress_count = 0
+    for row in reversed(aligned_rows):
+        try:
+            s = float(row.get("start") or 0.0)
+            e = float(row.get("end") or s)
+            text = str(row.get("text") or "")
+            chars = max(1, len(text))
+            asr_dur = max(0.0, e - s)
+            expected_dur = chars / speech_rate
+            if asr_dur < 0.5 * expected_dur:
+                compress_count += 1
+            else:
+                break
+        except (TypeError, ValueError):
+            break
+    # DEBUG: log compress_count and speech_rate
+    gap = speech_end - last_end
+    try:
+        with open(os.path.expanduser("~\\subfix_remap_debug.log"), "a", encoding="utf-8") as _dlf:
+            _dlf.write(f"[clamp_last] speech_rate={speech_rate:.3f} compress_count={compress_count} "
+                       f"gap={gap:.3f}\n")
+    except Exception:
+        pass
+
+    # 若尾部与语音终点差距较大（>2s），即使各行时长未被判定为"压缩"，
+    # 也需要重分配若干尾部行来覆盖语音区，否则只拉长末行会变成异常长条。
+    if compress_count <= 0 and gap > 2.0:
+        chars_needed = gap * speech_rate
+        accumulated = 0
+        for row in reversed(aligned_rows):
+            try:
+                accumulated += max(1, len(str(row.get("text") or "")))
+                compress_count += 1
+                if accumulated >= chars_needed:
+                    break
+            except (TypeError, ValueError):
+                break
+        compress_count = max(1, min(compress_count, len(aligned_rows)))
+
+    if compress_count <= 0:
+        # 末行未被压缩但终点仍早于语音结束，仅把末行终点推到语音终点
+        new_end = max(last_end, speech_end - tail_seconds)
+        last["end"] = round(new_end, 3)
+        last["end_frame"] = int(round(tl + new_end * rate))
+        if "ctc_end_frame" in last:
+            last["ctc_end_frame"] = last["end_frame"]
+        last["end_clamped"] = True
+        return {
+            "last_row_end_clamped": True,
+            "aligned_last_end": round(last_end, 3),
+            "speech_end": round(speech_end, 3),
+            "clamped_end": round(new_end, 3),
+            "vad": vad_diag,
+        }
+
+    # 尾部已由大模型切片重对齐：不要再二次机械重排，保留其相对时序。
+    if skip_redistribute:
+        return None
+
+    # 重分配尾部 compress_count 行：从第一行被压缩行的起点铺到语音终点。
+    # 优先用对齐器给出的“相对时长”缩放（保留大模型相对时序），仅当各行时长
+    # 全部退化（sum_orig<=0）时回退到纯字数比例。
+    tail_start_idx = len(aligned_rows) - compress_count
+    first_tail = aligned_rows[tail_start_idx]
+    try:
+        redist_start = float(first_tail.get("start") or 0.0)
+    except (TypeError, ValueError):
+        redist_start = last_start
+    redist_end = speech_end - tail_seconds
+    total_tail_chars = sum(
+        max(1, len(str(aligned_rows[i].get("text") or "")))
+        for i in range(tail_start_idx, len(aligned_rows))
+    )
+    window = max(0.1, redist_end - redist_start)
+    # 预计算尾部各行在对齐器输出中的原始时长，用于相对时长缩放
+    _orig_durs: list[float] = []
+    for i in range(tail_start_idx, len(aligned_rows)):
+        try:
+            ss = float(aligned_rows[i].get("start") or 0.0)
+            ee = float(aligned_rows[i].get("end") or ss)
+            _orig_durs.append(max(0.0, ee - ss))
+        except (TypeError, ValueError):
+            _orig_durs.append(0.0)
+    _sum_orig = sum(_orig_durs)
+    # DEBUG: log redistribution
+    try:
+        with open(os.path.expanduser("~\\subfix_remap_debug.log"), "a", encoding="utf-8") as _dlf:
+            _dlf.write(f"[clamp_last] redist: tail_start_idx={tail_start_idx} "
+                       f"redist_start={redist_start:.3f} redist_end={redist_end:.3f} "
+                       f"window={window:.3f} total_tail_chars={total_tail_chars} "
+                       f"sum_orig={_sum_orig:.3f} use_relative={'yes' if _sum_orig > 1e-6 else 'no'}\n")
+    except Exception:
+        pass
+    cursor = redist_start
+    for i in range(tail_start_idx, len(aligned_rows)):
+        row = aligned_rows[i]
+        text = str(row.get("text") or "")
+        chars = max(1, len(text))
+        if _sum_orig > 1e-6:
+            duration = window * (_orig_durs[i - tail_start_idx] / _sum_orig)
+        else:
+            duration = window * (chars / total_tail_chars)
+        seg_start = cursor
+        seg_end = max(cursor + 0.05, cursor + duration)
+        row["start"] = round(seg_start, 3)
+        row["end"] = round(seg_end, 3)
+        row["start_frame"] = int(round(tl + seg_start * rate))
+        row["end_frame"] = int(round(tl + seg_end * rate))
+        if "ctc_start_frame" in row:
+            row["ctc_start_frame"] = row["start_frame"]
+        if "ctc_end_frame" in row:
+            row["ctc_end_frame"] = row["end_frame"]
+        row["end_clamped"] = True
+        cursor = seg_end
+
+    return {
+        "tail_rows_redistributed": True,
+        "redistributed_count": compress_count,
+        "speech_end": round(speech_end, 3),
+        "original_last_end": round(last_end, 3),
+        "vad": vad_diag,
+    }
 
 
 def qwen3_py_forced_align_text_rows(
@@ -5289,8 +5771,24 @@ def qwen3_py_forced_align_text_rows(
     items = qwen3_force_align_items(Path(audio_path), alignment_text, qwen3_language_name(language) or "Chinese")
     if not items:
         raise RuntimeError("Qwen3 forced align 没有返回时间戳")
+    # 预先用 VAD 取真实语音起点/终点，传给 remap 使开头/尾部被拒行能对齐到语音边界；
+    # clamp_first/last_row 内部会再次调用 detect_speech_regions，开销可忽略。
+    speech_onset: float | None = None
+    speech_end: float | None = None
+    speech_regions: list[dict[str, float]] | None = None
+    try:
+        _regions, _onsets, _vad_diag = detect_speech_regions(Path(audio_path))
+        if _regions:
+            speech_onset = float(_regions[0]["start"])
+            speech_end = float(_regions[-1]["end"])
+            speech_regions = _regions
+    except Exception:
+        speech_onset = None
+        speech_end = None
+        speech_regions = None
     row_segments = qwen3_remap_timestamp_items_to_rows(
-        rows, items, fps=fps, timeline_start_frame=timeline_start_frame
+        rows, items, fps=fps, timeline_start_frame=timeline_start_frame,
+        speech_end=speech_end, speech_onset=speech_onset, speech_regions=speech_regions
     )
     if len(rows) != len(row_segments):
         raise ValueError("Qwen3 forced align 结果行数不一致: rows=%d segments=%d" % (len(rows), len(row_segments)))
@@ -5322,15 +5820,51 @@ def qwen3_py_forced_align_text_rows(
             if key in segment:
                 aligned_row[key] = segment[key]
         aligned_rows.append(aligned_row)
+    # ---- 尾部坍缩切片重对齐（核心修复：让大模型在尾部真正生效）----
+    # 对齐器在长音频尾部退化（时间戳坍缩）后，原本会被“按字数比例机械重排”兜底覆盖，
+    # 造成后部分字幕不与音频对齐。这里对尾部被拒段单独切片重跑 Qwen3 强制对齐，
+    # 用大模型的相对时序替换机械分配；失败则回退到既有兜底逻辑（行为不劣于现状）。
+    tail_realign_info = _try_realign_tail_with_aligner(
+        Path(audio_path), aligned_rows, language, fps, timeline_start_frame, speech_end
+    )
+    tail_realigned = tail_realign_info is not None
+    if tail_realigned:
+        for _idx, _s, _e in tail_realign_info["rows"]:
+            _row = aligned_rows[_idx]
+            _rate = max(1.0, float(fps or 30.0))
+            _tl = int(timeline_start_frame or 0)
+            _row["start"] = round(_s, 3)
+            _row["end"] = round(_e, 3)
+            _row["start_frame"] = int(round(_tl + _s * _rate))
+            _row["end_frame"] = max(_row["start_frame"] + 1, int(round(_tl + _e * _rate)))
+            if "ctc_start_frame" in _row:
+                _row["ctc_start_frame"] = _row["start_frame"]
+            if "ctc_end_frame" in _row:
+                _row["ctc_end_frame"] = _row["end_frame"]
+            _row["row_remap_decision"] = "realigned_tail"
+            _row["tail_realigned"] = True
     onset_diag = clamp_first_row_to_speech_onset(aligned_rows, Path(audio_path), fps, timeline_start_frame)
+    end_diag = clamp_last_row_to_speech_end(
+        aligned_rows, Path(audio_path), fps, timeline_start_frame,
+        skip_redistribute=tail_realigned,
+    )
     pad_aligned_rows_display(aligned_rows, fps, timeline_start_frame)
     diagnostic: dict[str, Any] = {
         "align_engine": "qwen3_py",
         "row_count": len(rows),
         "aligned_count": len(aligned_rows),
     }
+    if tail_realigned:
+        diagnostic["tail_realign"] = {
+            "used": True,
+            "tail_rows": len(tail_realign_info["rows"]),
+            "slice_start": round(tail_realign_info["slice_start"], 3),
+            "slice_end": round(tail_realign_info["slice_end"], 3),
+        }
     if onset_diag:
         diagnostic.update(onset_diag)
+    if end_diag:
+        diagnostic.update(end_diag)
     return {
         "backend": "qwen3_forced_aligner_py",
         "model": os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or _local_forced_aligner_model() or QWEN3_FORCED_ALIGNER_MODEL,
@@ -5338,6 +5872,215 @@ def qwen3_py_forced_align_text_rows(
         "text": alignment_text,
         "diagnostic": diagnostic,
     }
+
+
+def _tail_zero_duration_run(units: list[dict[str, Any]], threshold: float = 0.001) -> int:
+    """从末尾统计连续零时长（退化）unit 的run长度，用于判断切片重对齐是否仍坍缩。"""
+    run = 0
+    for _i in range(len(units) - 1, -1, -1):
+        _dur = max(0.0, float(units[_i].get("end", 0)) - float(units[_i].get("start", 0)))
+        if _dur <= threshold:
+            run += 1
+        else:
+            break
+    return run
+
+
+def _cut_wav_slice(audio_path: Path, start_s: float, end_s: float, pad_seconds: float = 0.0) -> Path | None:
+    """用 wave 模块按原始格式切出 [start_s, end_s] 区间的临时 WAV；失败返回 None。
+
+    pad_seconds>0 时在其后追加等量静音，用于把对齐器的尾部坍缩点推到静音区（重对齐时丢弃）。
+    """
+    try:
+        with wave.open(str(audio_path), "rb") as w:
+            sr = w.getframerate()
+            nch = w.getnchannels()
+            sw = w.getsampwidth()
+            nframes = w.getnframes()
+            if sr <= 0 or nframes <= 0:
+                return None
+            start_f = max(0, int(round(start_s * sr)))
+            end_f = min(nframes, int(round(end_s * sr)))
+            if end_f <= start_f:
+                return None
+            w.setpos(start_f)
+            data = w.readframes(end_f - start_f)
+        if pad_seconds > 0.0:
+            pad_frames = max(1, int(round(pad_seconds * sr)))
+            data += bytes(pad_frames * nch * sw)
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".wav", prefix="subfix_tail_realign_")
+        os.close(fd)
+        with wave.open(p, "wb") as out:
+            out.setnchannels(nch)
+            out.setsampwidth(sw)
+            out.setframerate(sr)
+            out.writeframes(data)
+        return Path(p)
+    except Exception:
+        return None
+
+
+def _log_tail_skip(reason: str) -> None:
+    """记录尾部重对齐放弃原因，便于用真实素材诊断（而非静默返回 None）。"""
+    try:
+        with open(os.path.expanduser("~\\subfix_remap_debug.log"), "a", encoding="utf-8") as _dlf:
+            _dlf.write(f"[tail_realign] SKIP: {reason}\n")
+    except Exception:
+        pass
+
+
+def _try_realign_tail_with_aligner(
+    audio_path: Path,
+    aligned_rows: list[dict[str, Any]],
+    language: str | None,
+    fps: float,
+    timeline_start_frame: int,
+    speech_end: float | None,
+) -> dict[str, Any] | None:
+    """尾部坍缩兜底修复：对尾部连续被拒段切片重跑 Qwen3 强制对齐。
+
+    返回 {"rows": [(idx, start, end), ...], "slice_start":, "slice_end":} 或 None（走原兜底）。
+    设计要点（基于调试日志实证，见 FIX 文档）：
+      * 切片起点 = 最后已对齐行终点 - lead（lead 默认 1.5s，环境变量可调），
+        而非坍缩点 collapse_timestamp——日志显示首句尾部真实语音比坍缩点早 ~1.76s，
+        从坍缩点切片会丢掉真实音频导致重对齐错位。
+      * 切片内文本 = 锚点句（最后已对齐句）+ 尾部被拒文稿，使对齐器有上下文锚点。
+      * 校验：切片结果仍坍缩/有被拒/非单调/末行偏离 speech_end 过多则放弃，回退原逻辑。
+    """
+    try:
+        lead = float(os.getenv("SUBFIX_SCRIPT_MATCH_TAIL_LEAD_SECONDS", "1.5"))
+        pad_seconds = float(os.getenv("SUBFIX_SCRIPT_MATCH_TAIL_PAD_SECONDS", "30.0"))
+        max_slice = float(os.getenv("SUBFIX_SCRIPT_MATCH_TAIL_MAX_SLICE_SECONDS", "180.0"))
+        n = len(aligned_rows)
+        if n == 0:
+            _log_tail_skip("empty_rows")
+            return None
+
+        def _is_rej(r: dict[str, Any]) -> bool:
+            return str(r.get("row_remap_decision") or "").startswith("rejected")
+
+        # 尾部连续被拒段（必须一路拒到行尾）
+        run_end = n - 1
+        while run_end >= 0 and _is_rej(aligned_rows[run_end]):
+            run_end -= 1
+        run_start = run_end + 1
+        if run_start >= n:
+            _log_tail_skip("no_tail_rejected")
+            return None
+        if run_start == 0:
+            _log_tail_skip("no_anchor")
+            return None  # 没有已对齐锚点，无法切片重对齐
+        for i in range(run_start, n):
+            if not _is_rej(aligned_rows[i]):
+                _log_tail_skip("non_tail_rejected")
+                return None  # 非尾部被拒，不在本次修复范围
+
+        anchor = aligned_rows[run_start - 1]
+        anchor_end = float(anchor.get("end") or 0.0)
+        anchor_text = str(anchor.get("text") or "")
+        if not anchor_text:
+            _log_tail_skip("empty_anchor_text")
+            return None
+        tail_rows = aligned_rows[run_start:n]
+        tail_texts = [str(r.get("text") or "") for r in tail_rows]
+        if any(not t for t in tail_texts):
+            _log_tail_skip("empty_tail_text")
+            return None
+
+        audio_dur = audio_duration_seconds(Path(audio_path))
+        slice_start = max(0.0, anchor_end - lead)
+        real_end = min(audio_dur, float(speech_end if speech_end is not None else anchor_end) + 0.3)
+        if real_end - slice_start < 1.0:
+            _log_tail_skip("slice_too_short")
+            return None
+        if real_end - slice_start > max_slice:
+            real_end = slice_start + max_slice
+        real_dur = real_end - slice_start
+
+        # 切片并补静音：把对齐器在输入尾部的坍缩点推到静音区，真实语音段不退化。
+        slice_path = _cut_wav_slice(Path(audio_path), slice_start, real_end, pad_seconds=pad_seconds)
+        if slice_path is None:
+            _log_tail_skip("cut_failed")
+            return None
+        try:
+            combined = anchor_text + "。" + "".join(tail_texts)
+            try:
+                items = qwen3_force_align_items(
+                    slice_path, combined, qwen3_language_name(language) or "Chinese"
+                )
+            except Exception as _e:
+                _log_tail_skip("align_exception:" + repr(_e)[:120])
+                return None
+            if not items:
+                _log_tail_skip("empty_items")
+                return None
+            units = qwen_timestamp_items_to_char_units(items)
+            # 仅统计真实语音段（剔除 padding 静音区）内的退化，避免静音末尾的零时长单位误判坍缩
+            _real_units = [u for u in units if float(u.get("end", 0)) <= real_dur + 0.05]
+            if _tail_zero_duration_run(_real_units) >= 3:
+                _log_tail_skip("slice_collapsed_in_real_region")
+                return None
+
+            tmp_rows = [{"text": anchor_text}] + [{"text": t} for t in tail_texts]
+            try:
+                segs = qwen3_remap_timestamp_items_to_rows(
+                    tmp_rows, items, fps=fps, timeline_start_frame=0,
+                    speech_end=real_end, speech_onset=0.0, speech_regions=None,
+                )
+            except Exception as _e:
+                _log_tail_skip("remap_exception:" + repr(_e)[:120])
+                return None
+            if len(segs) != len(tmp_rows):
+                _log_tail_skip("seg_count_mismatch")
+                return None
+            tail_segs = segs[1:]
+            if any(str(s.get("row_remap_decision") or "").startswith("rejected") for s in tail_segs):
+                _log_tail_skip("tail_still_rejected")
+                return None  # 切片内仍有被拒（字符丢失），放弃
+
+            results: list[tuple[float, float]] = []
+            prev_end = slice_start
+            for s in tail_segs:
+                s0 = float(s.get("start") or 0.0) + slice_start
+                e0 = max(s0 + 0.05, float(s.get("end") or s0) + slice_start)
+                # 不允许对齐结果被推入 padding 静音区（说明对齐器把文字铺满含静音的整段）
+                if e0 > real_dur + slice_start + 0.5:
+                    _log_tail_skip("pushed_into_padding")
+                    return None
+                if e0 < s0:
+                    _log_tail_skip("negative_dur")
+                    return None
+                if s0 < prev_end - 0.05:
+                    _log_tail_skip("not_monotonic")
+                    return None  # 非单调
+                prev_end = e0
+                results.append((round(s0, 3), round(e0, 3)))
+            if not results:
+                _log_tail_skip("no_results")
+                return None
+            if speech_end is not None and abs(results[-1][1] - speech_end) > 3.0:
+                _log_tail_skip("tail_end_off_%.1f" % (results[-1][1] - speech_end))
+                return None  # 末行偏离语音终点过多，重对齐不可信
+
+            out = [(run_start + i, s0, e0) for i, (s0, e0) in enumerate(results)]
+            try:
+                with open(os.path.expanduser("~\\subfix_remap_debug.log"), "a", encoding="utf-8") as _dlf:
+                    _dlf.write(
+                        f"[tail_realign] OK run={run_start}-{n - 1} slice={slice_start:.3f}-{real_end:.3f} "
+                        f"pad={pad_seconds:.1f} rows={len(out)} tail_end={results[-1][1]:.3f} speech_end={speech_end}\n"
+                    )
+            except Exception:
+                pass
+            return {"rows": out, "slice_start": slice_start, "slice_end": real_end, "tail_count": len(out)}
+        finally:
+            try:
+                slice_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception as _e:
+        _log_tail_skip("exception:" + repr(_e)[:200])
+        return None
 
 
 def run_qwen_forced_align_batch_plan(
